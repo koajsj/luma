@@ -1,0 +1,248 @@
+openapi: 3.1.0
+info:
+  title: Luma Backend API
+  version: 0.1.0
+  description: |
+    密文路由与设备同步基础 API。线上消息信封版本尚未冻结，当前 iOS Mock Provider 不能直接接入。
+    除公开认证端点外，每个请求都要带 X-Device-Timestamp（Unix 秒）、X-Device-Nonce（随机 16-128 字符）、X-Device-Signature（Ed25519/Base64url）。
+    签名文本为 luma.request.v1、HTTP 方法、原始 RequestURI、时间戳、nonce、Base64url(SHA-256(token)) 六行，以实际换行分隔。
+    刷新端点也须用已登记设备认证私钥对 refresh token 做相同请求证明；WebSocket 握手同样需要这三个标头。
+servers:
+  - url: https://localhost:8080/v1
+security:
+  - bearerAuth: []
+components:
+  securitySchemes:
+    bearerAuth: {type: http, scheme: bearer}
+  schemas:
+    Error:
+      type: object
+      required: [code, message, requestID]
+      properties:
+        code: {type: string}
+        message: {type: string}
+        requestID: {type: string}
+    Challenge:
+      type: object
+      required: [challengeID, nonce, expiresAt]
+      properties:
+        challengeID: {type: string, format: uuid}
+        nonce: {type: string, description: Base64url 256-bit nonce}
+        expiresAt: {type: string, format: date-time}
+    Tokens:
+      type: object
+      required: [accessToken, refreshToken, tokenType, expiresIn]
+      properties:
+        accessToken: {type: string}
+        refreshToken: {type: string}
+        tokenType: {type: string, const: Bearer}
+        expiresIn: {type: integer, description: seconds}
+    Envelope:
+      type: object
+      required: [recipientDeviceID, ciphertext, keyVersion, messageKeyIndex]
+      properties:
+        recipientDeviceID: {type: string, format: uuid}
+        ciphertext: {type: string, contentEncoding: base64url, description: 客户端已认证密文信封}
+        keyVersion: {type: integer, minimum: 1}
+        messageKeyIndex: {type: integer, minimum: 0}
+    SyncEvent:
+      type: object
+      properties:
+        eventID: {type: string, format: uuid}
+        deviceSeq: {type: integer}
+        type: {type: string}
+        payloadCiphertext: {type: string, contentEncoding: base64url}
+        routing: {type: object, description: 仅消息 ID 等路由元数据}
+        createdAt: {type: string, format: date-time}
+  responses:
+    Error:
+      description: 请求失败
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+paths:
+  /auth/register/challenge:
+    post:
+      tags: [Auth]
+      security: []
+      summary: 获取注册挑战
+      requestBody: {required: true, content: {application/json: {schema: {type: object, required: [userID], properties: {userID: {type: string}}}}}}
+      responses: {'200': {description: 挑战, content: {application/json: {schema: {$ref: '#/components/schemas/Challenge'}}}}, '429': {$ref: '#/components/responses/Error'}}
+  /auth/register:
+    post:
+      tags: [Auth]
+      security: []
+      summary: 注册用户和首台设备
+      description: |
+        authPublicKey 为 Ed25519 公钥；identityPublicKey 为 P-256 X9.63 公钥。
+        Signed PreKey 签名为 P-256 ECDSA ASN.1(SHA-256(prekey bytes))。
+        设备认证签名消息为 luma.register.v1\nnonce\nuserID\nidentityPublicKey\ndevicePublicKey\nauthPublicKey\nsignedPreKey（其中分隔符为实际换行）。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [challengeID, nonce, userID, identityPublicKey, devicePublicKey, authPublicKey, deviceName, signedPreKey, signedPreKeySignature, signedPreKeyVersion, signature]
+              properties:
+                challengeID: {type: string, format: uuid}
+                nonce: {type: string}
+                userID: {type: string, pattern: '^[a-z0-9_]{3,32}$'}
+                nickname: {type: string}
+                identityPublicKey: {type: string, contentEncoding: base64url}
+                devicePublicKey: {type: string, contentEncoding: base64url}
+                authPublicKey: {type: string, contentEncoding: base64url}
+                deviceName: {type: string}
+                signedPreKey: {type: string, contentEncoding: base64url}
+                signedPreKeySignature: {type: string, contentEncoding: base64url}
+                signedPreKeyVersion: {type: integer}
+                signature: {type: string, contentEncoding: base64url}
+      responses: {'201': {description: 账号与设备 ID}, '409': {$ref: '#/components/responses/Error'}}
+  /auth/challenge:
+    post:
+      tags: [Auth]
+      security: []
+      summary: 获取设备登录挑战
+      requestBody: {required: true, content: {application/json: {schema: {type: object, required: [deviceID], properties: {deviceID: {type: string, format: uuid}}}}}}
+      responses: {'200': {description: 挑战, content: {application/json: {schema: {$ref: '#/components/schemas/Challenge'}}}}}
+  /auth/token:
+    post:
+      tags: [Auth]
+      security: []
+      summary: 验证 Ed25519 设备签名并签发令牌
+      description: 签名消息为 luma.login.v1、nonce、deviceID 三行，用实际换行分隔。
+      requestBody: {required: true, content: {application/json: {schema: {type: object, required: [challengeID, nonce, deviceID, signature], properties: {challengeID: {type: string}, nonce: {type: string}, deviceID: {type: string}, signature: {type: string}}}}}}
+      responses: {'200': {description: 令牌, content: {application/json: {schema: {$ref: '#/components/schemas/Tokens'}}}}, '401': {$ref: '#/components/responses/Error'}}
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      security: []
+      summary: 刷新并轮换令牌
+      requestBody: {required: true, content: {application/json: {schema: {type: object, required: [refreshToken], properties: {refreshToken: {type: string}}}}}}
+      responses: {'200': {description: 新令牌, content: {application/json: {schema: {$ref: '#/components/schemas/Tokens'}}}}}
+  /auth/revoke:
+    post:
+      tags: [Auth]
+      summary: 注销当前设备会话
+      responses: {'204': {description: 已撤销；其他有效设备收到 device.revoked 游标事件}, '401': {description: 已撤销设备返回 device_revoked}}
+  /users/me:
+    get: {tags: [User], summary: 当前资料, responses: {'200': {description: 资料}}}
+    patch:
+      tags: [User]
+      summary: 修改昵称与隐私开关
+      requestBody: {required: true, content: {application/json: {schema: {type: object, properties: {nickname: {type: string}, searchable: {type: boolean}, showPresence: {type: boolean}, readReceipts: {type: boolean}}}}}}
+      responses: {'200': {description: 更新后资料}}
+  /users/search:
+    get:
+      tags: [User]
+      summary: 精确 UserID 搜索
+      parameters: [{name: userID, in: query, required: true, schema: {type: string}}]
+      responses: {'200': {description: 可发现用户}, '404': {$ref: '#/components/responses/Error'}}
+  /devices:
+    get: {tags: [Device], summary: 当前账号设备, responses: {'200': {description: 设备列表}}}
+  /devices/authorize/challenge:
+    post: {tags: [Device], summary: 已认证设备申请新设备授权挑战, responses: {'200': {description: challengeID、nonce、expiresAt}}}
+  /devices/authorize:
+    post:
+      tags: [Device]
+      summary: 现有设备和新设备双签名授权新设备
+      description: 签名文本为 luma.device.authorize.v1、nonce、用户 UUID、新协商公钥、新认证公钥、新签名预密钥六行。
+      requestBody: {required: true, content: {application/json: {schema: {type: object, required: [challengeID, nonce, deviceName, devicePublicKey, authPublicKey, signedPreKey, signedPreKeySignature, signedPreKeyVersion, newDeviceSignature, approverSignature], properties: {challengeID: {type: string}, nonce: {type: string}, deviceName: {type: string}, devicePublicKey: {type: string}, authPublicKey: {type: string}, signedPreKey: {type: string}, signedPreKeySignature: {type: string}, signedPreKeyVersion: {type: integer}, newDeviceSignature: {type: string}, approverSignature: {type: string}}}}}}
+      responses: {'201': {description: 新设备 ID}}
+  /devices/{id}:
+    delete:
+      tags: [Device]
+      summary: 撤销其他设备
+      parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+      responses: {'204': {description: 已撤销}}
+  /devices/{id}/prekeys:
+    put:
+      tags: [Device]
+      summary: 上传当前设备签名预密钥和一次性预密钥
+      parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+      requestBody: {required: true, content: {application/json: {schema: {type: object, required: [signedPreKey, signature, keyVersion], properties: {signedPreKey: {type: string}, signature: {type: string}, keyVersion: {type: integer}, oneTimePreKeys: {type: array, maxItems: 100, items: {type: string}}}}}}}
+      responses: {'204': {description: 已保存}}
+  /users/{id}/prekey-bundle:
+    get:
+      tags: [Device]
+      summary: 好友或本人的公钥束；默认原子领取一次性预密钥，claim=false 仅查看
+      parameters:
+        - {name: id, in: path, required: true, schema: {type: string, format: uuid}}
+        - {name: claim, in: query, required: false, schema: {type: boolean, default: true}, description: false 时只检查已签名公钥，不消耗一次性预密钥}
+      responses: {'200': {description: 公钥束}}
+  /friend/request:
+    post:
+      tags: [Friend]
+      summary: 发送好友请求
+      requestBody: {required: true, content: {application/json: {schema: {type: object, required: [userID], properties: {userID: {type: string}}}}}}
+      responses: {'202': {description: 已接受}}
+  /friends:
+    get: {tags: [Friend], summary: 已确认好友列表（含路由用户 UUID）, responses: {'200': {description: 好友列表}}}
+  /friend/requests:
+    get: {tags: [Friend], summary: 当前收到的待处理好友请求, responses: {'200': {description: 请求列表}}}
+  /friend/accept:
+    post: {tags: [Friend], summary: 接受请求, requestBody: {required: true, content: {application/json: {schema: {type: object, required: [requestID], properties: {requestID: {type: string, format: uuid}}}}}}, responses: {'204': {description: 已接受}}}
+  /friend/reject:
+    post: {tags: [Friend], summary: 拒绝请求, requestBody: {required: true, content: {application/json: {schema: {type: object, required: [requestID], properties: {requestID: {type: string, format: uuid}}}}}}, responses: {'204': {description: 已拒绝}}}
+  /friend/{id}:
+    delete: {tags: [Friend], summary: 删除好友, parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}], responses: {'204': {description: 已删除}}}
+  /friend/block:
+    post: {tags: [Friend], summary: 屏蔽用户, requestBody: {required: true, content: {application/json: {schema: {type: object, required: [userID], properties: {userID: {type: string, format: uuid}}}}}}, responses: {'204': {description: 已屏蔽}}}
+  /conversations:
+    get: {tags: [Conversation], summary: 一对一会话列表, responses: {'200': {description: 会话列表}}}
+    post: {tags: [Conversation], summary: 与已确认好友建立会话, requestBody: {required: true, content: {application/json: {schema: {type: object, required: [friendID], properties: {friendID: {type: string, format: uuid}}}}}}, responses: {'201': {description: 会话 ID}}}
+  /messages:
+    post:
+      tags: [Message]
+      summary: 事务保存密文信封和同步事件
+      parameters: [{name: Idempotency-Key, in: header, required: true, schema: {type: string}}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [messageID, conversationID, encryptionVersion, recipientEnvelopes]
+              properties:
+                messageID: {type: string, format: uuid}
+                conversationID: {type: string, format: uuid}
+                encryptionVersion: {type: integer, minimum: 3, description: v3 为客户端设备信封基础协议，未完成跨设备联调和安全审计}
+                recipientEnvelopes: {type: array, items: {$ref: '#/components/schemas/Envelope'}}
+                attachmentIDs: {type: array, items: {type: string, format: uuid}}
+      responses: {'201': {description: 已存储}, '200': {description: 幂等重放}, '409': {$ref: '#/components/responses/Error'}}
+  /messages/{id}:
+    delete: {tags: [Message], summary: 发送删除墓碑, parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}], responses: {'204': {description: 已删除}}}
+  /messages/edit:
+    post: {tags: [Message], summary: 用新的每设备密文信封编辑, requestBody: {required: true, content: {application/json: {schema: {type: object, required: [messageID, revision, recipientEnvelopes], properties: {messageID: {type: string}, revision: {type: integer}, recipientEnvelopes: {type: array, items: {$ref: '#/components/schemas/Envelope'}}}}}}}, responses: {'200': {description: 新版本}}}
+  /messages/read:
+    post: {tags: [Message], summary: 显式已读回执；遵守接收方隐私开关, requestBody: {required: true, content: {application/json: {schema: {type: object, required: [messageID], properties: {messageID: {type: string}}}}}}, responses: {'204': {description: 已处理}}}
+  /messages/delivered:
+    post: {tags: [Message], summary: 显式送达回执, requestBody: {required: true, content: {application/json: {schema: {type: object, required: [messageID], properties: {messageID: {type: string}}}}}}, responses: {'204': {description: 已处理}}}
+  /messages/reaction:
+    post: {tags: [Message], summary: 逐设备密文回应事件, requestBody: {required: true, content: {application/json: {schema: {type: object, required: [messageID, recipientEnvelopes], properties: {messageID: {type: string}, recipientEnvelopes: {type: array, items: {$ref: '#/components/schemas/Envelope'}}}}}}}, responses: {'202': {description: 已接收}}}
+  /sync/events:
+    get:
+      tags: [Sync]
+      summary: 目标设备的连续事件
+      parameters: [{name: cursor, in: query, schema: {type: integer, minimum: 0}}, {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 200}}]
+      responses: {'200': {description: 事件与 nextCursor}}
+  /sync/ack:
+    post: {tags: [Sync], summary: 确认最高连续已落盘序号, requestBody: {required: true, content: {application/json: {schema: {type: object, required: [cursor], properties: {cursor: {type: integer, minimum: 0}}}}}}, responses: {'204': {description: 已确认}}}
+  /files/upload/init:
+    post: {tags: [File], summary: 声明密文字节大小和 SHA-256, requestBody: {required: true, content: {application/json: {schema: {type: object, required: [ciphertextSize, ciphertextHash], properties: {ciphertextSize: {type: integer}, ciphertextHash: {type: string, contentEncoding: base64url}}}}}}, responses: {'201': {description: 附件 ID 与 uploadPath}}}
+  /files/{id}/upload:
+    put: {tags: [File], summary: 上传密文字节, parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}], requestBody: {required: true, content: {application/octet-stream: {schema: {type: string, format: binary}}}}, responses: {'204': {description: 已上传}}}
+  /files/upload/complete:
+    post: {tags: [File], summary: 核对密文大小与哈希, requestBody: {required: true, content: {application/json: {schema: {type: object, required: [attachmentID], properties: {attachmentID: {type: string, format: uuid}}}}}}, responses: {'204': {description: 已完成}}}
+  /files/{id}/download:
+    get: {tags: [File], summary: 获取受控下载路径, parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}], responses: {'200': {description: downloadPath}}}
+  /files/{id}/content:
+    get: {tags: [File], summary: 下载密文字节, parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}], responses: {'200': {description: 密文字节, content: {application/octet-stream: {schema: {type: string, format: binary}}}}}}
+  /files/{id}:
+    delete: {tags: [File], summary: 删除自己上传的密文对象, parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}], responses: {'204': {description: 已删除}}}
+  /presence/heartbeat:
+    put: {tags: [Presence], summary: 更新短期在线状态, responses: {'204': {description: 已记录}}}
+  /presence/{userID}:
+    get: {tags: [Presence], summary: 读取允许展示的好友在线状态, parameters: [{name: userID, in: path, required: true, schema: {type: string}}], responses: {'200': {description: 在线状态}, '404': {$ref: '#/components/responses/Error'}}}
+  /ws:
+    get: {tags: [Sync], summary: WebSocket 事件提示；完整数据仍从游标同步获取, responses: {'101': {description: WebSocket upgrade}}}

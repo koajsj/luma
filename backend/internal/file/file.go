@@ -1,0 +1,202 @@
+package file
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/base64"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
+	"io"
+	"luma/backend/internal/config"
+	"luma/backend/internal/middleware"
+	"net/http"
+)
+
+type Service struct {
+	DB     *pgxpool.Pool
+	Client *minio.Client
+	Bucket string
+}
+
+func New(c config.Config, db *pgxpool.Pool) (Service, error) {
+	s := Service{DB: db, Bucket: c.S3Bucket}
+	if c.S3Endpoint == "" {
+		return s, nil
+	}
+	client, e := minio.New(c.S3Endpoint, &minio.Options{Creds: credentials.NewStaticV4(c.S3AccessKey, c.S3SecretKey, ""), Secure: c.S3Secure})
+	s.Client = client
+	return s, e
+}
+func (s Service) ready(w http.ResponseWriter, r *http.Request) bool {
+	if s.Client == nil {
+		middleware.Fail(w, r, 503, "object_storage_unconfigured")
+		return false
+	}
+	return true
+}
+func (s Service) Init(w http.ResponseWriter, r *http.Request) {
+	if !s.ready(w, r) {
+		return
+	}
+	var in struct {
+		CiphertextSize int64  `json:"ciphertextSize"`
+		CiphertextHash string `json:"ciphertextHash"`
+	}
+	if !middleware.Decode(w, r, &in) {
+		return
+	}
+	hash, e := base64.RawURLEncoding.DecodeString(in.CiphertextHash)
+	if e != nil || len(hash) != 32 || in.CiphertextSize < 1 || in.CiphertextSize > 100<<20 {
+		middleware.Fail(w, r, 400, "invalid_ciphertext_metadata")
+		return
+	}
+	id := uuid.NewString()
+	key := "ciphertext/" + id
+	_, e = s.DB.Exec(r.Context(), "INSERT INTO attachments(id,owner_user_id,object_key,ciphertext_size,ciphertext_hash) VALUES($1,$2,$3,$4,$5)", id, middleware.Current(r).UserID, key, in.CiphertextSize, hash)
+	if e != nil {
+		middleware.Fail(w, r, 503, "storage_unavailable")
+		return
+	}
+	middleware.JSON(w, 201, map[string]any{"attachmentID": id, "uploadPath": "/v1/files/" + id + "/upload", "expiresIn": 300})
+}
+func (s Service) Upload(w http.ResponseWriter, r *http.Request) {
+	if !s.ready(w, r) {
+		return
+	}
+	id := r.PathValue("id")
+	var key string
+	var size int64
+	var expected []byte
+	e := s.DB.QueryRow(r.Context(), "SELECT object_key,ciphertext_size,ciphertext_hash FROM attachments WHERE id=$1 AND owner_user_id=$2 AND status='pending' AND created_at>now()-interval '5 minutes'", id, middleware.Current(r).UserID).Scan(&key, &size, &expected)
+	if e != nil {
+		middleware.Fail(w, r, 404, "not_found")
+		return
+	}
+	if r.ContentLength != size {
+		middleware.Fail(w, r, 400, "size_mismatch")
+		return
+	}
+	data, e := io.ReadAll(http.MaxBytesReader(w, r.Body, size))
+	if e != nil || int64(len(data)) != size {
+		middleware.Fail(w, r, 400, "size_mismatch")
+		return
+	}
+	h := sha256.Sum256(data)
+	if !bytes.Equal(h[:], expected) {
+		middleware.Fail(w, r, 400, "ciphertext_mismatch")
+		return
+	}
+	_, e = s.Client.PutObject(r.Context(), s.Bucket, key, bytes.NewReader(data), size, minio.PutObjectOptions{ContentType: "application/octet-stream"})
+	if e != nil {
+		middleware.Fail(w, r, 503, "object_storage_unavailable")
+		return
+	}
+	w.WriteHeader(204)
+}
+func (s Service) Complete(w http.ResponseWriter, r *http.Request) {
+	if !s.ready(w, r) {
+		return
+	}
+	var in struct {
+		AttachmentID string `json:"attachmentID"`
+	}
+	if !middleware.Decode(w, r, &in) {
+		return
+	}
+	var key string
+	var size int64
+	var expected []byte
+	e := s.DB.QueryRow(r.Context(), "SELECT object_key,ciphertext_size,ciphertext_hash FROM attachments WHERE id=$1 AND owner_user_id=$2 AND status='pending'", in.AttachmentID, middleware.Current(r).UserID).Scan(&key, &size, &expected)
+	if e != nil {
+		middleware.Fail(w, r, 404, "not_found")
+		return
+	}
+	obj, e := s.Client.GetObject(r.Context(), s.Bucket, key, minio.GetObjectOptions{})
+	if e != nil {
+		middleware.Fail(w, r, 503, "object_storage_unavailable")
+		return
+	}
+	defer obj.Close()
+	h := sha256.New()
+	n, e := io.Copy(h, io.LimitReader(obj, size+1))
+	if e != nil || n != size || !bytes.Equal(h.Sum(nil), expected) {
+		middleware.Fail(w, r, 400, "ciphertext_mismatch")
+		return
+	}
+	_, e = s.DB.Exec(r.Context(), "UPDATE attachments SET status='complete' WHERE id=$1 AND owner_user_id=$2", in.AttachmentID, middleware.Current(r).UserID)
+	if e != nil {
+		middleware.Fail(w, r, 503, "storage_unavailable")
+		return
+	}
+	w.WriteHeader(204)
+}
+func (s Service) Download(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.authorized(w, r); !ok {
+		return
+	}
+	middleware.JSON(w, 200, map[string]any{"downloadPath": "/v1/files/" + r.PathValue("id") + "/content"})
+}
+func (s Service) authorized(w http.ResponseWriter, r *http.Request) (string, bool) {
+	if !s.ready(w, r) {
+		return "", false
+	}
+	id := r.PathValue("id")
+	me := middleware.Current(r).UserID
+	var key string
+	e := s.DB.QueryRow(r.Context(), `SELECT a.object_key FROM attachments a
+		LEFT JOIN messages m ON m.id=a.message_id AND m.deleted_at IS NULL
+		LEFT JOIN conversation_members cm ON cm.conversation_id=m.conversation_id AND cm.user_id=$2
+		WHERE a.id=$1 AND a.status='complete' AND
+		(a.owner_user_id=$2 OR (cm.user_id IS NOT NULL AND EXISTS (
+			SELECT 1 FROM friendships f WHERE f.user_a=LEAST($2::uuid,a.owner_user_id)
+			AND f.user_b=GREATEST($2::uuid,a.owner_user_id)
+		) AND NOT EXISTS (
+			SELECT 1 FROM blocks b WHERE (b.blocker=$2 AND b.blocked=a.owner_user_id)
+			OR (b.blocker=a.owner_user_id AND b.blocked=$2)
+		)))`, id, me).Scan(&key)
+	if e != nil {
+		middleware.Fail(w, r, 404, "not_found")
+		return "", false
+	}
+	return key, true
+}
+func (s Service) Content(w http.ResponseWriter, r *http.Request) {
+	key, ok := s.authorized(w, r)
+	if !ok {
+		return
+	}
+	obj, e := s.Client.GetObject(r.Context(), s.Bucket, key, minio.GetObjectOptions{})
+	if e != nil {
+		middleware.Fail(w, r, 503, "object_storage_unavailable")
+		return
+	}
+	defer obj.Close()
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", "attachment; filename=encrypted.bin")
+	_, _ = io.Copy(w, obj)
+}
+func (s Service) Delete(w http.ResponseWriter, r *http.Request) {
+	if !s.ready(w, r) {
+		return
+	}
+	id := r.PathValue("id")
+	me := middleware.Current(r).UserID
+	var key string
+	e := s.DB.QueryRow(r.Context(), "SELECT object_key FROM attachments WHERE id=$1 AND owner_user_id=$2 AND status<>'deleted'", id, me).Scan(&key)
+	if e != nil {
+		middleware.Fail(w, r, 404, "not_found")
+		return
+	}
+	if e = s.Client.RemoveObject(r.Context(), s.Bucket, key, minio.RemoveObjectOptions{}); e != nil {
+		middleware.Fail(w, r, 503, "object_storage_unavailable")
+		return
+	}
+	_, e = s.DB.Exec(r.Context(), "UPDATE attachments SET status='deleted' WHERE id=$1 AND owner_user_id=$2", id, me)
+	if e != nil {
+		middleware.Fail(w, r, 503, "storage_unavailable")
+		return
+	}
+	w.WriteHeader(204)
+}

@@ -1,0 +1,93 @@
+import Foundation
+import SwiftData
+
+enum OutgoingQueueError: LocalizedError {
+    case missing
+    var errorDescription: String? { "待发请求已不存在，请复制消息内容后重新发送" }
+}
+
+/// Persists the exact v3 request before transmission. Retries reuse its message ID and envelopes.
+@MainActor
+struct OutgoingMessageQueue {
+    let context: ModelContext
+    let ownerID: UUID
+    let backendDeviceID: UUID
+    let encryption: EncryptionService
+    let client: RemoteAPIClient
+    private static var draining = Set<UUID>()
+    private let maxAttempts = 5
+
+    func enqueue(messageID: UUID, request: Data) throws -> OutgoingMessageQueueItem {
+        let item = OutgoingMessageQueueItem(ownerID: ownerID, backendDeviceID: backendDeviceID,
+                                             messageID: messageID, encryptedRequest: Data())
+        item.encryptedRequest = try encryption.encrypt(request, authenticatedData: binding(item)).bytes
+        context.insert(item)
+        return item
+    }
+
+    func drain(prepare: (OutgoingMessageQueueItem, Data) async throws -> Data,
+               send: ((Data, UUID) async throws -> Void)? = nil) async throws {
+        guard !Self.draining.contains(backendDeviceID) else { return }
+        Self.draining.insert(backendDeviceID)
+        defer { Self.draining.remove(backendDeviceID) }
+        let items = try context.fetch(FetchDescriptor<OutgoingMessageQueueItem>()).filter {
+            $0.ownerID == ownerID && $0.backendDeviceID == backendDeviceID &&
+            $0.state != "sent" && $0.attempts < maxAttempts && $0.nextAttemptAt <= .now
+        }.sorted { $0.createdAt < $1.createdAt }
+        for item in items {
+            guard let message = try context.fetch(FetchDescriptor<Message>()).first(where: { $0.id == item.messageID }) else {
+                // Never transmit an orphaned queue item.
+                context.delete(item); try context.save(); continue
+            }
+            var body = try encryption.decrypt(EncryptedData(bytes: item.encryptedRequest), authenticatedData: binding(item))
+            item.state = "sending"
+            try context.save()
+            do {
+                if !item.prepared {
+                    body = try await prepare(item, body)
+                    item.encryptedRequest = try encryption.encrypt(body, authenticatedData: binding(item)).bytes
+                    item.prepared = true
+                    try context.save()
+                }
+                if let send { try await send(body, item.messageID) }
+                else {
+                    _ = try await client.request("POST", path: "/messages", body: body,
+                        extraHeaders: ["Idempotency-Key": item.messageID.uuidString.lowercased()])
+                }
+                message.deliveryStatus = .sent
+                item.state = "sent"
+                try context.save()
+                context.delete(item)
+                try context.save()
+            } catch {
+                if error is CancellationError || (error as? URLError)?.code == .cancelled {
+                    item.state = "pending"
+                    item.nextAttemptAt = .now
+                    try context.save()
+                    throw error
+                }
+                item.attempts += 1
+                item.state = item.attempts >= maxAttempts ? "failed" : "pending"
+                if item.state == "failed" { message.deliveryStatus = .failed }
+                item.nextAttemptAt = Date().addingTimeInterval(min(300, pow(2, Double(item.attempts)) * 3))
+                try context.save()
+                throw error
+            }
+        }
+    }
+
+    func retryFailed(messageID: UUID) throws {
+        guard let item = try context.fetch(FetchDescriptor<OutgoingMessageQueueItem>()).first(where: {
+            $0.ownerID == ownerID && $0.backendDeviceID == backendDeviceID && $0.messageID == messageID && $0.state == "failed"
+        }) else { throw OutgoingQueueError.missing }
+        item.attempts = 0; item.state = "pending"; item.nextAttemptAt = .now
+        if let message = try context.fetch(FetchDescriptor<Message>()).first(where: { $0.id == messageID }) {
+            message.deliveryStatus = .sending
+        }
+        try context.save()
+    }
+
+    private func binding(_ item: OutgoingMessageQueueItem) -> Data {
+        Data("luma-outbox-v1|\(ownerID.uuidString)|\(item.id.uuidString)|\(item.messageID.uuidString)".utf8)
+    }
+}
