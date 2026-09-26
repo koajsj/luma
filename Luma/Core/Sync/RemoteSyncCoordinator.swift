@@ -17,6 +17,8 @@ struct RemoteSyncCoordinator {
         Self.inFlightDevices.insert(deviceID)
         defer { Self.inFlightDevices.remove(deviceID) }
         let context = repository.context
+        let prekeys = PreKeyManager(context: context, keychain: KeychainManager())
+        try prekeys.purgeUsedKeyMaterial(for: repository.user.id)
         let checkpoint: RemoteSyncCheckpoint
         if let existing = try context.fetch(FetchDescriptor<RemoteSyncCheckpoint>()).first(where: {
             $0.ownerID == repository.user.id &&
@@ -54,6 +56,9 @@ struct RemoteSyncCoordinator {
             checkpoint.cursor = event.deviceSeq
             do { try context.save() }
             catch { context.rollback(); throw error }
+            // The one-time key can be removed only after both the message and cursor persist.
+            try repository.finalizeOneTimePreKey(for: event)
+            try prekeys.purgeUsedKeyMaterial(for: repository.user.id)
             try await provider.acknowledge(checkpoint.cursor)
             applied += 1
         }

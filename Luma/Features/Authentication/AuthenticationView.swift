@@ -33,7 +33,7 @@ struct AuthenticationView: View {
                     }
                     .frame(maxWidth: .infinity)
                 }
-                Section { Text("本阶段账号只保存在当前设备；未接入服务器。") }
+                Section { Text("此处创建本机账号，密码不会发送到服务器。在线服务需在设置中另行登记设备。") }
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }

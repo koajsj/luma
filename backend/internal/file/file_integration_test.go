@@ -77,9 +77,16 @@ func TestLocalFileFlowAndAccessControl(t *testing.T) {
 	if w := withID(http.MethodPut, owner, data, svc.Upload); w.Code != 204 {
 		t.Fatalf("upload = %d: %s", w.Code, w.Body.String())
 	}
+	var status string
+	if err := db.QueryRow(context.Background(), "SELECT status FROM attachments WHERE id=$1", created.AttachmentID).Scan(&status); err != nil || status != "stored" {
+		t.Fatalf("uploaded status = %q: %v", status, err)
+	}
 	complete, _ := json.Marshal(map[string]string{"attachmentID": created.AttachmentID})
 	if w := call(http.MethodPost, "/v1/files/upload/complete", owner, complete, svc.Complete); w.Code != 204 {
 		t.Fatalf("complete = %d: %s", w.Code, w.Body.String())
+	}
+	if err := db.QueryRow(context.Background(), "SELECT status FROM attachments WHERE id=$1", created.AttachmentID).Scan(&status); err != nil || status != "verified" {
+		t.Fatalf("verified status = %q: %v", status, err)
 	}
 	if w := withID(http.MethodGet, stranger, nil, svc.Content); w.Code != 404 {
 		t.Fatalf("stranger content = %d", w.Code)
@@ -95,4 +102,17 @@ func TestLocalFileFlowAndAccessControl(t *testing.T) {
 	if w := withID(http.MethodGet, owner, nil, svc.Content); w.Code != 404 {
 		t.Fatalf("deleted content = %d", w.Code)
 	}
+	var remaining int
+	if err := db.QueryRow(context.Background(), "SELECT count(*) FROM attachments WHERE id=$1", created.AttachmentID).Scan(&remaining); err != nil || remaining != 0 {
+		t.Fatalf("deleted metadata remains: %d: %v", remaining, err)
+	}
+	// An interrupted pending upload is removed from both the DB and local disk.
+	w = call(http.MethodPost, "/v1/files/upload/init", owner, input, svc.Init)
+	if w.Code != 201 || json.Unmarshal(w.Body.Bytes(), &created) != nil { t.Fatal("second init failed") }
+	if w := withID(http.MethodPut, owner, data, svc.Upload); w.Code != 204 { t.Fatal("second upload failed") }
+	var key string
+	if err := db.QueryRow(context.Background(), "UPDATE attachments SET created_at=now()-interval '20 minutes' WHERE id=$1 RETURNING object_key", created.AttachmentID).Scan(&key); err != nil { t.Fatal(err) }
+	if err := svc.Reconcile(context.Background()); err != nil { t.Fatal(err) }
+	if err := db.QueryRow(context.Background(), "SELECT count(*) FROM attachments WHERE id=$1", created.AttachmentID).Scan(&remaining); err != nil || remaining != 0 { t.Fatalf("stale metadata remains: %d: %v", remaining, err) }
+	if _, err := storage.Open(context.Background(), key); err == nil { t.Fatal("stale ciphertext remains") }
 }

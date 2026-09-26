@@ -43,7 +43,7 @@ struct PrivacyCenterView: View {
             Section("存储") {
                 NavigationLink("加密备份与清理缓存") { StorageManagementView(user: user) }
             }
-            Section { Text("在线状态、最后上线、已读回执和对方通知目前仅有本地模型与界面。截图与录屏提醒仅在本机生效。端到端加密尚未启用。") }
+            Section { Text("在线状态和最后上线仍是本地演示；显式在线 v3 文字聊天可同步已读回执。截图与录屏提醒仅在本机生效，不会通知对方。完整端到端加密协议尚未完成。") }
                 .font(.footnote).foregroundStyle(.secondary)
         }
         .navigationTitle("隐私中心")

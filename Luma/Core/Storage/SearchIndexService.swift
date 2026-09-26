@@ -40,7 +40,9 @@ struct SearchIndexService {
         for attachment in attachments {
             try add(try metadata.attachmentMetadata(for: attachment).name, sourceID: attachment.id, kind: "file")
         }
-        let shieldedFriendIDs = Set(conversations.filter { $0.requiresPrivacyShield == true }.map(\.friendID))
+        let shieldedFriendIDs = Set(conversations.filter {
+            $0.requiresPrivacyShield == true || $0.requiresUnlock == true || lockAllChats
+        }.map(\.friendID))
         for friend in friends where !shieldedFriendIDs.contains(friend.id) {
             let remark = try metadata.remark(for: friend)
             try add("\(friend.userID) \(friend.nickname) \(remark)", sourceID: friend.id, kind: "friend")
@@ -58,7 +60,9 @@ struct SearchIndexService {
         let attachments = try context.fetch(FetchDescriptor<Attachment>())
         let conversations = try context.fetch(FetchDescriptor<Conversation>()).filter { $0.ownerID == user.id }
         let hiddenConversationIDs = Set(conversations.filter { $0.requiresPrivacyShield == true || $0.requiresUnlock == true }.map(\.id))
-        let hiddenFriendIDs = Set(conversations.filter { $0.requiresPrivacyShield == true }.map(\.friendID))
+        let hiddenFriendIDs = Set(conversations.filter {
+            $0.requiresPrivacyShield == true || $0.requiresUnlock == true
+        }.map(\.friendID))
         return try entries.compactMap { entry in
             if entry.kind == "friend" && hiddenFriendIDs.contains(entry.sourceID) { return nil }
             let binding = Data("luma-index-v1|\(user.id.uuidString)|\(entry.sourceID.uuidString)|\(entry.kind)".utf8)

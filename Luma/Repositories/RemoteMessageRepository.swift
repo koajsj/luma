@@ -52,6 +52,7 @@ struct RemoteMessageRepository {
         let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty, value.utf8.count <= 16_384 else { throw DeviceSessionError.invalidEnvelope }
         guard friend.identityFingerprint?.isEmpty == false else { throw DeviceSessionError.untrustedIdentity }
+        guard friend.sessionStatus != "identityKeyChanged" else { throw DeviceSessionError.identityKeyChanged }
         let message = Message(conversationID: conversation.id, type: .text, isMine: true, senderID: user.userID)
         message.deliveryStatus = .sending
         message.transportEncryptionVersion = 3
@@ -76,6 +77,7 @@ struct RemoteMessageRepository {
                   $0.id == conversation.friendID && $0.ownerID == user.id
               }),
               let pinned = friend.identityFingerprint, !pinned.isEmpty else { throw DeviceSessionError.untrustedIdentity }
+        guard friend.sessionStatus != "identityKeyChanged" else { throw DeviceSessionError.identityKeyChanged }
         let contacts = try await RemoteAccountRepository(client: client).confirmedFriends()
         guard let contact = contacts.first(where: { $0.userID == friend.userID }) else { throw RemoteError.server(403, "friendship_required") }
         friend.remoteUserID = contact.id
@@ -177,6 +179,7 @@ struct RemoteMessageRepository {
 
     private func makeEnvelopes(messageID: UUID, conversationID: UUID, friend: Friend,
                                kind: String, text: String, revision: Int? = nil) async throws -> [V3RecipientEnvelope] {
+        guard friend.sessionStatus != "identityKeyChanged" else { throw DeviceSessionError.identityKeyChanged }
         guard let pinned = friend.identityFingerprint,
               let contact = try await RemoteAccountRepository(client: client).confirmedFriends()
                 .first(where: { $0.userID == friend.userID }) else { throw DeviceSessionError.untrustedIdentity }
@@ -214,16 +217,36 @@ struct RemoteMessageRepository {
         }
         let fingerprint = IdentityFingerprint.make(publicKey: identity)
         for item in raw { _ = try item.verified(expectedFingerprint: fingerprint) }
-        if let saved = friend.identityFingerprint, saved != fingerprint { throw DeviceSessionError.untrustedIdentity }
+        if let saved = friend.identityFingerprint, saved != fingerprint {
+            try markIdentityChanged(friend, candidate: fingerprint)
+        }
         return fingerprint
     }
 
     func trustIdentity(_ fingerprint: String, for friend: Friend) throws {
-        guard friend.ownerID == user.id,
-              friend.identityFingerprint == nil || friend.identityFingerprint == fingerprint else {
+        guard friend.ownerID == user.id else { throw DeviceSessionError.untrustedIdentity }
+        if friend.sessionStatus == "identityKeyChanged" {
+            guard friend.pendingIdentityFingerprint == fingerprint else { throw DeviceSessionError.identityKeyChanged }
+        } else if friend.identityFingerprint != nil && friend.identityFingerprint != fingerprint {
             throw DeviceSessionError.untrustedIdentity
         }
+        let changed = friend.identityFingerprint != nil && friend.identityFingerprint != fingerprint
+        let wasBlocked = friend.sessionStatus == "identityKeyChanged"
         friend.identityFingerprint = fingerprint
+        friend.pendingIdentityFingerprint = nil
+        if changed || wasBlocked {
+            friend.sessionStatus = changed ? "identityReverified" : "none"
+            let conversations = try context.fetch(FetchDescriptor<Conversation>()).filter {
+                $0.ownerID == user.id && $0.friendID == friend.id
+            }
+            let ids = Set(conversations.map(\.id))
+            let messageIDs = Set(try context.fetch(FetchDescriptor<Message>()).filter({
+                ids.contains($0.conversationID)
+            }).map(\.id))
+            for item in try context.fetch(FetchDescriptor<OutgoingMessageQueueItem>()).filter({
+                $0.ownerID == user.id && messageIDs.contains($0.messageID) && $0.state == "identityChanged"
+            }) { context.delete(item) }
+        }
         try context.save()
     }
 
@@ -235,9 +258,21 @@ struct RemoteMessageRepository {
 
     func retryOutgoing() async throws {
         do {
-            try await outgoingQueue().drain { item, plaintext in
+            try await outgoingQueue().drain(validate: { item in
+                guard let message = try context.fetch(FetchDescriptor<Message>()).first(where: { $0.id == item.messageID }),
+                      let conversation = try context.fetch(FetchDescriptor<Conversation>()).first(where: {
+                          $0.id == message.conversationID && $0.ownerID == user.id
+                      }),
+                      let friend = try context.fetch(FetchDescriptor<Friend>()).first(where: {
+                          $0.id == conversation.friendID && $0.ownerID == user.id
+                      }), let saved = friend.identityFingerprint else { throw DeviceSessionError.untrustedIdentity }
+                let current = try await identityFingerprint(for: friend)
+                guard saved == current, friend.sessionStatus != "identityKeyChanged" else {
+                    throw DeviceSessionError.identityKeyChanged
+                }
+            }, prepare: { item, plaintext in
                 try await prepareOutgoing(item, text: plaintext)
-            }
+            })
         } catch RemoteError.deviceRevoked {
             try clearRevokedAccess(); throw RemoteError.deviceRevoked
         }
@@ -288,12 +323,6 @@ struct RemoteMessageRepository {
                let existing = try context.fetch(FetchDescriptor<Message>()).first(where: { $0.id == messageID }) {
                 guard existing.transportEncryptionVersion == 3,
                       existing.lastEventID == event.eventID else { throw DeviceSessionError.invalidEnvelope }
-                if let oneTime = envelope.recipientOneTimePreKey {
-                    let manager = PreKeyManager(context: context, keychain: keychain)
-                    if let record = try manager.records(for: user.id).first(where: {
-                        $0.type == "oneTime" && $0.publicKey == oneTime
-                    }) { try manager.consumeOneTime(record) }
-                }
                 return
             }
             let senderFingerprint = IdentityFingerprint.make(publicKey: envelope.senderIdentityPublicKey)
@@ -305,6 +334,7 @@ struct RemoteMessageRepository {
                     $0.ownerID == user.id && $0.identityFingerprint == senderFingerprint
                 }
                 guard matches.count == 1 else { throw DeviceSessionError.untrustedIdentity }
+                guard matches[0].sessionStatus != "identityKeyChanged" else { throw DeviceSessionError.identityKeyChanged }
                 friend = matches[0]
             }
             guard let localDevice = try context.fetch(FetchDescriptor<Device>()).first(where: { $0.ownerID == user.id }) else {
@@ -358,7 +388,7 @@ struct RemoteMessageRepository {
                 }
                 guard try context.fetch(FetchDescriptor<Message>()).contains(where: {
                     $0.id == messageID && $0.conversationID == conversation.id &&
-                    $0.senderID == body.senderUserID
+                    $0.senderID == body.senderUserID && $0.transportEncryptionVersion == 3 && !$0.deleted
                 }) else { throw DeviceSessionError.invalidEnvelope }
                 try store.applyVerifiedRemoteEdit(messageID: messageID, plaintext: Data(body.text.utf8),
                     revision: revision, at: time, eventID: event.eventID)
@@ -374,12 +404,24 @@ struct RemoteMessageRepository {
                 else { context.insert(Reaction(messageID: messageID, emoji: body.text, reactorID: body.senderUserID)) }
                 try context.save()
             }
-            if let oneTimeRecord { try prekeys.consumeOneTime(oneTimeRecord) }
         case "message.delivered", "message.read":
+            guard let receiptDevice = event.routing.recipientDeviceID,
+                  receiptDevice != registration.backendDeviceID else { throw DeviceSessionError.invalidEnvelope }
             guard let message = try context.fetch(FetchDescriptor<Message>()).first(where: { $0.id == messageID && $0.isMine }) else {
                 // A message may have expired locally before its receipt arrives.
                 return
             }
+            guard message.transportEncryptionVersion == 3,
+                  let conversation = try context.fetch(FetchDescriptor<Conversation>()).first(where: {
+                      $0.id == message.conversationID && $0.ownerID == user.id && $0.remoteID != nil
+                  }),
+                  let friend = try context.fetch(FetchDescriptor<Friend>()).first(where: {
+                      $0.id == conversation.friendID && $0.ownerID == user.id
+                  }), friend.sessionStatus != "identityKeyChanged",
+                  let peerID = friend.remoteUserID,
+                  try context.fetch(FetchDescriptor<RemoteDeviceTrust>()).contains(where: {
+                      $0.ownerID == user.id && $0.peerUserID == peerID && $0.backendDeviceID == receiptDevice
+                  }) else { throw DeviceSessionError.invalidEnvelope }
             if event.type == "message.delivered", message.deliveryStatus == .sent {
                 message.deliveryStatus = .delivered; message.deliveredAt = time
             } else if event.type == "message.read", security.preferences.readReceipts,
@@ -393,19 +435,45 @@ struct RemoteMessageRepository {
             guard let message = try context.fetch(FetchDescriptor<Message>()).first(where: { $0.id == messageID }) else {
                 return
             }
-            if let revision = event.routing.revision, revision > (message.remoteRevision ?? 1) {
+            guard message.transportEncryptionVersion == 3,
+                  let conversation = try context.fetch(FetchDescriptor<Conversation>()).first(where: {
+                      $0.id == message.conversationID && $0.ownerID == user.id && $0.remoteID != nil
+                  }),
+                  let friend = try context.fetch(FetchDescriptor<Friend>()).first(where: {
+                      $0.id == conversation.friendID && $0.ownerID == user.id
+                  }), friend.sessionStatus != "identityKeyChanged",
+                  let revision = event.routing.revision else { throw DeviceSessionError.invalidEnvelope }
+            if revision == (message.remoteRevision ?? 1) + 1 {
                 message.deleted = true; message.deletedForEveryone = true
                 message.deletedAt = time; message.remoteRevision = revision
                 try context.save()
+            } else if revision > (message.remoteRevision ?? 1) {
+                throw DeviceSessionError.invalidEnvelope
             }
         default: throw DeviceSessionError.unsupportedVersion
         }
     }
 
+    /// Called only after the corresponding event and local cursor have been saved.
+    func finalizeOneTimePreKey(for event: RemoteSyncEvent) throws {
+        guard ["message.created", "message.edited", "reaction.added"].contains(event.type),
+              let wire = Data(base64URL: event.payloadCiphertext),
+              let envelope = try? JSONDecoder().decode(DeviceMessageEnvelope.self, from: wire),
+              let oneTime = envelope.recipientOneTimePreKey else { return }
+        let manager = PreKeyManager(context: context, keychain: keychain)
+        guard let record = try manager.records(for: user.id).first(where: {
+            $0.type == "oneTime" && $0.publicKey == oneTime
+        }) else { return }
+        try manager.consumeOneTime(record)
+    }
+
     private func localConversation(remoteID: UUID, friend: Friend) throws -> Conversation {
         if let existing = try context.fetch(FetchDescriptor<Conversation>()).first(where: {
             $0.ownerID == user.id && $0.remoteID == remoteID
-        }) { return existing }
+        }) {
+            guard existing.friendID == friend.id else { throw DeviceSessionError.invalidEnvelope }
+            return existing
+        }
         if let existing = try context.fetch(FetchDescriptor<Conversation>()).first(where: {
             $0.ownerID == user.id && $0.friendID == friend.id
         }) {
@@ -425,7 +493,17 @@ struct RemoteMessageRepository {
         let raw: [RemoteDevicePreKeyBundle] = try await client.json([RemoteDevicePreKeyBundle].self,
             path: "/users/\(id.uuidString.lowercased())/prekey-bundle")
         guard !raw.isEmpty else { throw DeviceSessionError.missingPreKey }
-        let verified = try raw.map { try $0.verified(expectedFingerprint: fingerprint) }
+        guard let first = raw.first, let identity = Data(base64URL: first.identityPublicKey) else {
+            throw DeviceSessionError.invalidEnvelope
+        }
+        let candidate = IdentityFingerprint.make(publicKey: identity)
+        let verified = try raw.map { try $0.verified(expectedFingerprint: candidate) }
+        if candidate != fingerprint {
+            if let friend = try context.fetch(FetchDescriptor<Friend>()).first(where: {
+                $0.ownerID == user.id && $0.remoteUserID == id
+            }) { try markIdentityChanged(friend, candidate: candidate) }
+            throw DeviceSessionError.identityKeyChanged
+        }
         guard verified.allSatisfy({ $0.deviceID == registration.backendDeviceID || $0.oneTimePreKey != nil }) else {
             throw DeviceSessionError.missingPreKey
         }
@@ -448,6 +526,27 @@ struct RemoteMessageRepository {
         }
         try context.save()
         return verified
+    }
+
+    func markIdentityChanged(_ friend: Friend, candidate: String) throws {
+        friend.pendingIdentityFingerprint = candidate
+        friend.sessionStatus = "identityKeyChanged"
+        if let remoteID = friend.remoteUserID {
+            for trust in try context.fetch(FetchDescriptor<RemoteDeviceTrust>()).filter({
+                $0.ownerID == user.id && $0.peerUserID == remoteID
+            }) { context.delete(trust) }
+        }
+        let conversations = try context.fetch(FetchDescriptor<Conversation>()).filter {
+            $0.ownerID == user.id && $0.friendID == friend.id
+        }
+        let ids = Set(conversations.map(\.id))
+        let messages = try context.fetch(FetchDescriptor<Message>()).filter { ids.contains($0.conversationID) }
+        let messageIDs = Set(messages.map(\.id))
+        for item in try context.fetch(FetchDescriptor<OutgoingMessageQueueItem>()).filter({
+            $0.ownerID == user.id && messageIDs.contains($0.messageID)
+        }) { item.state = "identityChanged"; item.attempts = 5 }
+        for message in messages where message.deliveryStatus == .sending { message.deliveryStatus = .failed }
+        try context.save()
     }
 
     private func requiredOwnFingerprint() throws -> String {

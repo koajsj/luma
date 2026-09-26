@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | `User` | `id`、唯一 `userID`、`nickname`、头像/简介、`identityPublicKey`、`identityFingerprint`、`encryptedPreferences` | `passwordHash` 是本地验证值，不是明文密码；`searchable` 为本机发现标志。 |
 | `Device` | `id`、`ownerID`、设备名、系统版本、`publicKey`、创建与最后活动时间 | 私钥在 Keychain，当前只表示本机设备。 |
-| `Friend` | `id`、`ownerID`、对方 `userID`、昵称、`encryptedRemark`、身份指纹、会话状态 | 备注经主密钥加密；旧 `remark` 是迁移字段。 |
+| `Friend` | `id`、`ownerID`、对方 `userID`、昵称、`encryptedRemark`、身份指纹、会话状态、待核验指纹 | 备注经主密钥加密；旧 `remark` 是迁移字段。身份变更状态阻止旧在线信封继续发送。 |
 | `Conversation` | `id`、`ownerID`、`friendID`、`draft`、聊天锁、置顶、未读数 | `draft` 为加密字节；关系和计数仍是元数据。 |
 | `Message` | `id`、`conversationID`、`senderID`、类型、`ciphertext`、时间、状态、回执/编辑/删除时间、`deviceID`、`lastEventID`、`encryptionVersion`、`sessionKeyVersion`、`messageKeyIndex` | 正文在 `ciphertext`；`content` 仅供旧版迁移，新记录为空。 |
 | `Attachment` | `id`、`messageID`、类型、`encryptedMetadata` | 真实附件上传尚无；旧路径字段仅供迁移。 |
@@ -16,7 +16,7 @@
 
 辅助模型：`Reaction` 保存本机回应，`UserPresence` 保存本机模拟在线记录，`SearchIndexEntry` 保存加密索引。`MessageEvent` / `ReadReceiptEvent` 是 Codable 事件结构，目前由 Mock 流程使用，**不是**持久化的服务端事件表。
 
-稳定性模型：`OutgoingMessageQueueItem` 按本地用户及后端设备保存 AES-GCM 加密的待发文字意图或完整 v3 请求，状态为 pending/sending/sent/failed；不会保存明文正文。`CleanupState` 记录账号删除或备份恢复的 started/processing/completed/failed 阶段，恢复清理清单使用主密钥加密，完成后删除标记。
+稳定性模型：`OutgoingMessageQueueItem` 按本地用户及后端设备保存 AES-GCM 加密的待发文字意图或完整 v3 请求，状态为 pending/sending/sent/failed/identityChanged；不会保存明文正文。`CleanupState` 记录账号删除的 started/processing/completed/failed 阶段，备份恢复细分为 preparing/restoring/verifying/completed/failed；恢复清理清单使用主密钥加密，完成后删除标记。
 
 ## 关系与迁移
 

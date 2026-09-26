@@ -91,7 +91,7 @@ struct ChatViewModel {
 
     func visibleContent(for message: Message) -> String {
         do { return try displayContent(for: message) }
-        catch { return error.localizedDescription }
+        catch { return LumaError.message(for: error) }
     }
 
     func delete(_ message: Message, forEveryone: Bool) throws {

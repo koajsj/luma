@@ -91,10 +91,11 @@ struct VerifiedDeviceBundle {
 }
 
 enum DeviceSessionError: LocalizedError {
-    case untrustedIdentity, invalidEnvelope, wrongDevice, missingPreKey, authenticationFailed, unsupportedVersion
+    case untrustedIdentity, identityKeyChanged, invalidEnvelope, wrongDevice, missingPreKey, authenticationFailed, unsupportedVersion
     var errorDescription: String? {
         switch self {
         case .untrustedIdentity: "对方身份指纹或预密钥签名未通过验证"
+        case .identityKeyChanged: "好友身份密钥已变化；在线发送已暂停，请通过可信渠道重新核对指纹"
         case .invalidEnvelope: "设备消息信封无效"
         case .wrongDevice: "消息并非发给当前设备"
         case .missingPreKey: "接收预密钥不可用，暂不能确认此事件"

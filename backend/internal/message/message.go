@@ -139,7 +139,7 @@ func (s Service) Send(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, id := range in.AttachmentIDs {
 		var n int
-		e = tx.QueryRow(r.Context(), "SELECT 1 FROM attachments WHERE id=$1 AND owner_user_id=$2 AND status='complete'", id, i.UserID).Scan(&n)
+		e = tx.QueryRow(r.Context(), "SELECT 1 FROM attachments WHERE id=$1 AND owner_user_id=$2 AND status IN ('complete','verified')", id, i.UserID).Scan(&n)
 		if e != nil {
 			middleware.Fail(w, r, 400, "invalid_attachment")
 			return

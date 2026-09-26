@@ -2,8 +2,13 @@ import Foundation
 import SwiftData
 
 enum OutgoingQueueError: LocalizedError {
-    case missing
-    var errorDescription: String? { "待发请求已不存在，请复制消息内容后重新发送" }
+    case missing, identityChanged
+    var errorDescription: String? {
+        switch self {
+        case .missing: "待发请求已不存在，请复制消息内容后重新发送"
+        case .identityChanged: "好友身份密钥已变化，请重新核对后重新发送消息"
+        }
+    }
 }
 
 /// Persists the exact v3 request before transmission. Retries reuse its message ID and envelopes.
@@ -25,7 +30,8 @@ struct OutgoingMessageQueue {
         return item
     }
 
-    func drain(prepare: (OutgoingMessageQueueItem, Data) async throws -> Data,
+    func drain(validate: ((OutgoingMessageQueueItem) async throws -> Void)? = nil,
+               prepare: (OutgoingMessageQueueItem, Data) async throws -> Data,
                send: ((Data, UUID) async throws -> Void)? = nil) async throws {
         guard !Self.draining.contains(backendDeviceID) else { return }
         Self.draining.insert(backendDeviceID)
@@ -51,6 +57,7 @@ struct OutgoingMessageQueue {
                     try context.save()
                     throw error
                 }
+                try await validate?(item)
                 item.state = "sending"
                 try context.save()
                 if !item.prepared {
@@ -70,7 +77,14 @@ struct OutgoingMessageQueue {
                 context.delete(item)
                 try context.save()
             } catch {
-                if item.state == "failed" { throw error }
+                if item.state == "failed" || item.state == "identityChanged" { throw error }
+                if case DeviceSessionError.identityKeyChanged = error {
+                    item.attempts = maxAttempts
+                    item.state = "identityChanged"
+                    message.deliveryStatus = .failed
+                    try context.save()
+                    throw error
+                }
                 if error is CancellationError || (error as? URLError)?.code == .cancelled {
                     item.state = "pending"
                     item.nextAttemptAt = .now
@@ -88,6 +102,10 @@ struct OutgoingMessageQueue {
     }
 
     func retryFailed(messageID: UUID) throws {
+        if try context.fetch(FetchDescriptor<OutgoingMessageQueueItem>()).contains(where: {
+            $0.ownerID == ownerID && $0.backendDeviceID == backendDeviceID &&
+            $0.messageID == messageID && $0.state == "identityChanged"
+        }) { throw OutgoingQueueError.identityChanged }
         guard let item = try context.fetch(FetchDescriptor<OutgoingMessageQueueItem>()).first(where: {
             $0.ownerID == ownerID && $0.backendDeviceID == backendDeviceID && $0.messageID == messageID && $0.state == "failed"
         }) else { throw OutgoingQueueError.missing }

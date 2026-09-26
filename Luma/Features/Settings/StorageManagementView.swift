@@ -49,7 +49,7 @@ struct StorageManagementView: View {
                 }
                 Button("从备份恢复") { showingImporter = true }
                     .disabled(backupPassword.isEmpty || busy)
-                Text("备份使用独立密码加密，不含账号密码验证值、PIN、登录状态或 Keychain 私钥。恢复仅支持当前 UserID，并将替换该账号在本机的聊天数据。")
+                Text("备份使用独立密码加密，不含账号密码验证值、PIN、登录状态或 Keychain 私钥。恢复仅支持当前 UserID；含在线消息、未发送队列或在线同步进度时暂不允许恢复，以免丢失远端事件。")
                     .font(.footnote).foregroundStyle(.secondary)
                 if cleanupStates.contains(where: { $0.ownerID == user.id && $0.operation == "backupRestore" && $0.dataCommitted && $0.state != "completed" }) {
                     Button("继续完成恢复清理") {
@@ -59,7 +59,7 @@ struct StorageManagementView: View {
                                 keychain: security.sessionManager(context: context).keychain)
                             try security.reloadPreferences(for: user, context: context)
                             notice = "恢复清理已完成"
-                        } catch { notice = error.localizedDescription }
+                        } catch { notice = LumaError.message(for: error) }
                     }
                 }
             }
@@ -78,7 +78,7 @@ struct StorageManagementView: View {
                 defer { if scoped { url.stopAccessingSecurityScopedResource() } }
                 pendingRestore = try Data(contentsOf: url)
                 confirmingRestore = true
-            } catch { notice = error.localizedDescription }
+            } catch { notice = LumaError.message(for: error) }
         }
         .confirmationDialog("替换当前账号本机数据？", isPresented: $confirmingRestore) {
             Button("验证并恢复", role: .destructive) { restoreBackup() }
@@ -101,7 +101,7 @@ struct StorageManagementView: View {
             try data.write(to: url, options: .atomic)
             backupURL = url
             notice = "加密备份已生成。请使用导出按钮保存文件，并妥善保管备份密码。"
-        } catch { notice = error.localizedDescription }
+        } catch { notice = LumaError.message(for: error) }
     }
 
     private func restoreBackup() {
@@ -114,7 +114,7 @@ struct StorageManagementView: View {
                 .restore(pendingRestore, password: backupPassword, into: user)
             try security.reloadPreferences(for: user, context: context)
             notice = "恢复完成。好友、会话和消息已重新使用本机主密钥加密。"
-        } catch { notice = error.localizedDescription }
+        } catch { notice = LumaError.message(for: error) }
     }
 
     private func clearCache() {
@@ -122,6 +122,6 @@ struct StorageManagementView: View {
             if FileManager.default.fileExists(atPath: cacheDirectory.path) { try FileManager.default.removeItem(at: cacheDirectory) }
             backupURL = nil
             notice = "缓存已清理"
-        } catch { notice = error.localizedDescription }
+        } catch { notice = LumaError.message(for: error) }
     }
 }

@@ -65,15 +65,19 @@ struct LocalMessageRepository: MessageRepository {
             payload = try JSONEncoder().encode(EditedMessagePayload(ciphertext: ciphertext,
                                                                       sessionKeyVersion: version, messageKeyIndex: index))
         } else { payload = message.ciphertext }
-        let event = MessageEvent(kind: .messageEdited, messageID: message.id, payload: payload)
+        let event = MessageEvent(kind: .messageEdited, messageID: message.id, payload: payload,
+                                 actorID: message.senderID, deviceID: message.deviceID)
         message.lastEventID = event.id
         try context.save()
         return event
     }
 
     func delete(_ message: Message, forEveryone: Bool) throws -> MessageEvent {
+        let conversation = try context.fetch(FetchDescriptor<Conversation>()).first { $0.id == message.conversationID }
+        let ownerID = try context.fetch(FetchDescriptor<User>()).first { $0.id == conversation?.ownerID }?.userID
         let event = MessageEvent(kind: .messageDeleted, messageID: message.id,
-                                 payload: Data([forEveryone ? 1 : 0]))
+                                 payload: Data([forEveryone ? 1 : 0]), actorID: ownerID,
+                                 deviceID: try ownerID.flatMap { try localDeviceID(for: $0) })
         try apply(event)
         return event
     }
@@ -116,7 +120,9 @@ struct LocalMessageRepository: MessageRepository {
         let events = try unread.map { message in
             let receipt = ReadReceiptEvent(messageID: message.id, readerID: readerID, timestamp: message.readAt ?? .now)
             let payload = try JSONEncoder().encode(receipt)
-            let event = MessageEvent(kind: .messageRead, messageID: message.id, timestamp: receipt.timestamp, payload: payload)
+            let event = MessageEvent(kind: .messageRead, messageID: message.id, timestamp: receipt.timestamp,
+                                     payload: payload, actorID: readerID,
+                                     deviceID: try localDeviceID(for: readerID))
             message.lastEventID = event.id
             return event
         }
@@ -127,6 +133,7 @@ struct LocalMessageRepository: MessageRepository {
     func apply(_ event: MessageEvent) throws {
         let message = try context.fetch(FetchDescriptor<Message>()).first { $0.id == event.messageID }
         if let message, message.lastEventID == event.id { return }
+        try EventVerifier(context: context).verify(event, message: message)
         if event.kind == .newMessage {
             guard message == nil, let payload = event.payload,
                   let data = try? JSONDecoder().decode(NewMessagePayload.self, from: payload),

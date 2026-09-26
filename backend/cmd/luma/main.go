@@ -52,6 +52,23 @@ func main() {
 	if e != nil {
 		log.Fatal(e)
 	}
+	if e = files.Reconcile(ctx); e != nil {
+		log.Print("file reconciliation failed")
+	}
+	go func() {
+		ticker := time.NewTicker(10 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := files.Reconcile(ctx); err != nil {
+					log.Print("file reconciliation failed")
+				}
+			}
+		}
+	}()
 	authSvc := auth.Service{DB: db, Cache: cache}
 	userSvc := user.Service{DB: db}
 	deviceSvc := device.Service{DB: db}

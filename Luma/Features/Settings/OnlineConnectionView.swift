@@ -142,7 +142,7 @@ struct OnlineConnectionView: View {
         do {
             (registration, hasTokens) = try viewModel.localState()
             address = registration?.baseURL.absoluteString ?? ProcessInfo.processInfo.environment["LUMA_DEV_API_URL"] ?? ""
-        } catch { errorMessage = error.localizedDescription }
+        } catch { errorMessage = LumaError.message(for: error) }
     }
 
     private func run(_ operation: @escaping () async throws -> Void) {
@@ -151,7 +151,7 @@ struct OnlineConnectionView: View {
         Task { @MainActor in
             defer { working = false }
             do { try await operation(); errorMessage = nil }
-            catch { loadState(); errorMessage = error.localizedDescription }
+            catch { loadState(); errorMessage = LumaError.message(for: error) }
         }
     }
 

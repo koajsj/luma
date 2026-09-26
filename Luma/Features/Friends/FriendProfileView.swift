@@ -77,6 +77,11 @@ struct FriendProfileView: View {
 
     private func deleteLocalFriend() throws {
         do {
+            let conversationIDs = Set(conversations.filter { $0.friendID == friend.id && $0.ownerID == friend.ownerID }.map(\.id))
+            let messageIDs = Set(allMessages.filter { conversationIDs.contains($0.conversationID) }.map(\.id))
+            for item in try context.fetch(FetchDescriptor<OutgoingMessageQueueItem>()).filter({
+                $0.ownerID == friend.ownerID && messageIDs.contains($0.messageID)
+            }) { context.delete(item) }
             for conversation in conversations where conversation.friendID == friend.id {
                 for message in allMessages where message.conversationID == conversation.id {
                     for attachment in attachments where attachment.messageID == message.id {

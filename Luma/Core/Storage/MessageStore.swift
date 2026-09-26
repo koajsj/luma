@@ -51,6 +51,11 @@ struct MessageStore {
         guard session.ownerID == conversation.ownerID, session.friendID == conversation.friendID else {
             throw SessionError.missing
         }
+        guard let friend = try context.fetch(FetchDescriptor<Friend>()).first(where: {
+            $0.id == conversation.friendID && $0.ownerID == conversation.ownerID
+        }), friend.sessionStatus != "identityKeyChanged", friend.sessionStatus != "identityReverified" else {
+            throw SessionError.identityMismatch
+        }
         let message = Message(conversationID: conversation.id, type: .text, isMine: true, senderID: senderID)
         message.encryptionVersion = EncryptionVersion.sessionAESGCM.rawValue
         message.sessionKeyVersion = session.keyVersion

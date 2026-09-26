@@ -67,11 +67,11 @@ struct ChatListView: View {
                             if let conversation = allConversations.first(where: { $0.ownerID == user.id && $0.friendID == friend.id }) {
                                 Button(conversation.isPinned == true ? "取消置顶" : "置顶") {
                                     do { try viewModel.setPinned(conversation.isPinned != true, for: conversation) }
-                                    catch { errorMessage = error.localizedDescription }
+                                    catch { errorMessage = LumaError.message(for: error) }
                                 }.tint(.orange)
                                 Button("标记未读") {
                                     do { try viewModel.markUnread(conversation) }
-                                    catch { errorMessage = error.localizedDescription }
+                                    catch { errorMessage = LumaError.message(for: error) }
                                 }.tint(.blue)
                             }
                         }
@@ -217,11 +217,11 @@ struct ChatDetailView: View {
                                 Task {
                                     do { try await viewModel.editOnlineText(editText, message: message, user: user,
                                         friend: friend, conversation: conversation); editing = nil }
-                                    catch { featureNote = error.localizedDescription }
+                                    catch { featureNote = LumaError.message(for: error) }
                                 }
                             } else {
                                 do { try viewModel.edit(message, text: editText); editing = nil }
-                                catch { featureNote = error.localizedDescription }
+                                catch { featureNote = LumaError.message(for: error) }
                             }
                         }.disabled(editText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) }
                     }
@@ -234,7 +234,7 @@ struct ChatDetailView: View {
                         if let recipient = allFriends.first(where: { $0.id == target.friendID }) {
                             Button(security.friendDisplayName(recipient, context: context)) {
                                 do { try viewModel.forward(message, to: target); forwarding = nil }
-                                catch { featureNote = error.localizedDescription }
+                                catch { featureNote = LumaError.message(for: error) }
                             }
                         }
                     }
@@ -254,18 +254,18 @@ struct ChatDetailView: View {
         .alert("提示", isPresented: Binding(get: { featureNote != nil }, set: { if !$0 { featureNote = nil } })) {
             Button("好", role: .cancel) { featureNote = nil }
         } message: { Text(featureNote ?? "") }
-        .alert("核对身份指纹", isPresented: Binding(get: { identityCandidate != nil },
+        .alert(friend.sessionStatus == "identityKeyChanged" ? "身份密钥已变化" : "核对身份指纹", isPresented: Binding(get: { identityCandidate != nil },
                                                  set: { if !$0 { identityCandidate = nil } })) {
             Button("取消", role: .cancel) { identityCandidate = nil }
             Button("已通过可信渠道核对") {
                 if let identityCandidate {
                     do { try viewModel.trustOnlineIdentity(identityCandidate, user: user, friend: friend) }
-                    catch { featureNote = error.localizedDescription }
+                    catch { featureNote = LumaError.message(for: error) }
                 }
                 identityCandidate = nil
             }
         } message: {
-            Text("请与对方当面或通过可信渠道核对完整指纹。仅点击此处不能证明服务器提供的密钥真实属于对方。\n\n\(identityCandidate ?? "")")
+            Text("请与对方当面或通过可信渠道核对完整指纹。身份变化后旧在线会话已暂停；仅点击此处不能证明服务器提供的密钥真实属于对方。\n\n\(identityCandidate ?? "")")
         }
         .onAppear {
             updateVisiblePrivacyShield()
@@ -285,11 +285,11 @@ struct ChatDetailView: View {
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             guard !Task.isCancelled else { return }
             do { try viewModel.purgeExpired(conversation) }
-            catch { featureNote = error.localizedDescription }
+            catch { featureNote = LumaError.message(for: error) }
         }
         .onChange(of: draft) { _, value in
             guard canViewChat, draftLoaded, let conversation else { return }
-            do { try viewModel.saveDraft(value, in: conversation) } catch { featureNote = error.localizedDescription }
+            do { try viewModel.saveDraft(value, in: conversation) } catch { featureNote = LumaError.message(for: error) }
         }
         .onChange(of: scenePhase) { _, phase in
             if phase != .active { chatUnlocked = false; draftLoaded = false; draft = "" }
@@ -318,12 +318,12 @@ struct ChatDetailView: View {
                 .frame(maxWidth: 220).textFieldStyle(.roundedBorder)
             Button("使用 PIN 查看") {
                 do { try security.verifyChatPIN(chatPIN); chatPIN = ""; chatUnlocked = true; loadDraftIfAllowed(); markVisibleRead() }
-                catch { featureNote = error.localizedDescription }
+                catch { featureNote = LumaError.message(for: error) }
             }.buttonStyle(.borderedProminent)
             if security.canUseBiometrics() {
                 Button("使用 Face ID") {
                     Task { do { try await security.verifyChatBiometrics(); chatUnlocked = true; loadDraftIfAllowed(); markVisibleRead() }
-                           catch { featureNote = error.localizedDescription } }
+                           catch { featureNote = LumaError.message(for: error) } }
                 }
             }
         }.frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -334,7 +334,8 @@ struct ChatDetailView: View {
             Button { showingSecurity = true } label: {
                 HStack(spacing: 6) {
                     Image(systemName: "lock.shield")
-                    Text(onlineMode ? "设备间密文传输基础 · 非完整 E2EE 协议" : "本地加密保护已开启 · 端到端加密尚未启用")
+                    Text(friend.sessionStatus == "identityKeyChanged" ? "身份密钥已变化 · 在线发送暂停，需重新验证" :
+                         onlineMode ? "设备间密文传输基础 · 非完整 E2EE 协议" : "本地加密保护已开启 · 端到端加密尚未启用")
                 }
             }
             .font(.caption)
@@ -352,7 +353,7 @@ struct ChatDetailView: View {
                                    onReplyTap: { if let id = message.replyToID { withAnimation { proxy.scrollTo(id, anchor: .center) } } },
                                    onRetry: { Task {
                                        do { try await viewModel.retryFailedOnline(message.id, user: user) }
-                                       catch { featureNote = error.localizedDescription }
+                                       catch { featureNote = LumaError.message(for: error) }
                                    } })
                             .contextMenu {
                                 ForEach(["👍", "❤️", "😂", "‼️"], id: \.self) { emoji in
@@ -361,11 +362,11 @@ struct ChatDetailView: View {
                                             Task {
                                                 do { try await viewModel.reactOnline(emoji, to: message, user: user,
                                                     friend: friend, conversation: conversation) }
-                                                catch { featureNote = error.localizedDescription }
+                                                catch { featureNote = LumaError.message(for: error) }
                                             }
                                         } else {
                                             do { try viewModel.react(emoji, to: message) }
-                                            catch { featureNote = error.localizedDescription }
+                                            catch { featureNote = LumaError.message(for: error) }
                                         }
                                     }
                                 }
@@ -375,14 +376,14 @@ struct ChatDetailView: View {
                                 if message.type == .text {
                                     Button {
                                         do { UIPasteboard.general.string = try viewModel.displayContent(for: message) }
-                                        catch { featureNote = error.localizedDescription }
+                                        catch { featureNote = LumaError.message(for: error) }
                                     } label: { Label("复制", systemImage: "doc.on.doc") }
                                 }
                                 Button { replyTo = message } label: { Label("回复", systemImage: "arrowshape.turn.up.left") }
                                 Button { forwarding = message } label: { Label("转发", systemImage: "arrowshape.turn.up.right") }
                                 Button {
                                     do { try viewModel.setFavorite(message.isFavorite != true, for: message) }
-                                    catch { featureNote = error.localizedDescription }
+                                    catch { featureNote = LumaError.message(for: error) }
                                 } label: { Label(message.isFavorite == true ? "取消收藏" : "收藏", systemImage: message.isFavorite == true ? "star.slash" : "star") }
                                 Button(role: .destructive) { deleting = message } label: { Label("删除", systemImage: "trash") }
                             }
@@ -431,7 +432,7 @@ struct ChatDetailView: View {
     private func loadDraftIfAllowed() {
         guard canViewChat, let conversation, !draftLoaded else { return }
         do { draft = try viewModel.draft(in: conversation); draftLoaded = true }
-        catch { featureNote = error.localizedDescription }
+        catch { featureNote = LumaError.message(for: error) }
     }
 
     private func sendText() {
@@ -444,7 +445,7 @@ struct ChatDetailView: View {
                 do {
                     try await viewModel.sendOnlineText(text, user: user, friend: friend, conversation: conversation)
                     if draft == text { draft = ""; replyTo = nil }
-                } catch { featureNote = error.localizedDescription }
+                } catch { featureNote = LumaError.message(for: error) }
             }
             return
         }
@@ -452,27 +453,27 @@ struct ChatDetailView: View {
             if try viewModel.sendText(draft, in: conversation, replyingTo: replyTo) {
                 draft = ""; replyTo = nil
             }
-        } catch { featureNote = error.localizedDescription }
+        } catch { featureNote = LumaError.message(for: error) }
     }
 
     private func verifyOnlineIdentity() {
         Task {
             do { identityCandidate = try await viewModel.onlineIdentityFingerprint(user: user, friend: friend) }
-            catch { featureNote = error.localizedDescription }
+            catch { featureNote = LumaError.message(for: error) }
         }
     }
 
     private func syncOnline() async {
         guard onlineMode, canViewChat else { return }
         do { _ = try await viewModel.syncOnline(user: user) }
-        catch { featureNote = error.localizedDescription; onlineMode = false }
+        catch { featureNote = LumaError.message(for: error); onlineMode = false }
     }
 
     private func addSimulated(_ type: MessageType) {
         if onlineMode { featureNote = "在线附件尚未支持，未向服务器发送文件。"; return }
         do {
             try viewModel.sendPlaceholder(type, in: conversation)
-        } catch { featureNote = error.localizedDescription }
+        } catch { featureNote = LumaError.message(for: error) }
     }
 
     private func delete(forEveryone: Bool) {
@@ -480,13 +481,13 @@ struct ChatDetailView: View {
         if onlineMode && forEveryone && deleting.transportEncryptionVersion == 3 {
             Task {
                 do { try await viewModel.deleteOnline(deleting, user: user) }
-                catch { featureNote = error.localizedDescription }
+                catch { featureNote = LumaError.message(for: error) }
             }
             self.deleting = nil
             return
         }
         do { try viewModel.delete(deleting, forEveryone: forEveryone) }
-        catch { featureNote = error.localizedDescription }
+        catch { featureNote = LumaError.message(for: error) }
         self.deleting = nil
     }
 
@@ -495,14 +496,14 @@ struct ChatDetailView: View {
         if onlineMode {
             Task {
                 do { try await viewModel.markOnlineRead(conversation, user: user) }
-                catch { featureNote = error.localizedDescription }
+                catch { featureNote = LumaError.message(for: error) }
             }
             return
         }
         do {
             try viewModel.purgeExpired(conversation)
             try viewModel.markRead(conversation)
-        } catch { featureNote = error.localizedDescription }
+        } catch { featureNote = LumaError.message(for: error) }
     }
 }
 
@@ -606,7 +607,7 @@ private struct ChatInfoView: View {
                     Toggle("演示正在输入状态", isOn: Binding(get: { typingStatus == .typing }, set: { typingStatus = $0 ? .typing : .idle }))
                     Toggle("已读回执", isOn: Binding(get: { security.preferences.readReceipts }, set: { value in
                         do { try security.updatePreferences(for: user, context: context) { $0.readReceipts = value } }
-                        catch { errorMessage = error.localizedDescription }
+                        catch { errorMessage = LumaError.message(for: error) }
                     }))
                 }
                 Section { NavigationLink("好友资料与备注") { FriendProfileView(friend: friend) } }
@@ -621,7 +622,7 @@ private struct ChatInfoView: View {
             } message: { Text(errorMessage ?? "") }
         }
     }
-    private func save() { do { try context.save() } catch { errorMessage = error.localizedDescription } }
+    private func save() { do { try context.save() } catch { errorMessage = LumaError.message(for: error) } }
 }
 
 private struct ChatSecurityView: View {
@@ -644,13 +645,23 @@ private struct ChatSecurityView: View {
                     LabeledContent("身份密钥", value: security.identityKeyStatus(for: user))
                     LabeledContent("设备密钥", value: security.deviceKeyStatus(for: user, context: context))
                 }
+                if friend.sessionStatus == "identityKeyChanged" {
+                    Section("身份警告") {
+                        Label("身份密钥已变化，需要重新验证", systemImage: "exclamationmark.shield")
+                        Text("在聊天信息菜单中核对好友身份指纹。核对前暂停在线发送和旧会话使用。")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
+                }
                 Section("会话 · 本机模拟") {
-                    LabeledContent("Session", value: security.localSessionStatus(for: user, friend: friend, context: context))
+                    LabeledContent("Session", value: friend.sessionStatus == "identityKeyChanged" ||
+                                   friend.sessionStatus == "identityReverified" ? "旧会话已暂停" :
+                                   security.localSessionStatus(for: user, friend: friend, context: context))
                         .id(statusRefresh)
-                    if security.localSessionStatus(for: user, friend: friend, context: context) == "未建立" {
-                        Button("建立本机模拟会话") {
+                    if security.localSessionStatus(for: user, friend: friend, context: context) == "未建立" ||
+                        friend.sessionStatus == "identityReverified" {
+                        Button(friend.sessionStatus == "identityReverified" ? "核验后重建本机模拟会话" : "建立本机模拟会话") {
                             do { try security.createLocalSession(for: user, friend: friend, context: context); statusRefresh.toggle() }
-                            catch { errorMessage = error.localizedDescription }
+                            catch { errorMessage = LumaError.message(for: error) }
                         }
                     }
                     LabeledContent("协议", value: "v2 会话加密基础")
@@ -726,7 +737,7 @@ private struct LocalSearchView: View {
         defer { isSearching = false }
         do {
             results = try ChatViewModel(context: context, security: security).search(query, for: user)
-        } catch { errorMessage = error.localizedDescription }
+        } catch { errorMessage = LumaError.message(for: error) }
     }
 }
 
@@ -738,7 +749,10 @@ private struct FavoriteMessagesView: View {
     @Query private var conversations: [Conversation]
     @Query(sort: \Message.timestamp, order: .reverse) private var messages: [Message]
     private var favorites: [Message] {
-        let ids = Set(conversations.filter { $0.ownerID == user.id && $0.requiresPrivacyShield != true }.map(\.id))
+        let lockAll = security.preferences.privacyModeEnabled && security.preferences.privacyModeLockChats
+        let ids = Set(conversations.filter {
+            $0.ownerID == user.id && $0.requiresPrivacyShield != true && $0.requiresUnlock != true && !lockAll
+        }.map(\.id))
         return messages.filter { ids.contains($0.conversationID) && $0.isFavorite == true && !$0.deleted }
     }
     var body: some View {

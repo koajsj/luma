@@ -13,7 +13,7 @@
 | `messages` | `id`, `conversation_id`, `sender_user_id`, `sender_device_id`, `encryption_version`, `created_at`, `deleted_at` | 只放路由和版本；**禁止** `message_text`、明文文件名。 |
 | `message_envelopes` | `message_id`, `recipient_device_id`, `ciphertext`, `session_key_version`, `message_key_index` | 每目标设备独立密文；唯一 `(message_id, recipient_device_id)`；nonce/认证标签包含在约定信封中。 |
 | `message_receipts` | `message_id`, `recipient_device_id`, `delivered_at`, `read_at` | 只有明确事件可更新，尊重用户已读策略。 |
-| `attachments` | `id`, `message_id`, `object_key`, `ciphertext_size`, `ciphertext_hash`, `created_at` | 对象存储只存密文字节；下载 URL 短时生成，不长期落库。 |
+| `attachments` | `id`, `message_id`, `object_key`, `ciphertext_size`, `ciphertext_hash`, `status`, `created_at` | 实现中按 `pending → stored → verified → deleted` 管理，旧 `complete` 保持兼容；删除先撤销数据库读取权限，再清理密文对象与记录。 |
 | `presence_snapshots` | `user_id`, `last_seen_at` | 可选持久最后活动时间；在线/输入 TTL 在 Redis。 |
 | `sync_events` | `event_id`, `target_device_id`, `device_seq`, `type`, `payload_ciphertext`, `created_at` | 唯一 `(target_device_id, device_seq)` 和 `(target_device_id,event_id)`；负载不含消息明文。 |
 | `sync_cursors` | `device_id`, `acked_seq`, `updated_at` | 每设备最高连续 ack；事件清理与游标保留期协调。 |

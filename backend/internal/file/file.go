@@ -2,6 +2,7 @@ package file
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"github.com/google/uuid"
@@ -12,6 +13,7 @@ import (
 	"luma/backend/internal/config"
 	"luma/backend/internal/middleware"
 	"net/http"
+	"time"
 )
 
 type Service struct {
@@ -99,6 +101,17 @@ func (s Service) Upload(w http.ResponseWriter, r *http.Request) {
 		middleware.Fail(w, r, 503, "object_storage_unavailable")
 		return
 	}
+	tag, e := s.DB.Exec(r.Context(), "UPDATE attachments SET status='stored' WHERE id=$1 AND owner_user_id=$2 AND status='pending'", id, middleware.Current(r).UserID)
+	if e != nil {
+		// The object remains addressable only by its owner; reconciliation removes expired uploads.
+		middleware.Fail(w, r, 503, "storage_unavailable")
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		_ = s.Storage.Delete(r.Context(), key)
+		middleware.Fail(w, r, 409, "upload_expired")
+		return
+	}
 	w.WriteHeader(204)
 }
 func (s Service) Complete(w http.ResponseWriter, r *http.Request) {
@@ -114,7 +127,7 @@ func (s Service) Complete(w http.ResponseWriter, r *http.Request) {
 	var key string
 	var size int64
 	var expected []byte
-	e := s.DB.QueryRow(r.Context(), "SELECT object_key,ciphertext_size,ciphertext_hash FROM attachments WHERE id=$1 AND owner_user_id=$2 AND status='pending'", in.AttachmentID, middleware.Current(r).UserID).Scan(&key, &size, &expected)
+	e := s.DB.QueryRow(r.Context(), "SELECT object_key,ciphertext_size,ciphertext_hash FROM attachments WHERE id=$1 AND owner_user_id=$2 AND status IN ('pending','stored')", in.AttachmentID, middleware.Current(r).UserID).Scan(&key, &size, &expected)
 	if e != nil {
 		middleware.Fail(w, r, 404, "not_found")
 		return
@@ -131,9 +144,13 @@ func (s Service) Complete(w http.ResponseWriter, r *http.Request) {
 		middleware.Fail(w, r, 400, "ciphertext_mismatch")
 		return
 	}
-	_, e = s.DB.Exec(r.Context(), "UPDATE attachments SET status='complete' WHERE id=$1 AND owner_user_id=$2", in.AttachmentID, middleware.Current(r).UserID)
+	tag, e := s.DB.Exec(r.Context(), "UPDATE attachments SET status='verified' WHERE id=$1 AND owner_user_id=$2 AND status IN ('pending','stored')", in.AttachmentID, middleware.Current(r).UserID)
 	if e != nil {
 		middleware.Fail(w, r, 503, "storage_unavailable")
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		middleware.Fail(w, r, 409, "upload_state_changed")
 		return
 	}
 	w.WriteHeader(204)
@@ -154,7 +171,7 @@ func (s Service) authorized(w http.ResponseWriter, r *http.Request) (string, boo
 	e := s.DB.QueryRow(r.Context(), `SELECT a.object_key FROM attachments a
 		LEFT JOIN messages m ON m.id=a.message_id AND m.deleted_at IS NULL
 		LEFT JOIN conversation_members cm ON cm.conversation_id=m.conversation_id AND cm.user_id=$2
-		WHERE a.id=$1 AND a.status='complete' AND
+		WHERE a.id=$1 AND a.status IN ('complete','verified') AND
 		(a.owner_user_id=$2 OR (cm.user_id IS NOT NULL AND EXISTS (
 			SELECT 1 FROM friendships f WHERE f.user_a=LEAST($2::uuid,a.owner_user_id)
 			AND f.user_b=GREATEST($2::uuid,a.owner_user_id)
@@ -190,7 +207,7 @@ func (s Service) Delete(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	me := middleware.Current(r).UserID
 	var key string
-	e := s.DB.QueryRow(r.Context(), "SELECT object_key FROM attachments WHERE id=$1 AND owner_user_id=$2 AND status<>'deleted'", id, me).Scan(&key)
+	e := s.DB.QueryRow(r.Context(), "UPDATE attachments SET status='deleted' WHERE id=$1 AND owner_user_id=$2 RETURNING object_key", id, me).Scan(&key)
 	if e != nil {
 		middleware.Fail(w, r, 404, "not_found")
 		return
@@ -199,10 +216,50 @@ func (s Service) Delete(w http.ResponseWriter, r *http.Request) {
 		middleware.Fail(w, r, 503, "object_storage_unavailable")
 		return
 	}
-	_, e = s.DB.Exec(r.Context(), "UPDATE attachments SET status='deleted' WHERE id=$1 AND owner_user_id=$2", id, me)
+	_, e = s.DB.Exec(r.Context(), "DELETE FROM attachments WHERE id=$1 AND owner_user_id=$2 AND status='deleted'", id, me)
 	if e != nil {
 		middleware.Fail(w, r, 503, "storage_unavailable")
 		return
 	}
 	w.WriteHeader(204)
+}
+
+// Reconcile is safe to repeat after interruption: access is revoked by the DB
+// tombstone first, then orphaned ciphertext objects are removed.
+func (s Service) Reconcile(ctx context.Context) error {
+	if s.Storage == nil {
+		return nil
+	}
+	rows, err := s.DB.Query(ctx, `SELECT id,object_key FROM attachments
+		WHERE status='deleted' OR (status IN ('pending','stored') AND created_at < $1)`, time.Now().Add(-10*time.Minute))
+	if err != nil {
+		return err
+	}
+	type stale struct{ id, key string }
+	var items []stale
+	for rows.Next() {
+		var item stale
+		if err = rows.Scan(&item.id, &item.key); err != nil {
+			break
+		}
+		items = append(items, item)
+	}
+	if err == nil {
+		err = rows.Err()
+	}
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	for _, item := range items {
+		if err = s.Storage.Delete(ctx, item.key); err != nil {
+			return err
+		}
+		if _, err = s.DB.Exec(ctx, `DELETE FROM attachments WHERE id=$1 AND
+			(status='deleted' OR (status IN ('pending','stored') AND created_at < $2))`,
+			item.id, time.Now().Add(-10*time.Minute)); err != nil {
+			return err
+		}
+	}
+	return nil
 }

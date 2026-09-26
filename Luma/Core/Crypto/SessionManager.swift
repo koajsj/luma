@@ -46,10 +46,25 @@ struct SessionManager {
     func create(owner: User, friend: Friend, peerPublicKey: Data) throws -> SessionKey {
         guard friend.ownerID == owner.id else { throw SessionError.identityMismatch }
         if let existing = try session(ownerID: owner.id, friendID: friend.id) {
+            guard friend.sessionStatus != "identityKeyChanged" else { throw SessionError.identityMismatch }
             guard friend.identityFingerprint == IdentityFingerprint.make(publicKey: peerPublicKey) else {
                 throw SessionError.identityMismatch
             }
-            _ = try key(for: existing)
+            if friend.sessionStatus == "identityReverified" {
+                guard (1...999).contains(existing.keyVersion) else { throw SessionError.unsupportedVersion }
+                let version = existing.keyVersion + 1
+                let replacement = try agreement.derive(ownerUserID: owner.userID,
+                                                       peerPublicKey: peerPublicKey, version: version)
+                try keychain.save(replacement.withUnsafeBytes { Data($0) },
+                                  account: account(for: existing, version: version))
+                existing.keyVersion = version
+                existing.updatedAt = .now
+                friend.sessionStatus = "active"
+                do { try context.save() }
+                catch { try? keychain.delete(account(for: existing, version: version)); context.rollback(); throw error }
+                return existing
+            }
+            try validatePeerKey(existing, owner: owner, peerPublicKey: peerPublicKey)
             return existing
         }
         let fingerprint = IdentityFingerprint.make(publicKey: peerPublicKey)
@@ -76,11 +91,12 @@ struct SessionManager {
 
     func update(_ record: SessionKey, owner: User, friend: Friend, peerPublicKey: Data) throws {
         guard record.ownerID == owner.id, record.friendID == friend.id,
+              friend.sessionStatus != "identityKeyChanged", friend.sessionStatus != "identityReverified",
               friend.identityFingerprint == IdentityFingerprint.make(publicKey: peerPublicKey) else {
             throw SessionError.identityMismatch
         }
         guard (1...999).contains(record.keyVersion) else { throw SessionError.unsupportedVersion }
-        _ = try key(for: record)
+        try validatePeerKey(record, owner: owner, peerPublicKey: peerPublicKey)
         let nextVersion = record.keyVersion + 1
         let newKey = try agreement.derive(ownerUserID: owner.userID, peerPublicKey: peerPublicKey, version: nextVersion)
         try keychain.save(newKey.withUnsafeBytes { Data($0) }, account: account(for: record, version: nextVersion))
@@ -111,6 +127,15 @@ struct SessionManager {
         try RatchetManager(context: context, keychain: keychain, sessions: self).deleteStates(for: record.id)
         for version in 1...record.keyVersion {
             try keychain.delete(account(for: record, version: version))
+        }
+    }
+
+    private func validatePeerKey(_ record: SessionKey, owner: User, peerPublicKey: Data) throws {
+        let expected = try agreement.derive(ownerUserID: owner.userID, peerPublicKey: peerPublicKey,
+                                            version: record.keyVersion)
+        let existing = try key(for: record)
+        guard expected.withUnsafeBytes({ Data($0) }) == existing.withUnsafeBytes({ Data($0) }) else {
+            throw SessionError.identityMismatch
         }
     }
 

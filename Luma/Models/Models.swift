@@ -82,13 +82,15 @@ final class Friend {
     var encryptedRemark: Data?
     var identityFingerprint: String?
     var sessionStatus: String?
+    /// A server-advertised replacement remains untrusted until explicitly verified.
+    var pendingIdentityFingerprint: String?
     /// Server UUID is routing metadata; local Friend.id remains stable.
     var remoteUserID: UUID?
     var displayName: String { let value = remark?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""; return value.isEmpty ? nickname : value }
     init(ownerID: UUID, userID: String, nickname: String) {
         self.id = UUID(); self.ownerID = ownerID; self.userID = userID; self.nickname = nickname
         self.remark = nil; self.avatar = nil; self.privacyRestricted = false; self.encryptedRemark = nil
-        self.identityFingerprint = nil; self.sessionStatus = "none"
+        self.identityFingerprint = nil; self.sessionStatus = "none"; self.pendingIdentityFingerprint = nil
         self.remoteUserID = nil
     }
 }

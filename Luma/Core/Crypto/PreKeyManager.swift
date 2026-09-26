@@ -79,6 +79,12 @@ struct PreKeyManager {
         try keychain.delete(account(for: record))
     }
 
+    func purgeUsedKeyMaterial(for ownerID: UUID) throws {
+        for record in try records(for: ownerID) where record.type == "oneTime" && record.usedAt != nil {
+            try keychain.delete(account(for: record))
+        }
+    }
+
     func privateKey(for record: PreKeyMetadata) throws -> P256.KeyAgreement.PrivateKey {
         let data = try keychain.readRequired(account(for: record))
         guard let key = try? P256.KeyAgreement.PrivateKey(rawRepresentation: data),

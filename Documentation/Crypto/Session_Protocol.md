@@ -24,3 +24,9 @@ MessageEncryptor → 依据 encryptionVersion 加解密
 5. 完成独立协议评审后才把正式聊天从 v1 切换到网络 E2EE。
 
 消息元数据约定见[消息格式](../Protocol/Message_Format.md)。
+
+## v4 实验核心
+
+`V4Handshake` 验证签名预密钥和已固定的身份指纹，结合身份密钥、临时密钥、签名预密钥及可选一次性预密钥派生初始共享密钥。`V4RatchetState` 建立独立发送与接收链，支持 DH 换钥、每消息密钥、有限乱序和重放拒绝。它们目前只供本机协议实验，不使用正式 `MessageRepository` / `SyncCoordinator`。跨 SwiftData、Keychain 与同步游标的崩溃一致性、预密钥领取、设备撤销后的重新建链及安全审计完成前，不能把 v4 切到线上聊天。
+
+设计参考：[Signal X3DH 规范](https://signal.org/docs/specifications/x3dh/)与[Signal Double Ratchet 规范](https://signal.org/docs/specifications/doubleratchet/)。当前实现是 Luma 的实验性子集，不能声称兼容 Signal 协议。

@@ -5,15 +5,21 @@ import Security
 import SwiftData
 
 enum BackupError: LocalizedError {
-    case invalidFile, wrongAccount, invalidPassword, incompleteData
+    case invalidFile, wrongAccount, invalidPassword, incompleteData, onlineHistoryCannotRestore
     var errorDescription: String? {
         switch self {
         case .invalidFile: "备份文件格式无效或已损坏"
         case .wrongAccount: "此备份属于另一个 UserID"
         case .invalidPassword: "备份密码错误或文件已损坏"
         case .incompleteData: "备份引用不完整，未恢复任何数据"
+        case .onlineHistoryCannotRestore: "当前备份包含在线消息或仍有在线同步进度，无法安全恢复。请保留备份，并先在原设备完成在线数据核对。"
         }
     }
+}
+
+/// Persisted in CleanupState.state without a new SwiftData schema dependency.
+enum RecoveryState: String {
+    case preparing, restoring, verifying, completed, failed
 }
 
 /// Portable, password-encrypted export. Keychain keys and password verifiers never enter the archive.
@@ -115,6 +121,8 @@ struct BackupManager {
 
     /// Replaces only this unlocked account's local content, after decoding and validating the complete archive.
     func restore(_ file: Data, password: String, into user: User) throws {
+        try Self.resumeRestoreCleanup(for: user, context: context, encryption: encryption,
+                                      keychain: sessions?.keychain ?? KeychainManager())
         guard file.count <= 100_000_000,
               let envelope = try? JSONDecoder().decode(Envelope.self, from: file),
               envelope.format == "luma-backup-v1", envelope.rounds == 310_000,
@@ -136,7 +144,27 @@ struct BackupManager {
               archive.attachments.allSatisfy({ messageIDs.contains($0.messageID) }),
               archive.reactions.allSatisfy({ messageIDs.contains($0.messageID) }) else { throw BackupError.incompleteData }
 
+        // The archive contains no server cursor or consumed one-time private keys.
+        // Replacing an online snapshot would silently skip events or make replay undecryptable.
+        let currentConversations = try context.fetch(FetchDescriptor<Conversation>()).filter { $0.ownerID == user.id }
+        let currentConversationIDs = Set(currentConversations.map(\.id))
+        let hasOnlineMessages = try context.fetch(FetchDescriptor<Message>()).contains {
+            currentConversationIDs.contains($0.conversationID) && $0.transportEncryptionVersion == 3
+        }
+        let hasSyncProgress = try context.fetch(FetchDescriptor<RemoteSyncCheckpoint>()).contains {
+            $0.ownerID == user.id && $0.cursor > 0
+        }
+        let hasOutgoing = try context.fetch(FetchDescriptor<OutgoingMessageQueueItem>()).contains { $0.ownerID == user.id }
+        guard !archive.messages.contains(where: { $0.transportEncryptionVersion == 3 }),
+              !hasOnlineMessages, !hasSyncProgress, !hasOutgoing else {
+            throw BackupError.onlineHistoryCannotRestore
+        }
+
+        try Self.validateKeyState(for: user, context: context,
+                                  keychain: sessions?.keychain ?? KeychainManager())
+
         let marker = CleanupState(ownerID: user.id, userID: user.userID, operation: "backupRestore")
+        marker.state = RecoveryState.preparing.rawValue
         let oldSessions = try context.fetch(FetchDescriptor<SessionKey>()).filter { $0.ownerID == user.id }
         let oldSessionIDs = Set(oldSessions.map(\.id))
         let oldChains = try context.fetch(FetchDescriptor<ChainState>()).filter { oldSessionIDs.contains($0.sessionID) }
@@ -150,6 +178,8 @@ struct BackupManager {
         marker.encryptedPayload = try encryption.encrypt(JSONEncoder().encode(obsoleteAccounts),
             authenticatedData: Self.cleanupBinding(marker)).bytes
         context.insert(marker)
+        try context.save()
+        marker.state = RecoveryState.restoring.rawValue
         try context.save()
         do {
             try context.transaction {
@@ -208,7 +238,10 @@ struct BackupManager {
                 for record in archive.attachments {
                     let item = Attachment(messageID: record.messageID, type: record.type, path: "")
                     item.id = record.id
-                    item.encryptedMetadata = try encryption.encrypt(JSONEncoder().encode(record.metadata),
+                    // Backup contains metadata, not attachment bytes. Never restore a stale local path.
+                    let metadata = AttachmentMetadata(name: record.metadata.name, encryptedPath: nil,
+                                                      metadata: record.metadata.metadata)
+                    item.encryptedMetadata = try encryption.encrypt(JSONEncoder().encode(metadata),
                                                                     authenticatedData: Data("luma-attachment-v1|\(item.id.uuidString)".utf8)).bytes
                     context.insert(item)
                 }
@@ -217,18 +250,18 @@ struct BackupManager {
                     item.id = record.id; context.insert(item)
                 }
                 marker.dataCommitted = true
-                marker.state = "processing"
+                marker.state = RecoveryState.verifying.rawValue
                 try context.save()
             }
         } catch {
             context.rollback()
-            marker.state = "failed"
+            marker.state = RecoveryState.failed.rawValue
             try? context.save()
             throw error
         }
-        do { try Self.finishRestoreCleanup(marker, context: context, encryption: encryption,
+        do { try Self.finishRestoreCleanup(marker, user: user, context: context, encryption: encryption,
                                            keychain: sessions?.keychain ?? KeychainManager()) }
-        catch { marker.state = "failed"; try? context.save(); throw error }
+        catch { marker.state = RecoveryState.failed.rawValue; try? context.save(); throw error }
     }
 
     static func resumeRestoreCleanup(for user: User, context: ModelContext, encryption: EncryptionService,
@@ -237,25 +270,54 @@ struct BackupManager {
             $0.ownerID == user.id && $0.operation == "backupRestore" && $0.state != "completed"
         }) {
             if marker.dataCommitted {
-                do { try finishRestoreCleanup(marker, context: context, encryption: encryption, keychain: keychain) }
-                catch { marker.state = "failed"; try? context.save(); throw error }
+                do { try finishRestoreCleanup(marker, user: user, context: context, encryption: encryption, keychain: keychain) }
+                catch { marker.state = RecoveryState.failed.rawValue; try? context.save(); throw error }
             }
-            else { marker.state = "failed"; try context.save() }
+            else {
+                // The data transaction never committed; the old account remains intact.
+                context.delete(marker)
+                try context.save()
+            }
         }
     }
 
-    private static func finishRestoreCleanup(_ marker: CleanupState, context: ModelContext,
+    private static func finishRestoreCleanup(_ marker: CleanupState, user: User, context: ModelContext,
                                              encryption: EncryptionService, keychain: KeychainManager) throws {
+        guard marker.dataCommitted else { throw BackupError.incompleteData }
+        marker.state = RecoveryState.verifying.rawValue
+        try context.save()
+        try validateKeyState(for: user, context: context, keychain: keychain)
+        let conversationIDs = Set(try context.fetch(FetchDescriptor<Conversation>()).filter({
+            $0.ownerID == user.id
+        }).map(\.id))
+        let messageIDs = Set(try context.fetch(FetchDescriptor<Message>()).filter({
+            conversationIDs.contains($0.conversationID)
+        }).map(\.id))
+        let metadata = PrivateMetadataStore(context: context, encryption: encryption)
+        for item in try context.fetch(FetchDescriptor<Attachment>()).filter({ messageIDs.contains($0.messageID) }) {
+            guard try metadata.attachmentMetadata(for: item).encryptedPath == nil else { throw BackupError.incompleteData }
+        }
         guard let payload = marker.encryptedPayload else { throw BackupError.incompleteData }
         let plain = try encryption.decrypt(EncryptedData(bytes: payload), authenticatedData: cleanupBinding(marker))
         let accounts = try JSONDecoder().decode([String].self, from: plain)
         for account in accounts { try keychain.delete(account) }
         try FileTransferService.purgeAccount(ownerID: marker.ownerID)
-        marker.state = "completed"
+        marker.state = RecoveryState.completed.rawValue
         marker.encryptedPayload = nil
         try context.save()
         context.delete(marker)
         try context.save()
+    }
+
+    private static func validateKeyState(for user: User, context: ModelContext,
+                                         keychain: KeychainManager) throws {
+        _ = try KeyManager(keychain: keychain).read(for: user.userID)
+        guard let identity = user.identityPublicKey,
+              try IdentityKeyManager(keychain: keychain).readPublicKey(for: user.userID) == identity,
+              let device = try context.fetch(FetchDescriptor<Device>()).first(where: { $0.ownerID == user.id }),
+              try DeviceKeyManager(keychain: keychain).readPublicKey(for: device.id) == device.publicKey else {
+            throw BackupError.incompleteData
+        }
     }
 
     private static func cleanupBinding(_ marker: CleanupState) -> Data {
