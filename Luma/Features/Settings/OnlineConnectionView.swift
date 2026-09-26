@@ -38,7 +38,7 @@ struct OnlineConnectionView: View {
                         .disabled(address.isEmpty || working)
                 }
             } header: { Text("连接") } footer: {
-                Text("在线登记是自愿操作。本地密码、PIN 和 Master Key 不会上传。服务器地址须使用可信的 HTTPS。")
+                Text("默认使用本地聊天；进入聊天后可显式切换在线开发模式。调试地址可在 Xcode Run Scheme 设置 LUMA_DEV_API_URL，也可在此输入。仅接受设备信任的 HTTPS，本地密码、PIN 和 Master Key 不会上传。")
             }
 
             if hasTokens {
@@ -141,7 +141,7 @@ struct OnlineConnectionView: View {
     private func loadState() {
         do {
             (registration, hasTokens) = try viewModel.localState()
-            address = registration?.baseURL.absoluteString ?? ""
+            address = registration?.baseURL.absoluteString ?? ProcessInfo.processInfo.environment["LUMA_DEV_API_URL"] ?? ""
         } catch { errorMessage = error.localizedDescription }
     }
 

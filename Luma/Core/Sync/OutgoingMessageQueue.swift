@@ -39,10 +39,20 @@ struct OutgoingMessageQueue {
                 // Never transmit an orphaned queue item.
                 context.delete(item); try context.save(); continue
             }
-            var body = try encryption.decrypt(EncryptedData(bytes: item.encryptedRequest), authenticatedData: binding(item))
-            item.state = "sending"
-            try context.save()
             do {
+                var body: Data
+                do {
+                    body = try encryption.decrypt(EncryptedData(bytes: item.encryptedRequest), authenticatedData: binding(item))
+                } catch {
+                    // A damaged request cannot become valid through network retries.
+                    item.attempts = maxAttempts
+                    item.state = "failed"
+                    message.deliveryStatus = .failed
+                    try context.save()
+                    throw error
+                }
+                item.state = "sending"
+                try context.save()
                 if !item.prepared {
                     body = try await prepare(item, body)
                     item.encryptedRequest = try encryption.encrypt(body, authenticatedData: binding(item)).bytes
@@ -60,6 +70,7 @@ struct OutgoingMessageQueue {
                 context.delete(item)
                 try context.save()
             } catch {
+                if item.state == "failed" { throw error }
                 if error is CancellationError || (error as? URLError)?.code == .cancelled {
                     item.state = "pending"
                     item.nextAttemptAt = .now

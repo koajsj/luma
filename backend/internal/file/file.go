@@ -15,22 +15,28 @@ import (
 )
 
 type Service struct {
-	DB     *pgxpool.Pool
-	Client *minio.Client
-	Bucket string
+	DB      *pgxpool.Pool
+	Storage Storage
 }
 
 func New(c config.Config, db *pgxpool.Pool) (Service, error) {
-	s := Service{DB: db, Bucket: c.S3Bucket}
+	s := Service{DB: db}
+	if c.LocalStorageDir != "" {
+		local, err := NewLocalStorage(c.LocalStorageDir)
+		s.Storage = local
+		return s, err
+	}
 	if c.S3Endpoint == "" {
 		return s, nil
 	}
 	client, e := minio.New(c.S3Endpoint, &minio.Options{Creds: credentials.NewStaticV4(c.S3AccessKey, c.S3SecretKey, ""), Secure: c.S3Secure})
-	s.Client = client
+	if e == nil {
+		s.Storage = S3Storage{Client: client, Bucket: c.S3Bucket}
+	}
 	return s, e
 }
 func (s Service) ready(w http.ResponseWriter, r *http.Request) bool {
-	if s.Client == nil {
+	if s.Storage == nil {
 		middleware.Fail(w, r, 503, "object_storage_unconfigured")
 		return false
 	}
@@ -88,7 +94,7 @@ func (s Service) Upload(w http.ResponseWriter, r *http.Request) {
 		middleware.Fail(w, r, 400, "ciphertext_mismatch")
 		return
 	}
-	_, e = s.Client.PutObject(r.Context(), s.Bucket, key, bytes.NewReader(data), size, minio.PutObjectOptions{ContentType: "application/octet-stream"})
+	e = s.Storage.Put(r.Context(), key, data)
 	if e != nil {
 		middleware.Fail(w, r, 503, "object_storage_unavailable")
 		return
@@ -113,7 +119,7 @@ func (s Service) Complete(w http.ResponseWriter, r *http.Request) {
 		middleware.Fail(w, r, 404, "not_found")
 		return
 	}
-	obj, e := s.Client.GetObject(r.Context(), s.Bucket, key, minio.GetObjectOptions{})
+	obj, e := s.Storage.Open(r.Context(), key)
 	if e != nil {
 		middleware.Fail(w, r, 503, "object_storage_unavailable")
 		return
@@ -167,7 +173,7 @@ func (s Service) Content(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	obj, e := s.Client.GetObject(r.Context(), s.Bucket, key, minio.GetObjectOptions{})
+	obj, e := s.Storage.Open(r.Context(), key)
 	if e != nil {
 		middleware.Fail(w, r, 503, "object_storage_unavailable")
 		return
@@ -189,7 +195,7 @@ func (s Service) Delete(w http.ResponseWriter, r *http.Request) {
 		middleware.Fail(w, r, 404, "not_found")
 		return
 	}
-	if e = s.Client.RemoveObject(r.Context(), s.Bucket, key, minio.RemoveObjectOptions{}); e != nil {
+	if e = s.Storage.Delete(r.Context(), key); e != nil {
 		middleware.Fail(w, r, 503, "object_storage_unavailable")
 		return
 	}

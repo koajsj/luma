@@ -19,6 +19,7 @@ struct PrivacyCenterView: View {
                 LabeledContent("身份密钥", value: security.identityKeyStatus(for: user))
                 LabeledContent("设备密钥", value: security.deviceKeyStatus(for: user, context: context))
                 LabeledContent("端到端加密", value: "未启用")
+                NavigationLink("安全与隐私报告") { PrivacyReportView(user: user) }
             }
             Section("隐私模式") {
                 Toggle("一键开启", isOn: preference(\.privacyModeEnabled))
@@ -57,7 +58,53 @@ struct PrivacyCenterView: View {
             catch { errorMessage = error.localizedDescription }
         })
     }
-    private func save() { do { try context.save() } catch { errorMessage = error.localizedDescription } }
+}
+
+struct PrivacyReportView: View {
+    let user: User
+    @Environment(SecurityManager.self) private var security
+    @Environment(\.modelContext) private var context
+
+    var body: some View {
+        Form {
+            Section("数据保护") {
+                status("本地消息加密", "已启用 · AES-GCM", "lock.doc")
+                status("Keychain 密钥保护", security.keychainStatus(), "key.horizontal")
+            }
+            Section("身份") {
+                status("Identity Key", security.identityKeyStatus(for: user), "person.crop.circle.badge.checkmark")
+                status("Device Key", security.deviceKeyStatus(for: user, context: context), "iphone.gen3")
+            }
+            Section("通信") {
+                status("密文消息传输", "仅显式在线 v3 文字聊天", "lock.bubble")
+                status("设备身份验证", "在线登记后使用设备签名", "checkmark.shield")
+                Text("服务器可见通信关系、时间及密文大小；本地聊天不会自动上传。")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+            Section("隐私保护") {
+                status("Privacy Shield", "可配置录屏遮罩与敏感聊天", "hand.raised")
+                status("Chat Lock", "可按聊天启用 PIN / Face ID", "lock")
+                status("截图检测", security.preferences.screenshotAlerts ? "已开启 · 本机检测" : "已关闭", "camera.viewfinder")
+                status("后台隐藏", security.preferences.hideInBackground ? "已开启" : "已关闭", "rectangle.on.rectangle.slash")
+            }
+            Section("当前限制") {
+                Text("尚未完成完整 Signal E2EE。当前仅有设备间加密通信基础，未完成完整身份验证、Double Ratchet 和独立安全审计。")
+                Text("截图检测发生在截图之后；无法禁止截图或保证遮罩覆盖所有采集方式。")
+                Text("本页展示本机能力与设置状态，不代表对远端设备或服务器的实时安全审计。")
+            }
+            .font(.footnote)
+            .foregroundStyle(.secondary)
+        }
+        .navigationTitle("安全与隐私报告")
+    }
+
+    private func status(_ title: String, _ detail: String, _ symbol: String) -> some View {
+        LabeledContent {
+            Text(detail).foregroundStyle(.secondary)
+        } label: {
+            Label(title, systemImage: symbol)
+        }
+    }
 }
 
 struct PrivacyShieldView: View {

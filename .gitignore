@@ -2,3 +2,6 @@
 DerivedData/
 *.xcuserstate
 xcuserdata/
+backend/.env.local
+backend/local-data/
+backend/local-certs/

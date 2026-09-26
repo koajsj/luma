@@ -6,8 +6,9 @@
 
 - Go 1.24+：`cd backend && go mod download && go run ./cmd/luma`
 - 本地容器：`cd backend && docker compose up --build`。示例仅绑定宿主机 `127.0.0.1:8080`，用开发凭据和明文 HTTP；不得直接对公网开放。
+- 本地 iOS 联调见 [LOCAL_DEVELOPMENT.md](LOCAL_DEVELOPMENT.md)：使用可信开发 TLS、隔离 PostgreSQL/Redis、设备签名登录和双模拟器流程。Compose 已改用持久化本地密文卷，不再依赖 MinIO。
 - 生产启动必须设置 `TLS_CERT_FILE` 与 `TLS_KEY_FILE`。只有明确设置 `LUMA_ALLOW_INSECURE_LOCAL=true` 才允许不带 TLS 证书启动；此开关仅供本机开发。生产还需独立的反向代理、监控、备份、密钥与证书管理。
-- 必需：`DATABASE_URL`。可选：`REDIS_URL`、`S3_ENDPOINT`、`S3_BUCKET`、`S3_ACCESS_KEY`、`S3_SECRET_KEY`、`S3_SECURE`、`LUMA_ADDR`、`MIGRATIONS_DIR`。S3 未配置时文件接口返回 `503`；PostgreSQL/Redis 缺失会阻止启动。
+- 必需：`DATABASE_URL`。可选：`REDIS_URL`、`LOCAL_STORAGE_DIR`、`S3_ENDPOINT`、`S3_BUCKET`、`S3_ACCESS_KEY`、`S3_SECRET_KEY`、`S3_SECURE`、`LUMA_ADDR`、`MIGRATIONS_DIR`。`LOCAL_STORAGE_DIR` 为绝对路径并优先于 S3；两者均未配置时文件接口返回 `503`。PostgreSQL/Redis 缺失会阻止启动。
 - 启动时依序执行 `migrations/*.sql`，`schema_migrations` 记录已执行版本。部署前须备份数据库；迁移不含回滚。
 
 OpenAPI 见 [openapi/openapi.yaml](openapi/openapi.yaml)。所有受保护 HTTP 请求和 WebSocket 握手均要求 Bearer token 与设备 Ed25519 请求签名。具体签名文本见 OpenAPI `info.description`；`/auth/refresh` 使用 refresh token 同样签名。访问 token 15 分钟、refresh token 30 天，只持久化哈希，刷新时轮换并撤销旧访问 token；重放旧 refresh token 会撤销整个令牌家族。
