@@ -45,3 +45,13 @@
 每个目标设备新建 P-256 临时密钥，用临时私钥分别与目标 Device Key、Signed PreKey 和可选 One-Time PreKey 做 ECDH；连接共享秘密，以 SHA-256(AAD) 为盐、`luma-device-message-key.v3` 为 info，经 HKDF-SHA256 派生 256 位消息密钥。`messageKeyIndex` 是每信封随机非负整数，当前不是 Double Ratchet 链序号。接收并持久化后删除用过的一次性私钥。Signed PreKey 与 Device Key 仍保留，**不能据此声称完整前向保密**。
 
 发送给多个设备时必须分别生成信封；后端验证信封集合与当前活动目标设备完全一致。同一个 `messageID` 作为幂等键。接收端按连续 `deviceSeq` 验证、解密、重加密落盘，之后发送送达回执并 ack。失败不推进游标。在线文字已使用主密钥加密的持久待发队列；离线时先保存本地消息与加密意图，联网后生成信封并加密保存最终请求，重试复用同一请求和幂等键。真实两设备联调仍待完成。
+
+## v4 设备 Ratchet 信封（新在线文字消息）
+
+`POST /v1/messages` 的 `encryptionVersion=4`，每个 `recipientEnvelopes` 项仍传 `recipientDeviceID`、`keyVersion`、`messageKeyIndex` 和 base64url `ciphertext`。该密文字段实际是 `V4RatchetMessage` JSON：`messageID`、`conversationID`、发送/接收设备 ID、版本、Ratchet 公钥、前一发送链长度、消息序号、会话版本、首次会话握手头、随机 nonce、AES-GCM 密文及认证标签。除密文内的 `kind`、UserID、文字和编辑版本外，这些头字段及长度/时序信息均可被服务器看到；固定顺序、长度前缀的头编码作为 AES-GCM AAD。首次握手头的身份与设备绑定签名也参与认证。
+
+客户端先验证后端返回的 P-256 账号身份与本地固定指纹一致，再验证其对 v4 Curve25519 身份的绑定签名、Signed PreKey 的 Ed25519 身份签名及版本。私钥和 Ratchet 链只保留在 Keychain；接收后的正文重新以本地 v1 Master Key 加密。v4 控制事件使用同一逐设备 Ratchet 链：密文内的 `V4EventEnvelope` 包含事件 ID、原消息 ID、会话 ID、操作者、类型、revision、可选正文或 Emoji 操作；外层只暴露路由元数据。接收端核对密文内外绑定后才应用编辑、删除、已读和 Reaction。后端将外层 UUID 规范化为小写再做会话比较和幂等判断；编码大小写不改变密文头认证数据。旧版读取保持不变。两个独立模拟器已通过本地后端闭环，实体设备与独立审计前不能宣称完整 E2EE。
+
+## v4 附件载荷（客户端已实现，跨设备附件联调待验证）
+
+在线附件仍使用 `POST /v1/messages`、`encryptionVersion=4` 和逐设备 `recipientEnvelopes`。外层新增 `attachmentIDs`，服务器可见随机对象 ID 并据此将已上传密文对象绑定到消息。每个 Ratchet 密文正文的 `kind=attachment`，内含发送/目标 UserID 以及 `V4AttachmentDescriptor`：本地随机附件 ID、服务器对象 ID、消息/会话 ID、图片/文件/语音类型、原文件名、随机 256 位附件密钥和 SHA-256 密文哈希。服务器看不到这些正文成员、文件名、密钥或缩略图明文；文件服务另可见对象大小与密文哈希。文件使用独立 AES-GCM，AAD 绑定附件、消息、会话 ID 和类型；AES-GCM combined 字节包含随机 nonce、密文和认证标签。接收端先验证 Ratchet 消息及描述绑定，再按哈希和认证标签校验下载文件。旧 v1/v2/v3 读取不变。

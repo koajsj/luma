@@ -1,9 +1,8 @@
 import CryptoKit
 import Foundation
 
-/// Experimental, non-header-encrypted Double Ratchet core. This type stays in memory;
-/// callers must persist a sealed state together with message/cursor updates before use online.
-struct V4RatchetState {
+/// Non-header-encrypted Double Ratchet state. Persist only in device-only Keychain records.
+struct V4RatchetState: Codable {
     var rootKey: Data
     var sendingChainKey: Data?
     var receivingChainKey: Data?
@@ -13,6 +12,18 @@ struct V4RatchetState {
     var receivingIndex: Int
     var previousSendingLength: Int
     var skippedKeys: [String: Data]
+
+    func validate() throws {
+        guard rootKey.count == 32, ownRatchetPrivateKey.count == 32,
+              sendingChainKey == nil || sendingChainKey?.count == 32,
+              receivingChainKey == nil || receivingChainKey?.count == 32,
+              remoteRatchetPublicKey == nil || remoteRatchetPublicKey?.count == 32,
+              sendingIndex >= 0, receivingIndex >= 0, previousSendingLength >= 0,
+              skippedKeys.count <= 2_000, skippedKeys.values.allSatisfy({ $0.count == 32 }),
+              (try? Curve25519.KeyAgreement.PrivateKey(rawRepresentation: ownRatchetPrivateKey)) != nil else {
+            throw V4ProtocolError.invalidHandshake
+        }
+    }
 
     static func initiator(sharedSecret: SymmetricKey,
                           ownEphemeral: Curve25519.KeyAgreement.PrivateKey,
@@ -35,7 +46,8 @@ struct V4RatchetState {
     }
 
     mutating func encrypt(_ plaintext: Data, messageID: UUID, conversationID: UUID,
-                          senderDeviceID: UUID, receiverDeviceID: UUID) throws -> V4RatchetMessage {
+                          senderDeviceID: UUID, receiverDeviceID: UUID,
+                          initialHeader: V4InitialHeader? = nil, sessionVersion: Int = 1) throws -> V4RatchetMessage {
         guard let chain = sendingChainKey, sendingIndex < Int.max else { throw V4ProtocolError.invalidHandshake }
         let (next, messageKey) = Self.advanceChain(chain)
         let keyPair = try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: ownRatchetPrivateKey)
@@ -43,6 +55,7 @@ struct V4RatchetState {
             senderDeviceID: senderDeviceID, receiverDeviceID: receiverDeviceID,
             encryptionVersion: 4, ratchetPublicKey: keyPair.publicKey.rawRepresentation,
             previousChainLength: previousSendingLength, messageIndex: sendingIndex,
+            sessionVersion: sessionVersion, initialHeader: initialHeader,
             nonce: Data(), ciphertext: Data(), authenticationTag: Data())
         let sealed = try AES.GCM.seal(plaintext, using: SymmetricKey(data: messageKey),
                                       authenticating: header.authenticatedHeader())
@@ -50,6 +63,7 @@ struct V4RatchetState {
             senderDeviceID: header.senderDeviceID, receiverDeviceID: header.receiverDeviceID,
             encryptionVersion: 4, ratchetPublicKey: header.ratchetPublicKey,
             previousChainLength: header.previousChainLength, messageIndex: header.messageIndex,
+            sessionVersion: header.sessionVersion, initialHeader: header.initialHeader,
             nonce: sealed.nonce.withUnsafeBytes { Data($0) }, ciphertext: sealed.ciphertext,
             authenticationTag: sealed.tag)
         sendingChainKey = next
@@ -62,7 +76,7 @@ struct V4RatchetState {
         guard message.encryptionVersion == 4, message.receiverDeviceID == expectedReceiver,
               message.senderDeviceID == expectedSender,
               message.conversationID == expectedConversation,
-              message.messageIndex >= 0, message.previousChainLength >= 0,
+              message.messageIndex >= 0, message.previousChainLength >= 0, message.sessionVersion > 0,
               message.nonce.count == 12, message.authenticationTag.count == 16,
               message.ciphertext.count <= 1_048_576,
               (try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: message.ratchetPublicKey)) != nil else {
@@ -165,6 +179,8 @@ struct V4RatchetMessage: Codable {
     let ratchetPublicKey: Data
     let previousChainLength: Int
     let messageIndex: Int
+    let sessionVersion: Int
+    let initialHeader: V4InitialHeader?
     let nonce: Data
     let ciphertext: Data
     let authenticationTag: Data
@@ -175,6 +191,8 @@ struct V4RatchetMessage: Codable {
             Data(senderDeviceID.uuidString.lowercased().utf8),
             Data(receiverDeviceID.uuidString.lowercased().utf8),
             Data(String(encryptionVersion).utf8), ratchetPublicKey,
-            Data(String(previousChainLength).utf8), Data(String(messageIndex).utf8)])
+            Data(String(previousChainLength).utf8), Data(String(messageIndex).utf8),
+            Data(String(sessionVersion).utf8), initialHeader?.transcript() ?? Data(),
+            initialHeader?.signature ?? Data()])
     }
 }

@@ -32,15 +32,18 @@ struct OutgoingMessageQueue {
 
     func drain(validate: ((OutgoingMessageQueueItem) async throws -> Void)? = nil,
                prepare: (OutgoingMessageQueueItem, Data) async throws -> Data,
+               afterPrepared: ((OutgoingMessageQueueItem, Data) throws -> Void)? = nil,
                send: ((Data, UUID) async throws -> Void)? = nil) async throws {
         guard !Self.draining.contains(backendDeviceID) else { return }
         Self.draining.insert(backendDeviceID)
         defer { Self.draining.remove(backendDeviceID) }
         let items = try context.fetch(FetchDescriptor<OutgoingMessageQueueItem>()).filter {
             $0.ownerID == ownerID && $0.backendDeviceID == backendDeviceID &&
-            $0.state != "sent" && $0.attempts < maxAttempts && $0.nextAttemptAt <= .now
-        }.sorted { $0.createdAt < $1.createdAt }
+            $0.state != "sent" && $0.attempts < maxAttempts
+        }.sorted { $0.createdAt == $1.createdAt ? $0.id.uuidString < $1.id.uuidString : $0.createdAt < $1.createdAt }
         for item in items {
+            // Do not let a later message overtake one waiting for its retry window.
+            guard item.nextAttemptAt <= .now else { return }
             guard let message = try context.fetch(FetchDescriptor<Message>()).first(where: { $0.id == item.messageID }) else {
                 // Never transmit an orphaned queue item.
                 context.delete(item); try context.save(); continue
@@ -66,6 +69,9 @@ struct OutgoingMessageQueue {
                     item.prepared = true
                     try context.save()
                 }
+                // A v4 ratchet advance is finalized only after the exact encrypted request
+                // is durable in the outbox, and before any network transmission.
+                try afterPrepared?(item, body)
                 if let send { try await send(body, item.messageID) }
                 else {
                     _ = try await client.request("POST", path: "/messages", body: body,

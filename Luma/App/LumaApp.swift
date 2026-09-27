@@ -12,11 +12,12 @@ struct LumaApp: App {
                 .environment(security)
                 .environment(privacyShield)
         }
-        .modelContainer(for: [User.self, Device.self, Friend.self, Conversation.self, Message.self, Attachment.self, UserPresence.self, Reaction.self, SearchIndexEntry.self, SessionKey.self, PreKeyMetadata.self, ChainState.self, RemoteSyncCheckpoint.self, RemoteDeviceTrust.self, OutgoingMessageQueueItem.self, CleanupState.self])
+        .modelContainer(for: [User.self, Device.self, Friend.self, Conversation.self, Message.self, Attachment.self, UserPresence.self, Reaction.self, SearchIndexEntry.self, V4PendingEvent.self, SessionKey.self, PreKeyMetadata.self, ChainState.self, V4SessionMetadata.self, V4DeviceMetadata.self, RemoteSyncCheckpoint.self, RemoteDeviceTrust.self, OutgoingMessageQueueItem.self, CleanupState.self])
     }
 }
 
 struct RootView: View {
+    @AppStorage("privacyOnboardingCompleted") private var privacyOnboardingCompleted = false
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.modelContext) private var modelContext
     @Environment(SecurityManager.self) private var security
@@ -29,6 +30,11 @@ struct RootView: View {
     var body: some View {
         ZStack {
         Group {
+            if !privacyOnboardingCompleted {
+                PrivacyOnboardingView {
+                    privacyOnboardingCompleted = true
+                }
+            } else {
             switch security.phase {
             case .loading: ProgressView("正在打开 Luma")
             case .registration, .login: AuthenticationView()
@@ -37,6 +43,7 @@ struct RootView: View {
             case .unlocked:
                 if let activeUser { MainTabsView(user: activeUser) }
                 else { AuthenticationView() }
+            }
             }
         }
         .accessibilityHidden(shouldMask)
@@ -98,13 +105,17 @@ struct MainTabsView: View {
         }
         .task(id: scenePhase) {
             guard scenePhase == .active else { return }
+            try? ChatViewModel(context: context, security: security).cleanAttachmentFiles(for: user)
             while !Task.isCancelled && security.phase == .unlocked {
                 if let registration = try? RemoteSessionStore().registration(for: user.userID),
                    (try? RemoteSessionStore().tokens(for: user.userID)) != nil,
                    let client = try? RemoteAPIClient(baseURL: registration.baseURL, userID: user.userID),
                    (try? security.encryptionService()) != nil {
-                    try? await RemoteMessageRepository(context: context, user: user, security: security,
-                        client: client, registration: registration).retryOutgoing()
+                    let repository = RemoteMessageRepository(context: context, user: user,
+                        security: security, client: client, registration: registration)
+                    try? await repository.retryOutgoing()
+                    // Resume inbound cursor sync after unlock/restart even if no chat is open.
+                    _ = try? await repository.sync()
                 }
                 try? await Task.sleep(for: .seconds(15))
             }
@@ -116,5 +127,5 @@ struct MainTabsView: View {
     RootView()
         .environment(SecurityManager())
         .environment(PrivacyShieldManager())
-        .modelContainer(for: [User.self, Device.self, Friend.self, Conversation.self, Message.self, Attachment.self, UserPresence.self, Reaction.self, SearchIndexEntry.self, SessionKey.self, PreKeyMetadata.self, ChainState.self, RemoteSyncCheckpoint.self, RemoteDeviceTrust.self, OutgoingMessageQueueItem.self, CleanupState.self], inMemory: true)
+        .modelContainer(for: [User.self, Device.self, Friend.self, Conversation.self, Message.self, Attachment.self, UserPresence.self, Reaction.self, SearchIndexEntry.self, V4PendingEvent.self, SessionKey.self, PreKeyMetadata.self, ChainState.self, V4SessionMetadata.self, V4DeviceMetadata.self, RemoteSyncCheckpoint.self, RemoteDeviceTrust.self, OutgoingMessageQueueItem.self, CleanupState.self], inMemory: true)
 }

@@ -1,7 +1,7 @@
 import CryptoKit
 import Foundation
 
-/// Experimental v4 handshake core. It is not connected to the online repository.
+/// v4 handshake core. A caller must pin the legacy account identity binding before use online.
 /// Agreement and signing identities have separate keys; private material stays with the caller.
 struct V4IdentityKeys {
     let agreement: Curve25519.KeyAgreement.PrivateKey
@@ -10,6 +10,11 @@ struct V4IdentityKeys {
     init() {
         agreement = Curve25519.KeyAgreement.PrivateKey()
         signing = Curve25519.Signing.PrivateKey()
+    }
+
+    init(agreement: Curve25519.KeyAgreement.PrivateKey, signing: Curve25519.Signing.PrivateKey) {
+        self.agreement = agreement
+        self.signing = signing
     }
 }
 

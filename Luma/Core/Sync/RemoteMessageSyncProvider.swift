@@ -14,12 +14,14 @@ struct RemoteEventRouting: Decodable {
     let messageID: UUID?
     let conversationID: UUID?
     let senderDeviceID: UUID?
+    let senderUserID: UUID?
     let encryptionVersion: Int?
     let keyVersion: Int?
     let messageKeyIndex: Int64?
     let revision: Int?
     let recipientDeviceID: UUID?
     let revokedDeviceID: UUID?
+    let mutationEventID: UUID?
 }
 
 struct RemoteSyncPage: Decodable {

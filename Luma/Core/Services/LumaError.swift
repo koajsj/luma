@@ -22,6 +22,7 @@ enum LumaError: LocalizedError {
         if let error = error as? AuthenticationError { return error.localizedDescription }
         if let error = error as? OutgoingQueueError { return error.localizedDescription }
         if let error = error as? MessageStoreError { return error.localizedDescription }
+        if let error = error as? V4AttachmentError { return error.localizedDescription }
         if let error = error as? SessionError { return error.localizedDescription }
         if let error = error as? RemoteError {
             if case .server = error { return LumaError.network.localizedDescription }

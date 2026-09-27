@@ -46,6 +46,7 @@ struct KeyLifecycleManager {
     }
 
     func deleteKeys(for user: User, context: ModelContext) throws {
+        try V4SessionVault(keychain: keychain).purgeAccount(userID: user.userID)
         let ownedFriends = try context.fetch(FetchDescriptor<Friend>()).filter { $0.ownerID == user.id }
         let friendIDs = Set(ownedFriends.map(\.id))
         let sessions = SessionManager(context: context, keychain: keychain)

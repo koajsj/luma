@@ -170,6 +170,31 @@ paths:
         - {name: id, in: path, required: true, schema: {type: string, format: uuid}}
         - {name: claim, in: query, required: false, schema: {type: boolean, default: true}, description: false 时只检查已签名公钥，不消耗一次性预密钥}
       responses: {'200': {description: 公钥束}}
+  /devices/{id}/v4-prekeys:
+    put:
+      tags: [Device]
+      summary: 上传当前设备的 v4 公开身份、签名预密钥和一次性预密钥
+      description: 不接受私钥。v4 Curve25519 身份由已登记 P-256 账号身份签名绑定；签名预密钥由 v4 Ed25519 身份签名。相同设备的身份不可静默替换，版本不得倒退。
+      parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+      requestBody: {required: true, content: {application/json: {schema: {type: object, required: [identityAgreementPublicKey, identitySigningPublicKey, identityBindingSignature, signedPreKeyPublicKey, signedPreKeySignature, keyVersion], properties: {identityAgreementPublicKey: {type: string, description: base64url X25519 公钥}, identitySigningPublicKey: {type: string, description: base64url Ed25519 公钥}, identityBindingSignature: {type: string, description: base64url P-256 DER 签名}, signedPreKeyPublicKey: {type: string, description: base64url X25519 公钥}, signedPreKeySignature: {type: string, description: base64url Ed25519 签名}, keyVersion: {type: integer, minimum: 1}, oneTimePreKeys: {type: array, maxItems: 100, items: {type: string}}}}}}}
+      responses: {'204': {description: 已保存公开密钥}, '409': {$ref: '#/components/responses/Error'}}
+  /devices/{id}/v4-prekeys/status:
+    get:
+      tags: [Device]
+      summary: 查询当前已认证设备剩余可领取的一次性 v4 PreKey 数量
+      parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+      responses: {'200': {description: 返回 availableOneTimePreKeys 整数}, '403': {$ref: '#/components/responses/Error'}}
+  /users/{id}/v4-prekey-bundle:
+    get:
+      tags: [Device]
+      summary: 获取好友或本人所有活动设备的 v4 公钥束
+      description: 默认在事务中为每个目标设备领取一次性预密钥；claim=false 只查看。若任一活动设备尚未登记 v4 公钥或一次性密钥耗尽，则整个请求失败，不会降级为无一次性密钥握手。
+      parameters:
+        - {name: id, in: path, required: true, schema: {type: string, format: uuid}}
+        - {name: claim, in: query, required: false, schema: {type: boolean, default: true}}
+        - {name: includeRevoked, in: query, required: false, schema: {type: boolean, default: false}, description: 仅与 claim=false 和 deviceID 一起用于验证撤销前已发送的历史信封}
+        - {name: deviceID, in: query, required: false, schema: {type: string, format: uuid}, description: 历史信封的发送设备；仅在 includeRevoked=true 时使用}
+      responses: {'200': {description: 公钥束，包含账号身份绑定签名与设备签名预密钥}, '409': {$ref: '#/components/responses/Error'}}
   /friend/request:
     post:
       tags: [Friend]
@@ -220,6 +245,26 @@ paths:
     post: {tags: [Message], summary: 显式送达回执, requestBody: {required: true, content: {application/json: {schema: {type: object, required: [messageID], properties: {messageID: {type: string}}}}}}, responses: {'204': {description: 已处理}}}
   /messages/reaction:
     post: {tags: [Message], summary: 逐设备密文回应事件, requestBody: {required: true, content: {application/json: {schema: {type: object, required: [messageID, recipientEnvelopes], properties: {messageID: {type: string}, recipientEnvelopes: {type: array, items: {$ref: '#/components/schemas/Envelope'}}}}}}}, responses: {'202': {description: 已接收}}}
+  /messages/v4/events:
+    post:
+      tags: [Message]
+      summary: 发送 v4 逐设备认证加密控制事件
+      description: 支持编辑、删除、已读和 Reaction。旧控制接口拒绝 v4 消息；服务器只存逐设备密文及路由元数据。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [eventID, messageID, conversationID, type, revision, recipientEnvelopes]
+              properties:
+                eventID: {type: string, format: uuid}
+                messageID: {type: string, format: uuid}
+                conversationID: {type: string, format: uuid}
+                type: {type: string, enum: [message.edited, message.deleted, message.read, reaction.added]}
+                revision: {type: integer, minimum: 1}
+                recipientEnvelopes: {type: array, items: {$ref: '#/components/schemas/Envelope'}}
+      responses: {'201': {description: 已存储}, '200': {description: 幂等重放}, '409': {$ref: '#/components/responses/Error'}}
   /sync/events:
     get:
       tags: [Sync]

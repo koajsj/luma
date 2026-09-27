@@ -58,4 +58,19 @@ struct KeychainManager {
         let status = SecItemDelete(query as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else { throw KeychainError.status(status) }
     }
+
+    func deleteAccounts(prefix: String) throws {
+        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service, kSecReturnAttributes as String: true,
+            kSecMatchLimit as String: kSecMatchLimitAll]
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        if status == errSecItemNotFound { return }
+        guard status == errSecSuccess else { throw KeychainError.status(status) }
+        guard let rows = result as? [[String: Any]] else { throw KeychainError.invalidData }
+        for row in rows {
+            if let account = row[kSecAttrAccount as String] as? String,
+               account.hasPrefix(prefix) { try delete(account) }
+        }
+    }
 }

@@ -280,6 +280,42 @@ final class ChainState {
     }
 }
 
+/// v4 routing/status metadata only. Ratchet and private prekey bytes live in Keychain.
+@Model
+final class V4SessionMetadata {
+    @Attribute(.unique) var id: UUID
+    var ownerID: UUID
+    var friendID: UUID?
+    var localDeviceID: UUID
+    var remoteDeviceID: UUID
+    var sessionVersion: Int
+    var status: String
+    var updatedAt: Date
+
+    init(ownerID: UUID, friendID: UUID?, localDeviceID: UUID, remoteDeviceID: UUID,
+         sessionVersion: Int = 1, status: String = "active") {
+        id = UUID(); self.ownerID = ownerID; self.friendID = friendID
+        self.localDeviceID = localDeviceID; self.remoteDeviceID = remoteDeviceID
+        self.sessionVersion = sessionVersion; self.status = status; updatedAt = .now
+    }
+}
+
+@Model
+final class V4DeviceMetadata {
+    @Attribute(.unique) var id: UUID
+    var ownerID: UUID
+    var backendDeviceID: UUID
+    var keyVersion: Int
+    var identityFingerprint: String
+    var publishedAt: Date?
+
+    init(ownerID: UUID, backendDeviceID: UUID, keyVersion: Int, identityFingerprint: String) {
+        id = UUID(); self.ownerID = ownerID; self.backendDeviceID = backendDeviceID
+        self.keyVersion = keyVersion; self.identityFingerprint = identityFingerprint
+        publishedAt = nil
+    }
+}
+
 @Model
 final class RemoteSyncCheckpoint {
     @Attribute(.unique) var id: UUID
@@ -328,6 +364,31 @@ final class OutgoingMessageQueueItem {
         self.messageID = messageID; self.encryptedRequest = encryptedRequest
         self.prepared = false
         self.state = "pending"; self.attempts = 0; self.nextAttemptAt = .now; self.createdAt = .now
+    }
+}
+
+/// A v4 control event stays encrypted at rest until the server accepts its exact
+/// per-device ciphertext request. The event ID is the idempotency key.
+@Model
+final class V4PendingEvent {
+    @Attribute(.unique) var eventID: UUID
+    var ownerID: UUID
+    var backendDeviceID: UUID
+    var messageID: UUID
+    var encryptedRequest: Data
+    var encryptedPayload: Data
+    var prepared: Bool
+    var attempts: Int
+    var createdAt: Date
+    var nextAttemptAt: Date
+
+    init(eventID: UUID, ownerID: UUID, backendDeviceID: UUID, messageID: UUID,
+         encryptedRequest: Data) {
+        self.eventID = eventID; self.ownerID = ownerID
+        self.backendDeviceID = backendDeviceID; self.messageID = messageID
+        self.encryptedRequest = encryptedRequest; self.encryptedPayload = encryptedRequest
+        self.prepared = false
+        self.attempts = 0; self.createdAt = .now; self.nextAttemptAt = .now
     }
 }
 

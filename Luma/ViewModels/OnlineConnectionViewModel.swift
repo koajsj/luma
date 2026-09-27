@@ -46,6 +46,24 @@ struct OnlineConnectionViewModel {
         for trust in try context.fetch(FetchDescriptor<RemoteDeviceTrust>()).filter({
             $0.ownerID == user.id && $0.backendDeviceID == deviceID
         }) { context.delete(trust) }
+        let vault = V4SessionVault()
+        if let localDeviceID = (try store.registration(for: user.userID))?.backendDeviceID {
+            try vault.deletePeer(userID: user.userID, localDeviceID: localDeviceID,
+                remoteDeviceID: deviceID)
+        }
+        for session in try context.fetch(FetchDescriptor<V4SessionMetadata>()).filter({
+            $0.ownerID == user.id && $0.remoteDeviceID == deviceID
+        }) {
+            try vault.deletePeer(userID: user.userID, localDeviceID: session.localDeviceID,
+                remoteDeviceID: deviceID)
+            context.delete(session)
+        }
+        for item in try context.fetch(FetchDescriptor<V4PendingEvent>()).filter({
+            $0.ownerID == user.id
+        }) { context.delete(item) }
+        for item in try context.fetch(FetchDescriptor<OutgoingMessageQueueItem>()).filter({
+            $0.ownerID == user.id && $0.state != "sent"
+        }) { item.state = "failed"; item.attempts = 5 }
         try context.save()
     }
 

@@ -5,7 +5,7 @@ import Foundation
 struct RemoteFileTransferService {
     let client: RemoteAPIClient
 
-    func upload(_ encrypted: EncryptedData) async throws -> UUID {
+    func beginUpload(_ encrypted: EncryptedData) async throws -> UUID {
         let bytes = encrypted.bytes
         let digest = Data(SHA256.hash(data: bytes)).base64URLEncodedString()
         struct Init: Encodable { let ciphertextSize: Int; let ciphertextHash: String }
@@ -15,11 +15,14 @@ struct RemoteFileTransferService {
         guard ticket.uploadPath == "/v1/files/\(ticket.attachmentID.uuidString.lowercased())/upload" else {
             throw RemoteError.invalidResponse
         }
-        _ = try await client.request("PUT", path: "/files/\(ticket.attachmentID.uuidString.lowercased())/upload",
-                                     body: bytes, contentType: "application/octet-stream")
-        _ = try await client.request("POST", path: "/files/upload/complete",
-                                     body: JSONEncoder().encode(["attachmentID": ticket.attachmentID.uuidString.lowercased()]))
         return ticket.attachmentID
+    }
+
+    func finishUpload(_ encrypted: EncryptedData, attachmentID: UUID) async throws {
+        _ = try await client.request("PUT", path: "/files/\(attachmentID.uuidString.lowercased())/upload",
+                                     body: encrypted.bytes, contentType: "application/octet-stream")
+        _ = try await client.request("POST", path: "/files/upload/complete",
+                                     body: JSONEncoder().encode(["attachmentID": attachmentID.uuidString.lowercased()]))
     }
 
     func download(attachmentID: UUID, expectedHash: Data) async throws -> EncryptedData {

@@ -2,17 +2,9 @@ import SwiftData
 import SwiftUI
 
 struct SettingsView: View {
-    @Bindable var user: User
+    let user: User
     @Environment(SecurityManager.self) private var security
     @Environment(\.modelContext) private var context
-    @State private var showingNickname = false
-    @State private var showingPassword = false
-    @State private var showingPIN = false
-    @State private var showingDevices = false
-    @State private var showingProfile = false
-    @State private var showingPrivacy = false
-    @State private var showingStorage = false
-    @State private var showingOnline = false
     @State private var showingDeleteAccount = false
     @State private var deletionPassword = ""
     @State private var errorMessage: String?
@@ -21,46 +13,37 @@ struct SettingsView: View {
         NavigationStack {
             Form {
                 Section("账号") {
-                    Button { showingProfile = true } label: {
-                        HStack { AvatarView(name: user.nickname, imageData: user.avatar); VStack(alignment: .leading) { Text(user.nickname); Text("@\(user.userID)").font(.caption).foregroundStyle(.secondary) } }
+                    NavigationLink {
+                        UserProfileView(user: user)
+                    } label: {
+                        HStack(spacing: 12) {
+                            AvatarView(name: user.nickname, imageData: user.avatar)
+                            VStack(alignment: .leading) {
+                                Text("个人资料")
+                                Text(user.nickname).font(.footnote).foregroundStyle(.secondary)
+                            }
+                        }
                     }
                     LabeledContent("UserID", value: user.userID)
-                    Button { showingNickname = true } label: { LabeledContent("昵称", value: user.nickname) }
-                    Button("修改密码") { showingPassword = true }
-                    Button("服务器连接") { showingOnline = true }
+                    NavigationLink { DeviceManagerView(user: user) } label: { Label("设备管理", systemImage: "iphone.gen3") }
+                    NavigationLink { AccountAccessSettingsView(user: user) } label: { Label("登录与解锁", systemImage: "lock") }
                 }
-                Section("安全") {
-                    Button("修改 PIN") { showingPIN = true }
-                    Toggle("Face ID", isOn: preference(\.faceIDEnabled))
-                    Button("设备管理") { showingDevices = true }
-                    Button("存储管理与加密备份") { showingStorage = true }
+                Section("隐私与安全") {
+                    NavigationLink { PrivacyCenterView(user: user) } label: { Label("安全中心", systemImage: "checkmark.shield") }
+                    NavigationLink { PrivacyShieldView(user: user) } label: { Label("隐私护盾", systemImage: "hand.raised") }
+                    NavigationLink { PrivacyReportView(user: user) } label: { Label("安全与隐私报告", systemImage: "doc.text.magnifyingglass") }
+                    NavigationLink { IdentitySettingsView(user: user) } label: { Label("身份验证", systemImage: "person.crop.circle.badge.checkmark") }
                 }
-                Section {
-                    Button { showingPrivacy = true } label: { Label("隐私中心", systemImage: "hand.raised.shield") }
-                    Toggle("隐私模式", isOn: preference(\.privacyModeEnabled))
-                    Toggle("隐私模式锁定所有聊天", isOn: preference(\.privacyModeLockChats))
-                    Toggle("允许其他用户通过 UserID 搜索我", isOn: preference(\.searchable))
-                    Toggle("检测截图行为", isOn: preference(\.screenshotAlerts))
-                    Toggle("录屏提醒", isOn: preference(\.recordingAlerts))
-                    Toggle("后台隐藏", isOn: preference(\.hideInBackground))
-                    Toggle("已读回执", isOn: preference(\.readReceipts))
-                } header: {
-                    Text("隐私")
-                } footer: {
-                    Text("目前只进行本机检测和提醒，尚不能通知对方，也无法完全阻止截图。后台隐藏会在离开应用时锁定界面。")
+                Section("聊天设置") {
+                    NavigationLink { ChatPrivacySettingsView(user: user) } label: { Label("聊天偏好", systemImage: "bubble.left.and.text.bubble.right") }
                 }
-                Section {
-                    Picker("阅读后自动销毁", selection: Binding(get: { security.preferences.autoDestroyHours }, set: { value in
-                        do { try security.updatePreferences(for: user, context: context) { $0.autoDestroyHours = value } }
-                        catch { errorMessage = error.localizedDescription }
-                    })) {
-                        Text("关闭").tag(0)
-                        Text("24 小时").tag(24)
-                        Text("7 天").tag(168)
-                    }
-                    Toggle("阅后即焚（阅读后 1 分钟）", isOn: preference(\.disappearingMessages))
-                } header: { Text("聊天") }
-                  footer: { Text("仅对本机收到且首次打开的消息计时，到期后删除本地记录；不会删除对方设备上的消息。") }
+                Section("存储与数据") {
+                    NavigationLink { StorageManagementView(user: user) } label: { Label("备份与存储", systemImage: "externaldrive") }
+                }
+                Section("关于") {
+                    NavigationLink { AboutLumaView() } label: { Label("Luma 信息与隐私说明", systemImage: "info.circle") }
+                    NavigationLink { OnlineConnectionView(user: user) } label: { Label("开发服务器连接", systemImage: "network") }
+                }
                 Section {
                     Button("锁定应用") { security.lock() }
                     Button("退出登录", role: .destructive) {
@@ -70,14 +53,6 @@ struct SettingsView: View {
                 }
             }
             .navigationTitle("设置")
-            .sheet(isPresented: $showingNickname) { NicknameEditor(user: user) }
-            .sheet(isPresented: $showingPassword) { PasswordEditor(user: user) }
-            .sheet(isPresented: $showingPIN) { PINEditor() }
-            .sheet(isPresented: $showingProfile) { NavigationStack { UserProfileView(user: user) } }
-            .sheet(isPresented: $showingPrivacy) { NavigationStack { PrivacyCenterView(user: user) } }
-            .sheet(isPresented: $showingDevices) { NavigationStack { DeviceManagerView(user: user) } }
-            .sheet(isPresented: $showingStorage) { NavigationStack { StorageManagementView(user: user) } }
-            .sheet(isPresented: $showingOnline) { NavigationStack { OnlineConnectionView(user: user) } }
             .sheet(isPresented: $showingDeleteAccount) {
                 NavigationStack {
                     Form {
@@ -96,52 +71,166 @@ struct SettingsView: View {
                     .navigationTitle("删除账号")
                     .toolbar { Button("取消") { deletionPassword = ""; showingDeleteAccount = false } }
                 }
+                .interactiveDismissDisabled()
             }
             .alert("设置失败", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
                 Button("好", role: .cancel) { errorMessage = nil }
             } message: { Text(errorMessage ?? "") }
         }
     }
+}
 
-    private func save() {
-        do { try context.save() } catch { errorMessage = error.localizedDescription }
+private struct AccountAccessSettingsView: View {
+    let user: User
+    @Environment(SecurityManager.self) private var security
+    @Environment(\.modelContext) private var context
+    @State private var showingPassword = false
+    @State private var showingPIN = false
+    @State private var errorMessage: String?
+
+    var body: some View {
+        Form {
+            Section("登录") {
+                Button("修改密码") { showingPassword = true }
+                Button("修改 PIN") { showingPIN = true }
+                Toggle("Face ID 解锁", isOn: Binding(
+                    get: { security.preferences.faceIDEnabled },
+                    set: { value in
+                        if value && !security.canUseBiometrics() {
+                            errorMessage = "此设备暂不可使用 Face ID"
+                            return
+                        }
+                        do { try security.updatePreferences(for: user, context: context) { $0.faceIDEnabled = value } }
+                        catch { errorMessage = LumaError.message(for: error) }
+                    }
+                ))
+            }
+        }
+        .navigationTitle("登录与解锁")
+        .sheet(isPresented: $showingPassword) { PasswordEditor(user: user).interactiveDismissDisabled() }
+        .sheet(isPresented: $showingPIN) { PINEditor().interactiveDismissDisabled() }
+        .alert("设置失败", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
+            Button("好", role: .cancel) { errorMessage = nil }
+        } message: { Text(errorMessage ?? "") }
+    }
+}
+
+private struct ChatPrivacySettingsView: View {
+    let user: User
+    @Environment(SecurityManager.self) private var security
+    @Environment(\.modelContext) private var context
+    @State private var errorMessage: String?
+
+    var body: some View {
+        Form {
+            Section("消息状态") {
+                Toggle("已读回执", isOn: preference(\.readReceipts))
+            }
+            Section {
+                Picker("阅读后自动销毁", selection: Binding(
+                    get: { security.preferences.autoDestroyHours },
+                    set: { value in
+                        do { try security.updatePreferences(for: user, context: context) { $0.autoDestroyHours = value } }
+                        catch { errorMessage = LumaError.message(for: error) }
+                    }
+                )) {
+                    Text("关闭").tag(0)
+                    Text("24 小时").tag(24)
+                    Text("7 天").tag(168)
+                }
+                Toggle("阅后即焚（阅读后 1 分钟）", isOn: preference(\.disappearingMessages))
+            } header: { Text("消息保留") } footer: {
+                Text("计时仅影响本机消息记录，无法删除对方设备上已有的副本。")
+            }
+            Section("聊天保护") {
+                NavigationLink("聊天锁") { ChatLockSettingsView(user: user) }
+            }
+        }
+        .navigationTitle("聊天偏好")
+        .alert("保存失败", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
+            Button("好", role: .cancel) { errorMessage = nil }
+        } message: { Text(errorMessage ?? "") }
     }
 
     private func preference(_ keyPath: WritableKeyPath<PrivacyPreferences, Bool>) -> Binding<Bool> {
         Binding(get: { security.preferences[keyPath: keyPath] }, set: { value in
-            if keyPath == \.faceIDEnabled && value && !security.canUseBiometrics() {
-                errorMessage = "此设备暂不可使用 Face ID"; return
-            }
             do { try security.updatePreferences(for: user, context: context) { $0[keyPath: keyPath] = value } }
-            catch { errorMessage = error.localizedDescription }
+            catch { errorMessage = LumaError.message(for: error) }
         })
     }
 }
 
-private struct NicknameEditor: View {
-    @Bindable var user: User
+private struct ChatLockSettingsView: View {
+    let user: User
+    @Environment(SecurityManager.self) private var security
     @Environment(\.modelContext) private var context
-    @Environment(\.dismiss) private var dismiss
-    @State private var nickname = ""
+    @Query private var conversations: [Conversation]
+    @Query private var friends: [Friend]
     @State private var errorMessage: String?
+
     var body: some View {
-        NavigationStack {
-            Form { TextField("昵称", text: $nickname) }
-                .navigationTitle("修改昵称")
-                .toolbar {
-                    ToolbarItem(placement: .topBarLeading) { Button("取消") { dismiss() } }
-                    ToolbarItem(placement: .topBarTrailing) { Button("保存") {
-                        let value = nickname.trimmingCharacters(in: .whitespacesAndNewlines)
-                        guard !value.isEmpty else { errorMessage = "昵称不能为空"; return }
-                        user.nickname = value
-                        do { try context.save(); dismiss() } catch { errorMessage = error.localizedDescription }
-                    } }
+        Form {
+            Section {
+                let owned = conversations.filter { $0.ownerID == user.id }
+                if owned.isEmpty {
+                    ContentUnavailableView("还没有聊天", systemImage: "message")
                 }
-                .onAppear { nickname = user.nickname }
-                .alert("无法保存", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
-                    Button("好", role: .cancel) { errorMessage = nil }
-                } message: { Text(errorMessage ?? "") }
+                ForEach(owned) { conversation in
+                    if let friend = friends.first(where: { $0.id == conversation.friendID }) {
+                        Toggle(security.friendDisplayName(friend, context: context), isOn: Binding(
+                            get: { conversation.requiresUnlock == true },
+                            set: { value in
+                                conversation.requiresUnlock = value
+                                do { try context.save() } catch { errorMessage = LumaError.message(for: error) }
+                            }
+                        ))
+                    }
+                }
+            } footer: { Text("开启后进入该聊天需要再次验证 PIN 或 Face ID。") }
         }
+        .navigationTitle("聊天锁")
+        .alert("保存失败", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
+            Button("好", role: .cancel) { errorMessage = nil }
+        } message: { Text(errorMessage ?? "") }
+    }
+}
+
+private struct IdentitySettingsView: View {
+    let user: User
+    @Query private var friends: [Friend]
+
+    var body: some View {
+        List {
+            Section {
+                let candidates = friends.filter { $0.ownerID == user.id && $0.remoteUserID != nil }
+                if candidates.isEmpty {
+                    ContentUnavailableView("暂无可核对的在线好友", systemImage: "person.crop.circle.badge.questionmark")
+                }
+                ForEach(candidates) { friend in
+                    NavigationLink(friend.nickname) { IdentityVerificationView(user: user, friend: friend) }
+                }
+            } footer: {
+                Text("与好友通过独立可信渠道比较安全码。身份密钥变化后需要重新核对。")
+            }
+        }
+        .navigationTitle("身份验证")
+    }
+}
+
+private struct AboutLumaView: View {
+    var body: some View {
+        Form {
+            Section("Luma") {
+                Label("本地优先的隐私聊天", systemImage: "message.fill")
+                Text("当前在线通信能力仍在验证中。")
+                    .foregroundStyle(.secondary)
+            }
+            Section("隐私说明") {
+                Text("本地消息内容加密保存；在线服务可见通信所需的关系、时间和密文大小等信息。")
+                Text("截图检测在截图之后发生，无法阻止截图。完整端到端加密尚未通过最终验收。")
+            }
+        }
+        .navigationTitle("关于 Luma")
     }
 }
 

@@ -30,6 +30,8 @@ struct RemoteSyncCoordinator {
             context.insert(checkpoint)
             try context.save()
         }
+        try V4MessageSessionService(userID: repository.user.userID,
+            localDeviceID: deviceID).recoverReceived(committedCursor: checkpoint.cursor)
         let provider = RemoteMessageSyncProvider(client: repository.client)
         if checkpoint.cursor > 0 { try await provider.acknowledge(checkpoint.cursor) }
         let page = try await provider.fetch(after: checkpoint.cursor, limit: limit)
@@ -39,6 +41,8 @@ struct RemoteSyncCoordinator {
             do {
                 if event.type == "device.revoked" {
                     try applyDeviceRevoked(event)
+                } else if event.routing.encryptionVersion == 4 {
+                    try await repository.applyV4(event)
                 } else {
                     try repository.apply(event)
                 }
@@ -56,6 +60,10 @@ struct RemoteSyncCoordinator {
             checkpoint.cursor = event.deviceSeq
             do { try context.save() }
             catch { context.rollback(); throw error }
+            if event.routing.encryptionVersion == 4 {
+                try V4MessageSessionService(userID: repository.user.userID,
+                    localDeviceID: deviceID).finishReceived(eventID: event.eventID)
+            }
             // The one-time key can be removed only after both the message and cursor persist.
             try repository.finalizeOneTimePreKey(for: event)
             try prekeys.purgeUsedKeyMaterial(for: repository.user.id)
@@ -72,9 +80,22 @@ struct RemoteSyncCoordinator {
         for trust in try context.fetch(FetchDescriptor<RemoteDeviceTrust>()).filter({
             $0.ownerID == repository.user.id && $0.backendDeviceID == revoked
         }) { context.delete(trust) }
+        let vault = V4SessionVault()
+        try vault.deletePeer(userID: repository.user.userID,
+            localDeviceID: repository.registration.backendDeviceID, remoteDeviceID: revoked)
+        for session in try context.fetch(FetchDescriptor<V4SessionMetadata>()).filter({
+            $0.ownerID == repository.user.id && $0.remoteDeviceID == revoked
+        }) {
+            try vault.deletePeer(userID: repository.user.userID,
+                localDeviceID: session.localDeviceID, remoteDeviceID: revoked)
+            context.delete(session)
+        }
         // Pending envelopes can contain the revoked recipient; stop replay until recomposed.
         for item in try context.fetch(FetchDescriptor<OutgoingMessageQueueItem>()).filter({
             $0.ownerID == repository.user.id && $0.state != "sent"
         }) { item.state = "failed"; item.attempts = 5 }
+        for item in try context.fetch(FetchDescriptor<V4PendingEvent>()).filter({
+            $0.ownerID == repository.user.id
+        }) { context.delete(item) }
     }
 }

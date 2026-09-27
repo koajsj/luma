@@ -89,13 +89,14 @@ struct MessageStore {
     /// Persist a verified v3 payload under the local v1 Master Key. The wire key is never stored here.
     func receiveVerifiedRemote(messageID: UUID, plaintext: Data, from senderID: String,
                                in conversation: Conversation, at date: Date, senderDeviceID: UUID,
-                               eventID: UUID, isMine: Bool) throws {
+                               eventID: UUID, isMine: Bool, transportVersion: Int = 3,
+                               attachmentDescriptor: V4AttachmentDescriptor? = nil) throws {
         if try context.fetch(FetchDescriptor<Message>()).contains(where: { $0.id == messageID }) { return }
-        let message = Message(conversationID: conversation.id, type: .text, isMine: isMine,
+        let message = Message(conversationID: conversation.id, type: attachmentDescriptor?.type ?? .text, isMine: isMine,
                               senderID: senderID, timestamp: date)
         message.id = messageID
         message.encryptionVersion = EncryptionVersion.localAESGCM.rawValue
-        message.transportEncryptionVersion = 3
+        message.transportEncryptionVersion = transportVersion
         message.remoteRevision = 1
         message.deviceID = senderDeviceID
         message.lastEventID = eventID
@@ -103,6 +104,20 @@ struct MessageStore {
         if !isMine { message.deliveredAt = date }
         message.ciphertext = try encryption.encrypt(plaintext, authenticatedData: Self.binding(for: message)).bytes
         context.insert(message)
+        if let descriptor = attachmentDescriptor {
+            guard transportVersion == 4, let remoteConversationID = conversation.remoteID else {
+                throw V4AttachmentError.invalidDescriptor
+            }
+            try V4AttachmentCrypto.validate(descriptor, messageID: messageID,
+                                             conversationID: remoteConversationID)
+            let attachment = Attachment(messageID: messageID, type: descriptor.type, path: "")
+            attachment.id = descriptor.attachmentID
+            let metadata = AttachmentMetadata(name: descriptor.name, encryptedPath: nil,
+                                              metadata: try JSONEncoder().encode(descriptor))
+            attachment.encryptedMetadata = try encryption.encrypt(JSONEncoder().encode(metadata),
+                authenticatedData: Data("luma-attachment-v1|\(attachment.id.uuidString)".utf8)).bytes
+            context.insert(attachment)
+        }
         if !isMine { conversation.unreadCount = (conversation.unreadCount ?? 0) + 1 }
         try context.save()
     }
@@ -110,7 +125,7 @@ struct MessageStore {
     func applyVerifiedRemoteEdit(messageID: UUID, plaintext: Data, revision: Int, at date: Date,
                                  eventID: UUID) throws {
         guard let message = try context.fetch(FetchDescriptor<Message>()).first(where: { $0.id == messageID }),
-              message.transportEncryptionVersion == 3 else { throw MessageRepositoryError.invalidEvent }
+              [3, 4].contains(message.transportEncryptionVersion ?? 0) else { throw MessageRepositoryError.invalidEvent }
         if (message.remoteRevision ?? 1) >= revision { return }
         guard revision == (message.remoteRevision ?? 1) + 1 else { throw MessageRepositoryError.invalidEvent }
         message.ciphertext = try encryption.encrypt(plaintext, authenticatedData: Self.binding(for: message)).bytes
@@ -190,7 +205,11 @@ struct MessageStore {
             $0.conversationID == conversation.id && $0.expiresAt.map { $0 <= date } == true
         }
         let ids = Set(expired.map(\.id))
-        for item in try context.fetch(FetchDescriptor<Attachment>()).filter({ ids.contains($0.messageID) }) { context.delete(item) }
+        for item in try context.fetch(FetchDescriptor<Attachment>()).filter({ ids.contains($0.messageID) }) {
+            try FileTransferService(ownerID: conversation.ownerID, encryption: encryption)
+                .delete(attachmentID: item.id)
+            context.delete(item)
+        }
         for item in try context.fetch(FetchDescriptor<Reaction>()).filter({ ids.contains($0.messageID) }) { context.delete(item) }
         for message in expired { context.delete(message) }
         if !expired.isEmpty { try context.save() }

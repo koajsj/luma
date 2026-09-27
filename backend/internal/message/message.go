@@ -102,14 +102,17 @@ func (s Service) Send(w http.ResponseWriter, r *http.Request) {
 	if !middleware.Decode(w, r, &in) {
 		return
 	}
-	if _, e := uuid.Parse(in.MessageID); e != nil {
+	messageID, e := uuid.Parse(in.MessageID)
+	if e != nil {
 		middleware.Fail(w, r, 400, "invalid_message_id")
 		return
 	}
-	if _, e := uuid.Parse(in.ConversationID); e != nil || in.EncryptionVersion < 3 || in.EncryptionVersion > 255 || len(in.RecipientEnvelopes) > 32 || len(in.AttachmentIDs) > 32 {
+	conversationID, e := uuid.Parse(in.ConversationID)
+	if e != nil || in.EncryptionVersion < 3 || in.EncryptionVersion > 255 || len(in.RecipientEnvelopes) > 32 || len(in.AttachmentIDs) > 32 {
 		middleware.Fail(w, r, 400, "invalid_request")
 		return
 	}
+	in.MessageID, in.ConversationID = messageID.String(), conversationID.String()
 	actual, ok := decodeEnvelopes(in.RecipientEnvelopes)
 	if !ok {
 		middleware.Fail(w, r, 400, "invalid_envelopes")
@@ -172,16 +175,21 @@ func (s Service) Send(w http.ResponseWriter, r *http.Request) {
 		if e != nil {
 			break
 		}
-		seqs[env.RecipientDeviceID], e = sync.Append(r.Context(), tx, env.RecipientDeviceID, "message.created", b, map[string]any{"messageID": in.MessageID, "conversationID": in.ConversationID, "senderDeviceID": i.DeviceID, "encryptionVersion": in.EncryptionVersion, "keyVersion": env.KeyVersion, "messageKeyIndex": env.MessageKeyIndex})
+		seqs[env.RecipientDeviceID], e = sync.Append(r.Context(), tx, env.RecipientDeviceID, "message.created", b, map[string]any{"messageID": in.MessageID, "conversationID": in.ConversationID, "senderUserID": i.UserID, "senderDeviceID": i.DeviceID, "encryptionVersion": in.EncryptionVersion, "keyVersion": env.KeyVersion, "messageKeyIndex": env.MessageKeyIndex})
 		if e != nil {
 			break
 		}
 	}
 	if e == nil {
 		for _, id := range in.AttachmentIDs {
-			_, e = tx.Exec(r.Context(), "UPDATE attachments SET message_id=$1 WHERE id=$2", in.MessageID, id)
+			tag, updateErr := tx.Exec(r.Context(), "UPDATE attachments SET message_id=$1 WHERE id=$2 AND owner_user_id=$3 AND status IN ('complete','verified') AND message_id IS NULL", in.MessageID, id, i.UserID)
+			e = updateErr
 			if e != nil {
 				break
+			}
+			if tag.RowsAffected() != 1 {
+				middleware.Fail(w, r, 400, "invalid_attachment")
+				return
 			}
 		}
 	}
@@ -204,10 +212,14 @@ func (s Service) Delete(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback(r.Context())
 	var cid string
-	var rev int
-	e = tx.QueryRow(r.Context(), "SELECT conversation_id,revision FROM messages WHERE id=$1 AND sender_user_id=$2 AND deleted_at IS NULL FOR UPDATE", id, i.UserID).Scan(&cid, &rev)
+	var rev, version int
+	e = tx.QueryRow(r.Context(), "SELECT conversation_id,revision,encryption_version FROM messages WHERE id=$1 AND sender_user_id=$2 AND deleted_at IS NULL FOR UPDATE", id, i.UserID).Scan(&cid, &rev, &version)
 	if e != nil {
 		middleware.Fail(w, r, 404, "not_found")
+		return
+	}
+	if version == 4 {
+		middleware.Fail(w, r, 409, "v4_encrypted_event_required")
 		return
 	}
 	devices, ok := s.allowed(tx, r, cid)
@@ -221,7 +233,7 @@ func (s Service) Delete(w http.ResponseWriter, r *http.Request) {
 		if e != nil {
 			break
 		}
-		seqs[did], e = sync.Append(r.Context(), tx, did, "message.deleted", nil, map[string]any{"messageID": id, "revision": rev + 1})
+		seqs[did], e = sync.Append(r.Context(), tx, did, "message.deleted", nil, map[string]any{"messageID": id, "revision": rev + 1, "senderUserID": i.UserID, "senderDeviceID": i.DeviceID})
 	}
 	if e != nil || tx.Commit(r.Context()) != nil {
 		middleware.Fail(w, r, 503, "storage_unavailable")
@@ -254,10 +266,14 @@ func (s Service) Edit(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback(r.Context())
 	var cid string
-	var rev int
-	e = tx.QueryRow(r.Context(), "SELECT conversation_id,revision FROM messages WHERE id=$1 AND sender_user_id=$2 AND deleted_at IS NULL FOR UPDATE", in.MessageID, i.UserID).Scan(&cid, &rev)
+	var rev, version int
+	e = tx.QueryRow(r.Context(), "SELECT conversation_id,revision,encryption_version FROM messages WHERE id=$1 AND sender_user_id=$2 AND deleted_at IS NULL FOR UPDATE", in.MessageID, i.UserID).Scan(&cid, &rev, &version)
 	if e != nil {
 		middleware.Fail(w, r, 404, "not_found")
+		return
+	}
+	if version == 4 {
+		middleware.Fail(w, r, 409, "v4_encrypted_event_required")
 		return
 	}
 	devices, ok := s.allowed(tx, r, cid)
@@ -278,7 +294,7 @@ func (s Service) Edit(w http.ResponseWriter, r *http.Request) {
 		b := actual[env.RecipientDeviceID]
 		_, e = tx.Exec(r.Context(), "UPDATE message_envelopes SET ciphertext=$1,key_version=$2,message_key_index=$3 WHERE message_id=$4 AND recipient_device_id=$5", b, env.KeyVersion, env.MessageKeyIndex, in.MessageID, env.RecipientDeviceID)
 		if e == nil {
-			seqs[env.RecipientDeviceID], e = sync.Append(r.Context(), tx, env.RecipientDeviceID, "message.edited", b, map[string]any{"messageID": in.MessageID, "revision": rev + 1, "keyVersion": env.KeyVersion, "messageKeyIndex": env.MessageKeyIndex})
+			seqs[env.RecipientDeviceID], e = sync.Append(r.Context(), tx, env.RecipientDeviceID, "message.edited", b, map[string]any{"messageID": in.MessageID, "senderUserID": i.UserID, "senderDeviceID": i.DeviceID, "encryptionVersion": version, "revision": rev + 1, "keyVersion": env.KeyVersion, "messageKeyIndex": env.MessageKeyIndex})
 		}
 	}
 	if e != nil || tx.Commit(r.Context()) != nil {
@@ -306,10 +322,15 @@ func (s Service) Receipt(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback(r.Context())
 	var sender string
+	var version int
 	var allowed bool
-	e = tx.QueryRow(r.Context(), "SELECT m.sender_user_id,COALESCE(u.read_receipts,true) FROM message_envelopes env JOIN messages m ON m.id=env.message_id JOIN users u ON u.id=$2 WHERE env.message_id=$1 AND env.recipient_device_id=$3", in.MessageID, i.UserID, i.DeviceID).Scan(&sender, &allowed)
+	e = tx.QueryRow(r.Context(), "SELECT m.sender_user_id,m.encryption_version,COALESCE(u.read_receipts,true) FROM message_envelopes env JOIN messages m ON m.id=env.message_id JOIN users u ON u.id=$2 WHERE env.message_id=$1 AND env.recipient_device_id=$3", in.MessageID, i.UserID, i.DeviceID).Scan(&sender, &version, &allowed)
 	if e != nil {
 		middleware.Fail(w, r, 403, "forbidden")
+		return
+	}
+	if read && version == 4 {
+		middleware.Fail(w, r, 409, "v4_encrypted_event_required")
 		return
 	}
 	if read && !allowed {
@@ -347,7 +368,7 @@ func (s Service) Receipt(w http.ResponseWriter, r *http.Request) {
 	rows.Close()
 	seqs := map[string]int64{}
 	for _, did := range ids {
-		seqs[did], e = sync.Append(r.Context(), tx, did, typ, nil, map[string]any{"messageID": in.MessageID, "recipientDeviceID": i.DeviceID})
+		seqs[did], e = sync.Append(r.Context(), tx, did, typ, nil, map[string]any{"messageID": in.MessageID, "recipientDeviceID": i.DeviceID, "senderUserID": i.UserID, "senderDeviceID": i.DeviceID})
 		if e != nil {
 			break
 		}
@@ -381,9 +402,14 @@ func (s Service) Reaction(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback(r.Context())
 	var cid string
-	e = tx.QueryRow(r.Context(), "SELECT conversation_id FROM messages WHERE id=$1 AND deleted_at IS NULL", in.MessageID).Scan(&cid)
+	var version int
+	e = tx.QueryRow(r.Context(), "SELECT conversation_id,encryption_version FROM messages WHERE id=$1 AND deleted_at IS NULL", in.MessageID).Scan(&cid, &version)
 	if e != nil {
 		middleware.Fail(w, r, 404, "not_found")
+		return
+	}
+	if version == 4 {
+		middleware.Fail(w, r, 409, "v4_encrypted_event_required")
 		return
 	}
 	devices, ok := s.allowed(tx, r, cid)
@@ -393,7 +419,7 @@ func (s Service) Reaction(w http.ResponseWriter, r *http.Request) {
 	}
 	seqs := map[string]int64{}
 	for _, env := range in.RecipientEnvelopes {
-		seqs[env.RecipientDeviceID], e = sync.Append(r.Context(), tx, env.RecipientDeviceID, "reaction.added", actual[env.RecipientDeviceID], map[string]any{"messageID": in.MessageID})
+		seqs[env.RecipientDeviceID], e = sync.Append(r.Context(), tx, env.RecipientDeviceID, "reaction.added", actual[env.RecipientDeviceID], map[string]any{"messageID": in.MessageID, "senderUserID": middleware.Current(r).UserID, "senderDeviceID": middleware.Current(r).DeviceID, "encryptionVersion": version})
 		if e != nil {
 			break
 		}

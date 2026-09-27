@@ -47,6 +47,16 @@ func TestRevocationInvalidatesTokenAndEmitsOneCursorEvent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	_, err = db.Exec(context.Background(), `INSERT INTO v4_device_prekeys(device_id,identity_agreement_public,identity_signing_public,
+		identity_binding_signature,signed_prekey_public,signed_prekey_signature,key_version)
+		VALUES($1,$2,$3,$4,$5,$6,1)`, target, make([]byte, 32), make([]byte, 32), []byte{1}, make([]byte, 32), make([]byte, 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(context.Background(), "INSERT INTO v4_one_time_prekeys(device_id,public_key) VALUES($1,$2)", target, make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
 	token := uuid.NewString()
 	_, err = db.Exec(context.Background(), "INSERT INTO access_sessions(device_id,token_hash,family_id,expires_at) VALUES($1,$2,$3,now()+interval '1 hour')", target, crypto.Hash(token), uuid.NewString())
 	if err != nil {
@@ -69,6 +79,12 @@ func TestRevocationInvalidatesTokenAndEmitsOneCursorEvent(t *testing.T) {
         FROM devices d JOIN access_sessions a ON a.device_id=d.id JOIN refresh_sessions r ON r.device_id=d.id WHERE d.id=$1`, target).Scan(&deviceRevoked, &accessRevoked, &refreshRevoked)
 	if err != nil || !deviceRevoked || !accessRevoked || !refreshRevoked {
 		t.Fatalf("tokens/device not revoked: %v", err)
+	}
+	var publicCount, oneTimeCount int
+	err = db.QueryRow(context.Background(), `SELECT (SELECT count(*) FROM v4_device_prekeys WHERE device_id=$1),
+		(SELECT count(*) FROM v4_one_time_prekeys WHERE device_id=$1)`, target).Scan(&publicCount, &oneTimeCount)
+	if err != nil || publicCount != 1 || oneTimeCount != 0 {
+		t.Fatalf("v4 public history or one-time prekeys inconsistent: %d, %d, %v", publicCount, oneTimeCount, err)
 	}
 	var eventType string
 	var routing []byte

@@ -12,6 +12,7 @@
 | `Attachment` | `id`、`messageID`、类型、`encryptedMetadata` | 真实附件上传尚无；旧路径字段仅供迁移。 |
 | `SessionKey` | `id`、`ownerID`、`friendID`、版本和时间 | 只存元数据，密钥在 Keychain。 |
 | `PreKeyMetadata` | `id`、`ownerID`、类型、公钥/签名/指纹、使用时间 | 私钥在 Keychain。 |
+| `V4DeviceMetadata` / `V4SessionMetadata` | 后端设备 ID、版本、好友关联、发布/更新时间和状态 | 只存元数据；v4 身份私钥、预密钥私钥、Ratchet 根/链密钥和待提交记录在 Keychain。 |
 | `ChainState` | `sessionID`、发送者、链版本、消息序号 | 链密钥在 Keychain；此模型只记进度。 |
 
 辅助模型：`Reaction` 保存本机回应，`UserPresence` 保存本机模拟在线记录，`SearchIndexEntry` 保存加密索引。`MessageEvent` / `ReadReceiptEvent` 是 Codable 事件结构，目前由 Mock 流程使用，**不是**持久化的服务端事件表。

@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -77,9 +78,15 @@ func (s Service) Upload(w http.ResponseWriter, r *http.Request) {
 	var key string
 	var size int64
 	var expected []byte
-	e := s.DB.QueryRow(r.Context(), "SELECT object_key,ciphertext_size,ciphertext_hash FROM attachments WHERE id=$1 AND owner_user_id=$2 AND status='pending' AND created_at>now()-interval '5 minutes'", id, middleware.Current(r).UserID).Scan(&key, &size, &expected)
+	var status string
+	var createdAt time.Time
+	e := s.DB.QueryRow(r.Context(), "SELECT object_key,ciphertext_size,ciphertext_hash,status,created_at FROM attachments WHERE id=$1 AND owner_user_id=$2 AND status IN ('pending','stored','verified')", id, middleware.Current(r).UserID).Scan(&key, &size, &expected, &status, &createdAt)
 	if e != nil {
 		middleware.Fail(w, r, 404, "not_found")
+		return
+	}
+	if status == "pending" && time.Since(createdAt) > 5*time.Minute {
+		middleware.Fail(w, r, 404, "upload_expired")
 		return
 	}
 	if r.ContentLength != size {
@@ -96,6 +103,12 @@ func (s Service) Upload(w http.ResponseWriter, r *http.Request) {
 		middleware.Fail(w, r, 400, "ciphertext_mismatch")
 		return
 	}
+	// A lost response must not force the client to create another ciphertext object.
+	// Complete still rechecks the stored object before marking it verified.
+	if status == "stored" || status == "verified" {
+		w.WriteHeader(204)
+		return
+	}
 	e = s.Storage.Put(r.Context(), key, data)
 	if e != nil {
 		middleware.Fail(w, r, 503, "object_storage_unavailable")
@@ -108,6 +121,13 @@ func (s Service) Upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if tag.RowsAffected() == 0 {
+		var current string
+		if s.DB.QueryRow(r.Context(), "SELECT status FROM attachments WHERE id=$1 AND owner_user_id=$2",
+			id, middleware.Current(r).UserID).Scan(&current) == nil &&
+			(current == "stored" || current == "verified") {
+			w.WriteHeader(204)
+			return
+		}
 		_ = s.Storage.Delete(r.Context(), key)
 		middleware.Fail(w, r, 409, "upload_expired")
 		return
@@ -127,7 +147,7 @@ func (s Service) Complete(w http.ResponseWriter, r *http.Request) {
 	var key string
 	var size int64
 	var expected []byte
-	e := s.DB.QueryRow(r.Context(), "SELECT object_key,ciphertext_size,ciphertext_hash FROM attachments WHERE id=$1 AND owner_user_id=$2 AND status IN ('pending','stored')", in.AttachmentID, middleware.Current(r).UserID).Scan(&key, &size, &expected)
+	e := s.DB.QueryRow(r.Context(), "SELECT object_key,ciphertext_size,ciphertext_hash FROM attachments WHERE id=$1 AND owner_user_id=$2 AND status IN ('pending','stored','verified')", in.AttachmentID, middleware.Current(r).UserID).Scan(&key, &size, &expected)
 	if e != nil {
 		middleware.Fail(w, r, 404, "not_found")
 		return
@@ -144,7 +164,7 @@ func (s Service) Complete(w http.ResponseWriter, r *http.Request) {
 		middleware.Fail(w, r, 400, "ciphertext_mismatch")
 		return
 	}
-	tag, e := s.DB.Exec(r.Context(), "UPDATE attachments SET status='verified' WHERE id=$1 AND owner_user_id=$2 AND status IN ('pending','stored')", in.AttachmentID, middleware.Current(r).UserID)
+	tag, e := s.DB.Exec(r.Context(), "UPDATE attachments SET status='verified' WHERE id=$1 AND owner_user_id=$2 AND status IN ('pending','stored','verified')", in.AttachmentID, middleware.Current(r).UserID)
 	if e != nil {
 		middleware.Fail(w, r, 503, "storage_unavailable")
 		return
@@ -230,19 +250,20 @@ func (s Service) Reconcile(ctx context.Context) error {
 	if s.Storage == nil {
 		return nil
 	}
-	rows, err := s.DB.Query(ctx, `SELECT id,object_key FROM attachments
-		WHERE status='deleted' OR (status IN ('pending','stored') AND created_at < $1)`, time.Now().Add(-10*time.Minute))
+	rows, err := s.DB.Query(ctx, `SELECT id FROM attachments
+		WHERE status='deleted' OR (status IN ('pending','stored') AND created_at < $1)
+		OR (status='verified' AND message_id IS NULL AND created_at < $2)`,
+		time.Now().Add(-10*time.Minute), time.Now().Add(-24*time.Hour))
 	if err != nil {
 		return err
 	}
-	type stale struct{ id, key string }
-	var items []stale
+	var items []string
 	for rows.Next() {
-		var item stale
-		if err = rows.Scan(&item.id, &item.key); err != nil {
+		var id string
+		if err = rows.Scan(&id); err != nil {
 			break
 		}
-		items = append(items, item)
+		items = append(items, id)
 	}
 	if err == nil {
 		err = rows.Err()
@@ -251,13 +272,24 @@ func (s Service) Reconcile(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	for _, item := range items {
-		if err = s.Storage.Delete(ctx, item.key); err != nil {
+	for _, id := range items {
+		var key string
+		// Claim the stale row before removing its object. A concurrent message link
+		// can make a verified upload live between the listing and this update.
+		err = s.DB.QueryRow(ctx, `UPDATE attachments SET status='deleted' WHERE id=$1 AND
+			(status='deleted' OR (status IN ('pending','stored') AND created_at < $2)
+			OR (status='verified' AND message_id IS NULL AND created_at < $3)) RETURNING object_key`,
+			id, time.Now().Add(-10*time.Minute), time.Now().Add(-24*time.Hour)).Scan(&key)
+		if err == pgx.ErrNoRows {
+			continue
+		}
+		if err != nil {
 			return err
 		}
-		if _, err = s.DB.Exec(ctx, `DELETE FROM attachments WHERE id=$1 AND
-			(status='deleted' OR (status IN ('pending','stored') AND created_at < $2))`,
-			item.id, time.Now().Add(-10*time.Minute)); err != nil {
+		if err = s.Storage.Delete(ctx, key); err != nil {
+			return err
+		}
+		if _, err = s.DB.Exec(ctx, "DELETE FROM attachments WHERE id=$1 AND status='deleted'", id); err != nil {
 			return err
 		}
 	}

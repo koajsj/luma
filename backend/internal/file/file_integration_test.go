@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync"
 	"testing"
 
 	"github.com/google/uuid"
@@ -74,12 +75,28 @@ func TestLocalFileFlowAndAccessControl(t *testing.T) {
 		handler(w, req)
 		return w
 	}
-	if w := withID(http.MethodPut, owner, data, svc.Upload); w.Code != 204 {
-		t.Fatalf("upload = %d: %s", w.Code, w.Body.String())
+	var uploads sync.WaitGroup
+	results := make(chan int, 2)
+	for range 2 {
+		uploads.Add(1)
+		go func() {
+			defer uploads.Done()
+			results <- withID(http.MethodPut, owner, data, svc.Upload).Code
+		}()
+	}
+	uploads.Wait()
+	close(results)
+	for code := range results {
+		if code != 204 {
+			t.Fatalf("concurrent upload = %d", code)
+		}
 	}
 	var status string
 	if err := db.QueryRow(context.Background(), "SELECT status FROM attachments WHERE id=$1", created.AttachmentID).Scan(&status); err != nil || status != "stored" {
 		t.Fatalf("uploaded status = %q: %v", status, err)
+	}
+	if w := withID(http.MethodPut, owner, data, svc.Upload); w.Code != 204 {
+		t.Fatalf("repeated upload = %d: %s", w.Code, w.Body.String())
 	}
 	complete, _ := json.Marshal(map[string]string{"attachmentID": created.AttachmentID})
 	if w := call(http.MethodPost, "/v1/files/upload/complete", owner, complete, svc.Complete); w.Code != 204 {
@@ -87,6 +104,12 @@ func TestLocalFileFlowAndAccessControl(t *testing.T) {
 	}
 	if err := db.QueryRow(context.Background(), "SELECT status FROM attachments WHERE id=$1", created.AttachmentID).Scan(&status); err != nil || status != "verified" {
 		t.Fatalf("verified status = %q: %v", status, err)
+	}
+	if w := withID(http.MethodPut, owner, data, svc.Upload); w.Code != 204 {
+		t.Fatalf("repeated verified upload = %d: %s", w.Code, w.Body.String())
+	}
+	if w := call(http.MethodPost, "/v1/files/upload/complete", owner, complete, svc.Complete); w.Code != 204 {
+		t.Fatalf("repeated complete = %d: %s", w.Code, w.Body.String())
 	}
 	if w := withID(http.MethodGet, stranger, nil, svc.Content); w.Code != 404 {
 		t.Fatalf("stranger content = %d", w.Code)
@@ -108,11 +131,47 @@ func TestLocalFileFlowAndAccessControl(t *testing.T) {
 	}
 	// An interrupted pending upload is removed from both the DB and local disk.
 	w = call(http.MethodPost, "/v1/files/upload/init", owner, input, svc.Init)
-	if w.Code != 201 || json.Unmarshal(w.Body.Bytes(), &created) != nil { t.Fatal("second init failed") }
-	if w := withID(http.MethodPut, owner, data, svc.Upload); w.Code != 204 { t.Fatal("second upload failed") }
+	if w.Code != 201 || json.Unmarshal(w.Body.Bytes(), &created) != nil {
+		t.Fatal("second init failed")
+	}
+	if w := withID(http.MethodPut, owner, data, svc.Upload); w.Code != 204 {
+		t.Fatal("second upload failed")
+	}
 	var key string
-	if err := db.QueryRow(context.Background(), "UPDATE attachments SET created_at=now()-interval '20 minutes' WHERE id=$1 RETURNING object_key", created.AttachmentID).Scan(&key); err != nil { t.Fatal(err) }
-	if err := svc.Reconcile(context.Background()); err != nil { t.Fatal(err) }
-	if err := db.QueryRow(context.Background(), "SELECT count(*) FROM attachments WHERE id=$1", created.AttachmentID).Scan(&remaining); err != nil || remaining != 0 { t.Fatalf("stale metadata remains: %d: %v", remaining, err) }
-	if _, err := storage.Open(context.Background(), key); err == nil { t.Fatal("stale ciphertext remains") }
+	if err := db.QueryRow(context.Background(), "UPDATE attachments SET created_at=now()-interval '20 minutes' WHERE id=$1 RETURNING object_key", created.AttachmentID).Scan(&key); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(context.Background(), "SELECT count(*) FROM attachments WHERE id=$1", created.AttachmentID).Scan(&remaining); err != nil || remaining != 0 {
+		t.Fatalf("stale metadata remains: %d: %v", remaining, err)
+	}
+	if _, err := storage.Open(context.Background(), key); err == nil {
+		t.Fatal("stale ciphertext remains")
+	}
+	// A completed upload abandoned before message creation must also be reaped.
+	w = call(http.MethodPost, "/v1/files/upload/init", owner, input, svc.Init)
+	if w.Code != 201 || json.Unmarshal(w.Body.Bytes(), &created) != nil {
+		t.Fatal("third init failed")
+	}
+	if w := withID(http.MethodPut, owner, data, svc.Upload); w.Code != 204 {
+		t.Fatal("third upload failed")
+	}
+	complete, _ = json.Marshal(map[string]string{"attachmentID": created.AttachmentID})
+	if w := call(http.MethodPost, "/v1/files/upload/complete", owner, complete, svc.Complete); w.Code != 204 {
+		t.Fatal("third complete failed")
+	}
+	if err := db.QueryRow(context.Background(), "UPDATE attachments SET created_at=now()-interval '25 hours' WHERE id=$1 RETURNING object_key", created.AttachmentID).Scan(&key); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(context.Background(), "SELECT count(*) FROM attachments WHERE id=$1", created.AttachmentID).Scan(&remaining); err != nil || remaining != 0 {
+		t.Fatalf("abandoned verified upload remains: %d: %v", remaining, err)
+	}
+	if _, err := storage.Open(context.Background(), key); err == nil {
+		t.Fatal("abandoned verified ciphertext remains")
+	}
 }

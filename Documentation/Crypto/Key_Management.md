@@ -23,3 +23,7 @@
 ## v3 密钥使用补充
 
 v3 每个目标设备临时生成 P-256 密钥，结合其 Device Key、已由身份密钥签名的 Signed PreKey、可选一次性 PreKey 派生该信封专用 AES-GCM 密钥。临时私钥与消息密钥只在发送/接收调用期间使用，不进入 SwiftData、文件或日志。收到消息并以 Master Key 重加密落盘后，客户端标记并删除对应一次性私钥；中断后重放同一事件会继续清理。`RemoteDeviceTrust` 只保存公钥与版本以拒绝回滚。删除账号会清理本地身份/设备/预密钥和信任元数据；本阶段 v3 不持久化 Session Root 或链密钥，也不能宣称完整前向保密。
+
+v4 为每个已登记设备生成独立 Curve25519 身份协商键、Ed25519 签名键、Signed PreKey 和一次性 PreKey 池。P-256 账号身份私钥对该设备的 v4 公钥与版本作绑定签名；后端仅发布公开材料。`V4SessionVault` 以 `WhenUnlockedThisDeviceOnly` Keychain 项保存私钥、会话 Root/Chain/Ratchet 状态及中断恢复记录；SwiftData 的 `V4DeviceMetadata` 和 `V4SessionMetadata` 只保存非密钥字段。已用的一次性私钥在接收消息和游标持久化后删除；好友身份变化、设备撤销和账号删除清理相关会话材料。Keychain 项不随加密备份导出；换机或丢失该设备密钥后不能用旧备份恢复 v4 会话，需要重新建立。两个独立模拟器已验证在线收发与控制事件；实体设备重启恢复、密钥故障注入和独立安全审计仍未完成。
+
+附件每次新建独立随机 AES-GCM 密钥；它随附件描述通过 v4 逐设备 Ratchet 密文分发，不上传为独立服务器字段。本机仅在 Master Key 加密的 `Attachment.encryptedMetadata` 中保存恢复下载所需材料，不存明文密钥字段。删除消息、好友或账号时清理对应本机描述和缓存；历史加密备份或已下载的对端副本不受远端删除控制。

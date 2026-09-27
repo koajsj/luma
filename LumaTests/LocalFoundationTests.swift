@@ -5,6 +5,34 @@ import XCTest
 
 @MainActor
 final class LocalFoundationTests: XCTestCase {
+    func testV4AttachmentSealingAndIdentitySafetyCode() throws {
+        let message = UUID(), conversation = UUID()
+        for type in [MessageType.image, .file, .voice] {
+            let descriptor = V4AttachmentCrypto.makeDescriptor(attachmentID: UUID(),
+                messageID: message, conversationID: conversation, type: type, name: "private.bin")
+            let content = Data("private attachment \(type.rawValue)".utf8)
+            let sealed = try V4AttachmentCrypto.encrypt(content, descriptor: descriptor)
+            XCTAssertNil(sealed.bytes.range(of: content))
+            let uploaded = descriptor.withUpload(id: UUID(), hash: Data(SHA256.hash(data: sealed.bytes)))
+            try V4AttachmentCrypto.validate(uploaded, messageID: message, conversationID: conversation)
+            XCTAssertEqual(try V4AttachmentCrypto.decrypt(sealed, descriptor: uploaded), content)
+            var damaged = sealed.bytes
+            damaged[damaged.index(before: damaged.endIndex)] ^= 1
+            XCTAssertThrowsError(try V4AttachmentCrypto.decrypt(.init(bytes: damaged), descriptor: uploaded))
+            let wrong = V4AttachmentCrypto.makeDescriptor(attachmentID: descriptor.attachmentID,
+                messageID: message, conversationID: conversation, type: type, name: "private.bin")
+                .withUpload(id: uploaded.remoteObjectID!, hash: uploaded.ciphertextHash!)
+            XCTAssertThrowsError(try V4AttachmentCrypto.decrypt(sealed, descriptor: wrong))
+        }
+        let alice = P256.Signing.PrivateKey().publicKey.x963Representation
+        let bob = P256.Signing.PrivateKey().publicKey.x963Representation
+        let mallory = P256.Signing.PrivateKey().publicKey.x963Representation
+        let code = IdentitySafetyCode.make(alice, bob)
+        XCTAssertEqual(code, IdentitySafetyCode.make(bob, alice))
+        XCTAssertNotEqual(code, IdentitySafetyCode.make(alice, mallory))
+        XCTAssertTrue(IdentitySafetyCode.matches(IdentitySafetyCode.grouped(code), code: code))
+        XCTAssertFalse(IdentitySafetyCode.matches(IdentitySafetyCode.make(alice, mallory), code: code))
+    }
     private func makeContext() throws -> ModelContext {
         let container = try ModelContainer(for: User.self, Device.self, Friend.self, Conversation.self, Message.self, Attachment.self, UserPresence.self, Reaction.self, SearchIndexEntry.self, SessionKey.self, PreKeyMetadata.self, ChainState.self, RemoteSyncCheckpoint.self, RemoteDeviceTrust.self, OutgoingMessageQueueItem.self, CleanupState.self,
                                            configurations: ModelConfiguration(isStoredInMemoryOnly: true))
@@ -126,6 +154,11 @@ final class LocalFoundationTests: XCTestCase {
         XCTAssertNil(try keychain.read(oldSessionAccount))
         restored.transportEncryptionVersion = 3
         try context.save()
+        XCTAssertThrowsError(try manager.export(user: user, password: "backup-secret")) { error in
+            guard case BackupError.onlineHistoryCannotExport = error else {
+                return XCTFail("Online history must not enter a portable backup")
+            }
+        }
         XCTAssertThrowsError(try manager.restore(backup, password: "backup-secret", into: user))
         XCTAssertEqual(try chat.displayContent(for: restored), "备份消息")
         let interrupted = CleanupState(ownerID: user.id, userID: user.userID, operation: "backupRestore")
@@ -171,11 +204,21 @@ final class LocalFoundationTests: XCTestCase {
         } catch is URLError { }
         XCTAssertTrue(item.prepared)
         XCTAssertEqual(item.state, "pending")
+        let later = Message(conversationID: UUID(), type: .text, isMine: true)
+        context.insert(later)
+        _ = try queue.enqueue(messageID: later.id, request: Data("later".utf8))
+        try context.save()
+        try await queue.drain(prepare: { _, _ in XCTFail("Retry delay must preserve order"); return Data() },
+                              send: { _, _ in XCTFail("Later message overtook the retry") })
+        XCTAssertEqual(sentBodies.count, 1)
         item.nextAttemptAt = .distantPast
         try context.save()
-        try await queue.drain(prepare: { _, _ in XCTFail("Prepared request must be reused"); return Data() },
+        try await queue.drain(prepare: { queued, body in
+            XCTAssertEqual(queued.messageID, later.id)
+            return body
+        },
                               send: { body, _ in sentBodies.append(body) })
-        XCTAssertEqual(sentBodies, [Data("stable-envelope".utf8), Data("stable-envelope".utf8)])
+        XCTAssertEqual(sentBodies, [Data("stable-envelope".utf8), Data("stable-envelope".utf8), Data("later".utf8)])
         XCTAssertEqual(message.deliveryStatus, .sent)
         XCTAssertTrue(try context.fetch(FetchDescriptor<OutgoingMessageQueueItem>()).isEmpty)
     }
@@ -361,10 +404,204 @@ final class LocalFoundationTests: XCTestCase {
             senderDeviceID: third.senderDeviceID, receiverDeviceID: third.receiverDeviceID,
             encryptionVersion: third.encryptionVersion, ratchetPublicKey: third.ratchetPublicKey,
             previousChainLength: third.previousChainLength, messageIndex: third.messageIndex,
+            sessionVersion: third.sessionVersion, initialHeader: third.initialHeader,
             nonce: third.nonce, ciphertext: third.ciphertext, authenticationTag: third.authenticationTag)
         XCTAssertThrowsError(try bob.decrypt(forged, expectedReceiver: bobID, expectedSender: aliceID,
             expectedConversation: conversationID))
         XCTAssertEqual(bob.receivingIndex, before)
+    }
+
+    func testV4TwoDeviceSessionSurvivesVaultReopen() throws {
+        struct Request: Decodable {
+            struct Recipient: Decodable { let recipientDeviceID: String; let ciphertext: String }
+            let recipientEnvelopes: [Recipient]
+        }
+        let service = "app.luma.v4-test.\(UUID().uuidString)"
+        let vault = V4SessionVault(keychain: KeychainManager(service: service))
+        defer { try? vault.purgeAccount(userID: "alice"); try? vault.purgeAccount(userID: "bob") }
+        let aliceID = UUID(), bobID = UUID(), aliceUserID = UUID(), bobUserID = UUID()
+        let conversationID = UUID()
+        let aliceIdentity = V4IdentityKeys(), bobIdentity = V4IdentityKeys()
+        let aliceSigned = Curve25519.KeyAgreement.PrivateKey()
+        let bobSigned = Curve25519.KeyAgreement.PrivateKey()
+        for (name, id, identity, signed) in [
+            ("alice", aliceID, aliceIdentity, aliceSigned),
+            ("bob", bobID, bobIdentity, bobSigned)
+        ] {
+            try vault.saveDevice(.init(formatVersion: 1, deviceID: id, keyVersion: 1,
+                identityAgreement: identity.agreement.rawRepresentation,
+                identitySigning: identity.signing.rawRepresentation,
+                signedPreKey: signed.rawRepresentation, oneTimePreKeys: [:]), userID: name)
+        }
+        let aliceBundle = try V4Handshake.bundle(deviceID: aliceID, version: 1,
+            identity: aliceIdentity, signedPreKey: aliceSigned, oneTimePreKey: nil)
+        let bobBundle = try V4Handshake.bundle(deviceID: bobID, version: 1,
+            identity: bobIdentity, signedPreKey: bobSigned, oneTimePreKey: nil)
+        let alice = V4MessageSessionService(vault: vault, userID: "alice", localDeviceID: aliceID)
+        let bob = V4MessageSessionService(vault: vault, userID: "bob", localDeviceID: bobID)
+        let firstID = UUID()
+        let firstRequest = try alice.prepare(Data("hello".utf8), messageID: firstID,
+            conversationID: conversationID, targets: [.init(remoteUserID: bobUserID, bundle: bobBundle)])
+        XCTAssertEqual(try vault.outgoingPending(userID: "alice", deviceID: aliceID)?.phase, .prepared)
+        let reopenedVault = V4SessionVault(keychain: KeychainManager(service: service))
+        try V4MessageSessionService(vault: reopenedVault, userID: "alice", localDeviceID: aliceID)
+            .commitPreparedSend(messageID: firstID)
+        XCTAssertNil(try reopenedVault.outgoingPending(userID: "alice", deviceID: aliceID))
+        let oldAlice = try XCTUnwrap(vault.loadSession(userID: "alice", local: aliceID, remote: bobID))
+        let firstWire = try XCTUnwrap(JSONDecoder().decode(Request.self, from: firstRequest)
+            .recipientEnvelopes.first?.ciphertext)
+        let firstData = try XCTUnwrap(Data(base64URL: firstWire))
+        let first = try JSONDecoder().decode(V4RatchetMessage.self, from: firstData)
+        let firstEvent = UUID()
+        XCTAssertEqual(try bob.decrypt(first, wire: firstData, eventID: firstEvent, deviceSeq: 1,
+            senderUserID: aliceUserID, senderBundle: aliceBundle), Data("hello".utf8))
+        let restartedBob = V4MessageSessionService(vault: reopenedVault,
+            userID: "bob", localDeviceID: bobID)
+        try restartedBob.recoverReceived(committedCursor: 0)
+        XCTAssertEqual(try reopenedVault.incomingPending(userID: "bob", deviceID: bobID)?.phase, .prepared)
+        try restartedBob.recoverReceived(committedCursor: 1)
+        XCTAssertNil(try reopenedVault.incomingPending(userID: "bob", deviceID: bobID))
+        XCTAssertNotNil(try vault.loadSession(userID: "bob", local: bobID, remote: aliceID))
+        let replyID = UUID()
+        let replyRequest = try V4MessageSessionService(vault: reopenedVault,
+            userID: "bob", localDeviceID: bobID).prepare(Data("reply".utf8), messageID: replyID,
+            conversationID: conversationID, targets: [.init(remoteUserID: aliceUserID, bundle: aliceBundle)])
+        try bob.commitPreparedSend(messageID: replyID)
+        let replyWire = try XCTUnwrap(JSONDecoder().decode(Request.self, from: replyRequest)
+            .recipientEnvelopes.first?.ciphertext)
+        let replyData = try XCTUnwrap(Data(base64URL: replyWire))
+        let reply = try JSONDecoder().decode(V4RatchetMessage.self, from: replyData)
+        let replyEvent = UUID()
+        let restartedAlice = V4MessageSessionService(vault: reopenedVault,
+            userID: "alice", localDeviceID: aliceID)
+        XCTAssertEqual(try restartedAlice.decrypt(reply, wire: replyData, eventID: replyEvent, deviceSeq: 1,
+            senderUserID: bobUserID, senderBundle: bobBundle), Data("reply".utf8))
+        try restartedAlice.finishReceived(eventID: replyEvent)
+        let latestAlice = try XCTUnwrap(vault.loadSession(userID: "alice", local: aliceID, remote: bobID))
+        XCTAssertGreaterThan(latestAlice.stateVersion, oldAlice.stateVersion)
+        XCTAssertThrowsError(try vault.saveSession(oldAlice, userID: "alice"))
+        let account = "v4.session.alice.\(aliceID.uuidString).\(bobID.uuidString)"
+        try vault.keychain.save(JSONEncoder().encode(oldAlice), account: account)
+        XCTAssertThrowsError(try vault.loadSession(userID: "alice", local: aliceID, remote: bobID))
+        try vault.keychain.save(JSONEncoder().encode(latestAlice), account: account)
+        XCTAssertThrowsError(try restartedAlice.decrypt(reply, wire: replyData, eventID: UUID(), deviceSeq: 2,
+            senderUserID: bobUserID, senderBundle: bobBundle))
+    }
+
+    func testV4ControlEventsUseFreshKeysAndRejectReplayOrTampering() throws {
+        struct Request: Decodable {
+            struct Recipient: Decodable { let ciphertext: String }
+            let recipientEnvelopes: [Recipient]
+        }
+        let service = "app.luma.v4-events.\(UUID().uuidString)"
+        let aliceVault = V4SessionVault(keychain: KeychainManager(service: service + ".a"))
+        let bobVault = V4SessionVault(keychain: KeychainManager(service: service + ".b"))
+        defer { try? aliceVault.purgeAccount(userID: "alice"); try? bobVault.purgeAccount(userID: "bob") }
+        let aliceID = UUID(), bobID = UUID(), aliceUser = UUID(), bobUser = UUID()
+        let conversationID = UUID(), messageID = UUID()
+        let aliceKeys = V4IdentityKeys(), bobKeys = V4IdentityKeys()
+        let aliceSigned = Curve25519.KeyAgreement.PrivateKey(), bobSigned = Curve25519.KeyAgreement.PrivateKey()
+        try aliceVault.saveDevice(.init(formatVersion: 1, deviceID: aliceID, keyVersion: 1,
+            identityAgreement: aliceKeys.agreement.rawRepresentation,
+            identitySigning: aliceKeys.signing.rawRepresentation,
+            signedPreKey: aliceSigned.rawRepresentation, oneTimePreKeys: [:]), userID: "alice")
+        try bobVault.saveDevice(.init(formatVersion: 1, deviceID: bobID, keyVersion: 1,
+            identityAgreement: bobKeys.agreement.rawRepresentation,
+            identitySigning: bobKeys.signing.rawRepresentation,
+            signedPreKey: bobSigned.rawRepresentation, oneTimePreKeys: [:]), userID: "bob")
+        let aliceBundle = try V4Handshake.bundle(deviceID: aliceID, version: 1,
+            identity: aliceKeys, signedPreKey: aliceSigned, oneTimePreKey: nil)
+        let bobBundle = try V4Handshake.bundle(deviceID: bobID, version: 1,
+            identity: bobKeys, signedPreKey: bobSigned, oneTimePreKey: nil)
+        let alice = V4MessageSessionService(vault: aliceVault, userID: "alice", localDeviceID: aliceID)
+        let bob = V4MessageSessionService(vault: bobVault, userID: "bob", localDeviceID: bobID)
+        let first = try alice.prepare(Data("hello".utf8), messageID: messageID,
+            conversationID: conversationID, targets: [.init(remoteUserID: bobUser, bundle: bobBundle)])
+        try alice.commitPreparedSend(messageID: messageID)
+        let firstWire = try XCTUnwrap(Data(base64URL: XCTUnwrap(JSONDecoder().decode(Request.self, from: first)
+            .recipientEnvelopes.first).ciphertext))
+        let firstEnvelope = try JSONDecoder().decode(V4RatchetMessage.self, from: firstWire)
+        let firstSyncID = UUID()
+        XCTAssertEqual(try bob.decrypt(firstEnvelope, wire: firstWire, eventID: firstSyncID,
+            deviceSeq: 1, senderUserID: aliceUser, senderBundle: aliceBundle), Data("hello".utf8))
+        try bob.finishReceived(eventID: firstSyncID)
+        var ciphertexts: [Data] = []
+        for (index, kind, text, action) in [
+            (2, V4EventEnvelope.Kind.edit, "changed", nil),
+            (2, .reaction, "👍", "add"),
+            (2, .reaction, "👍", "remove"),
+            (3, .delete, nil, nil)
+        ] {
+            let event = V4EventEnvelope(eventID: UUID(), messageID: messageID,
+                conversationID: conversationID, actorUserID: aliceUser,
+                actorDeviceID: aliceID, kind: kind, revision: index,
+                text: text, reactionAction: action, occurredAt: .now)
+            let request = try alice.prepareEvent(event, targets: [.init(remoteUserID: bobUser, bundle: bobBundle)])
+            try alice.commitPreparedSend(messageID: event.eventID)
+            let wire = try XCTUnwrap(Data(base64URL: XCTUnwrap(JSONDecoder().decode(Request.self, from: request)
+                .recipientEnvelopes.first).ciphertext))
+            ciphertexts.append(wire)
+            let envelope = try JSONDecoder().decode(V4RatchetMessage.self, from: wire)
+            XCTAssertEqual(envelope.messageID, event.eventID)
+            let syncID = UUID()
+            let decoded = try bob.decrypt(envelope, wire: wire, eventID: syncID,
+                deviceSeq: Int64(ciphertexts.count + 1), senderUserID: aliceUser,
+                senderBundle: aliceBundle)
+            XCTAssertEqual(try JSONDecoder().decode(V4EventEnvelope.self, from: decoded).eventID, event.eventID)
+            try bob.finishReceived(eventID: syncID)
+            XCTAssertThrowsError(try bob.decrypt(envelope, wire: wire, eventID: UUID(),
+                deviceSeq: 99, senderUserID: aliceUser, senderBundle: aliceBundle))
+        }
+        XCTAssertEqual(Set(ciphertexts).count, ciphertexts.count)
+        let read = V4EventEnvelope(eventID: UUID(), messageID: messageID,
+            conversationID: conversationID, actorUserID: bobUser,
+            actorDeviceID: bobID, kind: .read, revision: 3,
+            text: nil, reactionAction: nil, occurredAt: .now)
+        let readRequest = try bob.prepareEvent(read, targets: [.init(remoteUserID: aliceUser, bundle: aliceBundle)])
+        try bob.commitPreparedSend(messageID: read.eventID)
+        let readWire = try XCTUnwrap(Data(base64URL: XCTUnwrap(JSONDecoder().decode(Request.self, from: readRequest)
+            .recipientEnvelopes.first).ciphertext))
+        let readEnvelope = try JSONDecoder().decode(V4RatchetMessage.self, from: readWire)
+        let tampered = V4RatchetMessage(messageID: UUID(), conversationID: readEnvelope.conversationID,
+            senderDeviceID: readEnvelope.senderDeviceID, receiverDeviceID: readEnvelope.receiverDeviceID,
+            encryptionVersion: 4, ratchetPublicKey: readEnvelope.ratchetPublicKey,
+            previousChainLength: readEnvelope.previousChainLength, messageIndex: readEnvelope.messageIndex,
+            sessionVersion: readEnvelope.sessionVersion, initialHeader: readEnvelope.initialHeader,
+            nonce: readEnvelope.nonce, ciphertext: readEnvelope.ciphertext,
+            authenticationTag: readEnvelope.authenticationTag)
+        XCTAssertThrowsError(try alice.decrypt(tampered, wire: try JSONEncoder().encode(tampered),
+            eventID: UUID(), deviceSeq: 1, senderUserID: bobUser, senderBundle: bobBundle))
+        let readSyncID = UUID()
+        let decrypted = try alice.decrypt(readEnvelope, wire: readWire, eventID: readSyncID,
+            deviceSeq: 1, senderUserID: bobUser, senderBundle: bobBundle)
+        XCTAssertEqual(try JSONDecoder().decode(V4EventEnvelope.self, from: decrypted).kind, .read)
+        try alice.finishReceived(eventID: readSyncID)
+
+        // A file key and name travel inside a fresh per-device ratchet message.
+        let attachmentMessageID = UUID()
+        let descriptor = V4AttachmentCrypto.makeDescriptor(attachmentID: UUID(),
+            messageID: attachmentMessageID, conversationID: conversationID,
+            type: .file, name: "private.pdf")
+        let attachmentBytes = Data("file bytes".utf8)
+        let sealedFile = try V4AttachmentCrypto.encrypt(attachmentBytes, descriptor: descriptor)
+        let uploaded = descriptor.withUpload(id: UUID(), hash: Data(SHA256.hash(data: sealedFile.bytes)))
+        let attachmentPayload = V4AttachmentPayload(kind: "attachment", senderUserID: "bob",
+            targetUserID: "alice", attachment: uploaded)
+        let attachmentRequest = try bob.prepare(JSONEncoder().encode(attachmentPayload),
+            messageID: attachmentMessageID, conversationID: conversationID,
+            targets: [.init(remoteUserID: aliceUser, bundle: aliceBundle)],
+            attachmentIDs: [uploaded.remoteObjectID!])
+        try bob.commitPreparedSend(messageID: attachmentMessageID)
+        let attachmentWire = try XCTUnwrap(Data(base64URL: XCTUnwrap(
+            JSONDecoder().decode(Request.self, from: attachmentRequest).recipientEnvelopes.first).ciphertext))
+        let attachmentEnvelope = try JSONDecoder().decode(V4RatchetMessage.self, from: attachmentWire)
+        let attachmentSyncID = UUID()
+        let opened = try alice.decrypt(attachmentEnvelope, wire: attachmentWire,
+            eventID: attachmentSyncID, deviceSeq: 2, senderUserID: bobUser, senderBundle: bobBundle)
+        let received = try JSONDecoder().decode(V4AttachmentPayload.self, from: opened)
+        XCTAssertEqual(received.attachment.name, "private.pdf")
+        XCTAssertEqual(try V4AttachmentCrypto.decrypt(sealedFile, descriptor: received.attachment), attachmentBytes)
+        try alice.finishReceived(eventID: attachmentSyncID)
     }
 
 }

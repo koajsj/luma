@@ -69,6 +69,11 @@ func (s Service) Revoke(w http.ResponseWriter, r *http.Request) {
 	if e == nil {
 		_, e = tx.Exec(r.Context(), "DELETE FROM signed_prekeys WHERE device_id=$1", id)
 	}
+	if e == nil {
+		_, e = tx.Exec(r.Context(), "DELETE FROM v4_one_time_prekeys WHERE device_id=$1", id)
+	}
+	// Keep signed public v4 identity material for validating envelopes sent before
+	// revocation. The active-device bundle excludes this device from new sends.
 	seqs := map[string]int64{}
 	if e == nil {
 		rows, err := tx.Query(r.Context(), "SELECT id FROM devices WHERE user_id=$1 AND revoked_at IS NULL AND id<>$2", i.UserID, id)

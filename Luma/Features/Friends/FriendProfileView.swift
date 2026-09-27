@@ -13,6 +13,7 @@ struct FriendProfileView: View {
     @Query private var indexes: [SearchIndexEntry]
     @Query private var sessionKeys: [SessionKey]
     @Query private var presences: [UserPresence]
+    @Query private var users: [User]
     @State private var remark = ""
     @State private var editingRemark = false
     @State private var confirmingDelete = false
@@ -45,6 +46,14 @@ struct FriendProfileView: View {
                 Toggle("限制此好友的本地资料展示", isOn: Binding(get: { friend.privacyRestricted ?? false }, set: { friend.privacyRestricted = $0; save() }))
                 Text("仅保存在本机；不会通知对方或改变服务器权限。")
                     .font(.footnote).foregroundStyle(.secondary)
+            }
+            if friend.remoteUserID != nil,
+               let owner = users.first(where: { $0.id == friend.ownerID }) {
+                Section("身份") {
+                    NavigationLink("安全验证") {
+                        IdentityVerificationView(user: owner, friend: friend)
+                    }
+                }
             }
             Section { Button("删除好友及本地聊天", role: .destructive) { confirmingDelete = true } }
         }
@@ -82,6 +91,9 @@ struct FriendProfileView: View {
             for item in try context.fetch(FetchDescriptor<OutgoingMessageQueueItem>()).filter({
                 $0.ownerID == friend.ownerID && messageIDs.contains($0.messageID)
             }) { context.delete(item) }
+            for item in try context.fetch(FetchDescriptor<V4PendingEvent>()).filter({
+                $0.ownerID == friend.ownerID && messageIDs.contains($0.messageID)
+            }) { context.delete(item) }
             for conversation in conversations where conversation.friendID == friend.id {
                 for message in allMessages where message.conversationID == conversation.id {
                     for attachment in attachments where attachment.messageID == message.id {
@@ -100,6 +112,20 @@ struct FriendProfileView: View {
             for key in sessionKeys where key.friendID == friend.id {
                 try sessions.deleteKeyMaterial(for: key)
                 context.delete(key)
+            }
+            let v4Vault = V4SessionVault()
+            let ownerUserID = try security.currentUserID()
+            if let remoteUserID = friend.remoteUserID,
+               let registration = try RemoteSessionStore().registration(for: ownerUserID) {
+                try v4Vault.discardPendingForRemoteUser(userID: ownerUserID,
+                    localDeviceID: registration.backendDeviceID, remoteUserID: remoteUserID)
+            }
+            for session in try context.fetch(FetchDescriptor<V4SessionMetadata>()).filter({
+                $0.ownerID == friend.ownerID && $0.friendID == friend.id
+            }) {
+                try v4Vault.deletePeer(userID: ownerUserID,
+                    localDeviceID: session.localDeviceID, remoteDeviceID: session.remoteDeviceID)
+                context.delete(session)
             }
             for presence in presences where presence.friendID == friend.id { context.delete(presence) }
             if let remoteUserID = friend.remoteUserID {

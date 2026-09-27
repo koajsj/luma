@@ -5,7 +5,7 @@ import Security
 import SwiftData
 
 enum BackupError: LocalizedError {
-    case invalidFile, wrongAccount, invalidPassword, incompleteData, onlineHistoryCannotRestore
+    case invalidFile, wrongAccount, invalidPassword, incompleteData, onlineHistoryCannotRestore, onlineHistoryCannotExport
     var errorDescription: String? {
         switch self {
         case .invalidFile: "备份文件格式无效或已损坏"
@@ -13,6 +13,7 @@ enum BackupError: LocalizedError {
         case .invalidPassword: "备份密码错误或文件已损坏"
         case .incompleteData: "备份引用不完整，未恢复任何数据"
         case .onlineHistoryCannotRestore: "当前备份包含在线消息或仍有在线同步进度，无法安全恢复。请保留备份，并先在原设备完成在线数据核对。"
+        case .onlineHistoryCannotExport: "当前账号包含在线消息或同步进度，暂不能导出可恢复备份。请保留原设备上的数据。"
         }
     }
 }
@@ -84,6 +85,15 @@ struct BackupManager {
         let conversations = try context.fetch(FetchDescriptor<Conversation>()).filter { $0.ownerID == user.id && friendIDs.contains($0.friendID) }
         let conversationIDs = Set(conversations.map(\.id))
         let messages = try context.fetch(FetchDescriptor<Message>()).filter { conversationIDs.contains($0.conversationID) }
+        let hasSyncProgress = try context.fetch(FetchDescriptor<RemoteSyncCheckpoint>()).contains {
+            $0.ownerID == user.id && $0.cursor > 0
+        }
+        let hasOutgoing = try context.fetch(FetchDescriptor<OutgoingMessageQueueItem>()).contains { $0.ownerID == user.id }
+        let hasV4Events = try context.fetch(FetchDescriptor<V4PendingEvent>()).contains { $0.ownerID == user.id }
+        guard !messages.contains(where: { [3, 4].contains($0.transportEncryptionVersion ?? 0) }),
+              !hasSyncProgress, !hasOutgoing, !hasV4Events else {
+            throw BackupError.onlineHistoryCannotExport
+        }
         let messageIDs = Set(messages.map(\.id))
         let attachments = try context.fetch(FetchDescriptor<Attachment>()).filter { messageIDs.contains($0.messageID) }
         let reactions = try context.fetch(FetchDescriptor<Reaction>()).filter { messageIDs.contains($0.messageID) }
@@ -149,14 +159,16 @@ struct BackupManager {
         let currentConversations = try context.fetch(FetchDescriptor<Conversation>()).filter { $0.ownerID == user.id }
         let currentConversationIDs = Set(currentConversations.map(\.id))
         let hasOnlineMessages = try context.fetch(FetchDescriptor<Message>()).contains {
-            currentConversationIDs.contains($0.conversationID) && $0.transportEncryptionVersion == 3
+            currentConversationIDs.contains($0.conversationID) &&
+            [3, 4].contains($0.transportEncryptionVersion ?? 0)
         }
         let hasSyncProgress = try context.fetch(FetchDescriptor<RemoteSyncCheckpoint>()).contains {
             $0.ownerID == user.id && $0.cursor > 0
         }
         let hasOutgoing = try context.fetch(FetchDescriptor<OutgoingMessageQueueItem>()).contains { $0.ownerID == user.id }
-        guard !archive.messages.contains(where: { $0.transportEncryptionVersion == 3 }),
-              !hasOnlineMessages, !hasSyncProgress, !hasOutgoing else {
+        let hasV4Events = try context.fetch(FetchDescriptor<V4PendingEvent>()).contains { $0.ownerID == user.id }
+        guard !archive.messages.contains(where: { [3, 4].contains($0.transportEncryptionVersion ?? 0) }),
+              !hasOnlineMessages, !hasSyncProgress, !hasOutgoing, !hasV4Events else {
             throw BackupError.onlineHistoryCannotRestore
         }
 
@@ -196,6 +208,7 @@ struct BackupManager {
                 for item in oldSessions { context.delete(item) }
                 for item in oldChains { context.delete(item) }
                 for item in try context.fetch(FetchDescriptor<OutgoingMessageQueueItem>()).filter({ $0.ownerID == user.id }) { context.delete(item) }
+                for item in try context.fetch(FetchDescriptor<V4PendingEvent>()).filter({ $0.ownerID == user.id }) { context.delete(item) }
                 for item in oldMessages { context.delete(item) }
                 for item in oldConversations { context.delete(item) }
                 for item in oldFriends { context.delete(item) }

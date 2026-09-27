@@ -15,6 +15,7 @@ enum RemoteError: LocalizedError {
         case .invalidResponse: "服务器响应格式无效"
         case .authenticationExpired: "设备会话已失效，请重新登录在线账号"
         case .deviceRevoked: "此设备已从服务器撤销，在线会话已清除"
+        case .server(409, "v4_prekeys_exhausted"): "对方设备的一次性安全密钥已用完，请对方打开 Luma 后重试"
         case let .server(code, reason): "服务器请求失败（\(code)：\(reason)）"
         case .onlineMessagesUnavailable: "线上消息协议尚未完成，不能发送本机密文"
         }

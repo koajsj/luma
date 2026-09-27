@@ -97,6 +97,15 @@ struct PrivateMetadataStore {
         return try JSONDecoder().decode(AttachmentMetadata.self, from: data)
     }
 
+    func saveAttachmentMetadata(_ metadata: AttachmentMetadata, for attachment: Attachment) throws {
+        attachment.encryptedMetadata = try encryption.encrypt(JSONEncoder().encode(metadata),
+            authenticatedData: binding("attachment", attachment.id)).bytes
+        attachment.path = ""
+        attachment.encryptedPath = nil
+        attachment.encryptionMetadata = nil
+        try context.save()
+    }
+
     private func legacyPreferences(for user: User) -> PrivacyPreferences {
         var value = PrivacyPreferences()
         value.searchable = user.searchable; value.faceIDEnabled = user.faceIDEnabled

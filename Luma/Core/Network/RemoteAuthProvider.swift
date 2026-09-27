@@ -73,6 +73,10 @@ struct RemoteAuthProvider {
         let response: RemoteTokenResponse = try await client.json(RemoteTokenResponse.self, method: "POST",
                                                                   path: "/auth/token", body: body, authenticated: false)
         try store.save(response, for: userID)
+        if let user = try context.fetch(FetchDescriptor<User>()).first(where: { $0.userID == userID }) {
+            try await V4PreKeyService(context: context, user: user, registration: registration,
+                client: client).ensurePublished()
+        }
     }
 
     func signOut(userID: String) async throws {

@@ -273,6 +273,7 @@ final class SecurityManager {
             if let user = try context.fetch(FetchDescriptor<User>()).first(where: { $0.id == marker.ownerID }) {
                 try continueAccountDeletion(user: user, marker: marker, context: context)
             } else {
+                try V4SessionVault(keychain: keychain).purgeAccount(userID: marker.userID)
                 try RemoteSessionStore(keychain: keychain).clearAll(for: marker.userID)
                 try keychain.delete(sessionAccount)
                 marker.state = "completed"
@@ -321,7 +322,10 @@ final class SecurityManager {
         let prekeys = try context.fetch(FetchDescriptor<PreKeyMetadata>()).filter { $0.ownerID == user.id }
         let remoteCheckpoints = try context.fetch(FetchDescriptor<RemoteSyncCheckpoint>()).filter { $0.ownerID == user.id }
         let remoteDeviceTrust = try context.fetch(FetchDescriptor<RemoteDeviceTrust>()).filter { $0.ownerID == user.id }
+        let v4Sessions = try context.fetch(FetchDescriptor<V4SessionMetadata>()).filter { $0.ownerID == user.id }
+        let v4Devices = try context.fetch(FetchDescriptor<V4DeviceMetadata>()).filter { $0.ownerID == user.id }
         let outgoing = try context.fetch(FetchDescriptor<OutgoingMessageQueueItem>()).filter { $0.ownerID == user.id }
+        let v4Events = try context.fetch(FetchDescriptor<V4PendingEvent>()).filter { $0.ownerID == user.id }
         let cleanupMarkers = try context.fetch(FetchDescriptor<CleanupState>()).filter { $0.ownerID == user.id && $0.id != marker.id }
 
         try FileTransferService.purgeAccount(ownerID: user.id)
@@ -336,7 +340,10 @@ final class SecurityManager {
         for item in prekeys { context.delete(item) }
         for item in remoteCheckpoints { context.delete(item) }
         for item in remoteDeviceTrust { context.delete(item) }
+        for item in v4Sessions { context.delete(item) }
+        for item in v4Devices { context.delete(item) }
         for item in outgoing { context.delete(item) }
+        for item in v4Events { context.delete(item) }
         for item in cleanupMarkers { context.delete(item) }
         for item in messages { context.delete(item) }
         for item in conversations { context.delete(item) }

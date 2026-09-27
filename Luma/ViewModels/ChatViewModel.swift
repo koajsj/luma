@@ -18,6 +18,21 @@ struct ChatViewModel {
                (try? store.tokens(for: user.userID)) != nil
     }
 
+    func cleanAttachmentFiles(for user: User) throws {
+        guard try security.currentUserID() == user.userID else { throw MessageStoreError.locked }
+        let conversationIDs = Set(try context.fetch(FetchDescriptor<Conversation>())
+            .filter { $0.ownerID == user.id }.map(\.id))
+        let messageIDs = Set(try context.fetch(FetchDescriptor<Message>())
+            .filter { conversationIDs.contains($0.conversationID) }.map(\.id))
+        let attachments = try context.fetch(FetchDescriptor<Attachment>())
+            .filter { messageIDs.contains($0.messageID) }
+        let queued = Set(try context.fetch(FetchDescriptor<OutgoingMessageQueueItem>())
+            .filter { $0.ownerID == user.id }.map(\.messageID))
+        try FileTransferService(ownerID: user.id, encryption: security.encryptionService())
+            .removeOrphans(validAttachmentIDs: Set(attachments.map(\.id)),
+                pendingUploadIDs: Set(attachments.filter { queued.contains($0.messageID) }.map(\.id)))
+    }
+
     private func remoteRepository(for user: User) throws -> RemoteMessageRepository {
         guard try security.currentUserID() == user.userID,
               let registration = try RemoteSessionStore().registration(for: user.userID) else {
@@ -44,6 +59,20 @@ struct ChatViewModel {
 
     func onlineIdentityFingerprint(user: User, friend: Friend) async throws -> String {
         try await remoteRepository(for: user).identityFingerprint(for: friend)
+    }
+
+    func identityVerification(user: User, friend: Friend) async throws -> (fingerprint: String, safetyCode: String) {
+        try await remoteRepository(for: user).identityVerification(for: friend)
+    }
+
+    func sendOnlineAttachment(_ data: Data, name: String, type: MessageType,
+                              user: User, friend: Friend, conversation: Conversation) async throws {
+        try await remoteRepository(for: user).sendAttachment(data, name: name, type: type,
+                                                             to: friend, in: conversation)
+    }
+
+    func downloadOnlineAttachment(_ message: Message, user: User) async throws -> (Data, String, MessageType) {
+        try await remoteRepository(for: user).downloadAttachment(for: message)
     }
 
     func trustOnlineIdentity(_ fingerprint: String, user: User, friend: Friend) throws {
@@ -96,6 +125,13 @@ struct ChatViewModel {
 
     func delete(_ message: Message, forEveryone: Bool) throws {
         _ = try repository.delete(message, forEveryone: forEveryone)
+        if message.type != .text,
+           let attachment = try context.fetch(FetchDescriptor<Attachment>()).first(where: { $0.messageID == message.id }),
+           let conversation = try context.fetch(FetchDescriptor<Conversation>()).first(where: { $0.id == message.conversationID }) {
+            try security.deleteLocalAttachment(attachment.id, ownerID: conversation.ownerID)
+            context.delete(attachment)
+            try context.save()
+        }
     }
 
     func setFavorite(_ value: Bool, for message: Message) throws {

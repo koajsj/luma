@@ -1,6 +1,9 @@
 import SwiftData
 import SwiftUI
 import UIKit
+import PhotosUI
+import UniformTypeIdentifiers
+import AVFoundation
 
 struct ChatListView: View {
     let user: User
@@ -143,7 +146,12 @@ struct ChatDetailView: View {
     @State private var draftLoaded = false
     @State private var onlineMode = false
     @State private var sendingOnline = false
-    @State private var identityCandidate: String?
+    @State private var showingIdentityVerification = false
+    @State private var selectedAttachmentPhoto: PhotosPickerItem?
+    @State private var showingPhotoPicker = false
+    @State private var importingAttachment: MessageType = .file
+    @State private var showingFileImporter = false
+    @State private var attachmentPreview: AttachmentPreview?
     @Environment(\.scenePhase) private var scenePhase
 
     private var viewModel: ChatViewModel { ChatViewModel(context: context, security: security) }
@@ -185,8 +193,8 @@ struct ChatDetailView: View {
                                 Label(onlineMode ? "切换到本地聊天" : "切换到在线密文聊天",
                                       systemImage: onlineMode ? "iphone" : "network.badge.shield.half.filled")
                             }
-                            Button { verifyOnlineIdentity() } label: {
-                                Label("核对好友身份指纹", systemImage: "person.crop.circle.badge.checkmark")
+                            Button { showingIdentityVerification = true } label: {
+                                Label("安全验证", systemImage: "person.crop.circle.badge.checkmark")
                             }
                             Button { Task { await syncOnline() } } label: {
                                 Label("同步线上消息", systemImage: "arrow.clockwise")
@@ -196,13 +204,51 @@ struct ChatDetailView: View {
                 }
             }
         }
-        .sheet(isPresented: $showingActions) { AttachmentActionsView { type in
+        .sheet(isPresented: $showingActions) { AttachmentActionsView(onlineMode: onlineMode, onSimulate: { type in
             showingActions = false
             addSimulated(type)
-        } onUnavailable: { note in
+        }, onPick: { type in
+            showingActions = false
+            if type == .image { showingPhotoPicker = true }
+            else { importingAttachment = type; showingFileImporter = true }
+        }, onUnavailable: { note in
             showingActions = false
             featureNote = note
-        } }
+        }) }
+        .photosPicker(isPresented: $showingPhotoPicker, selection: $selectedAttachmentPhoto, matching: .images)
+        .onChange(of: selectedAttachmentPhoto) { _, item in
+            guard let item else { return }
+            Task {
+                do {
+                    guard let data = try await item.loadTransferable(type: Data.self) else {
+                        throw V4AttachmentError.invalidDescriptor
+                    }
+                    try await sendAttachment(data, name: "image", type: .image)
+                } catch { featureNote = LumaError.message(for: error) }
+                selectedAttachmentPhoto = nil
+            }
+        }
+        .fileImporter(isPresented: $showingFileImporter,
+            allowedContentTypes: importingAttachment == .voice ? [.audio] : [.item]) { result in
+            let type = importingAttachment
+            switch result {
+            case .failure(let error): featureNote = LumaError.message(for: error)
+            case .success(let url):
+                Task {
+                    let access = url.startAccessingSecurityScopedResource()
+                    defer { if access { url.stopAccessingSecurityScopedResource() } }
+                    do {
+                        let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+                        guard size <= 20 << 20 else { throw V4AttachmentError.tooLarge }
+                        try await sendAttachment(Data(contentsOf: url), name: url.lastPathComponent, type: type)
+                    } catch { featureNote = LumaError.message(for: error) }
+                }
+            }
+        }
+        .sheet(item: $attachmentPreview) { AttachmentPreviewView(preview: $0) }
+        .sheet(isPresented: $showingIdentityVerification) {
+            NavigationStack { IdentityVerificationView(user: user, friend: friend) }
+        }
         .sheet(isPresented: $showingInfo) { ChatInfoView(user: user, friend: friend, conversation: conversation,
                                                         onlineMode: onlineMode, typingStatus: $typingStatus) }
         .sheet(isPresented: $showingSecurity) { ChatSecurityView(user: user, friend: friend, onlineMode: onlineMode) }
@@ -213,7 +259,7 @@ struct ChatDetailView: View {
                     .toolbar {
                         ToolbarItem(placement: .cancellationAction) { Button("取消") { editing = nil } }
                         ToolbarItem(placement: .confirmationAction) { Button("保存") {
-                            if onlineMode && message.transportEncryptionVersion == 3, let conversation {
+                            if [3, 4].contains(message.transportEncryptionVersion ?? 0), let conversation {
                                 Task {
                                     do { try await viewModel.editOnlineText(editText, message: message, user: user,
                                         friend: friend, conversation: conversation); editing = nil }
@@ -246,30 +292,19 @@ struct ChatDetailView: View {
         .confirmationDialog("删除消息", isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } })) {
             Button("删除自己", role: .destructive) { delete(forEveryone: false) }
             if deleting?.isMine == true {
-                Button(onlineMode && deleting?.transportEncryptionVersion == 3 ? "通知其他设备删除" : "删除双方（仅本地）",
+                Button([3, 4].contains(deleting?.transportEncryptionVersion ?? 0) ? "通知其他设备删除" : "删除双方（仅本地）",
                        role: .destructive) { delete(forEveryone: true) }
             }
-        } message: { Text(onlineMode && deleting?.transportEncryptionVersion == 3 ?
+        } message: { Text([3, 4].contains(deleting?.transportEncryptionVersion ?? 0) ?
                           "服务器将发送删除事件；已下载副本不能保证物理擦除。" : "当前仅清理此设备的数据，不会影响其他设备。") }
         .alert("提示", isPresented: Binding(get: { featureNote != nil }, set: { if !$0 { featureNote = nil } })) {
             Button("好", role: .cancel) { featureNote = nil }
         } message: { Text(featureNote ?? "") }
-        .alert(friend.sessionStatus == "identityKeyChanged" ? "身份密钥已变化" : "核对身份指纹", isPresented: Binding(get: { identityCandidate != nil },
-                                                 set: { if !$0 { identityCandidate = nil } })) {
-            Button("取消", role: .cancel) { identityCandidate = nil }
-            Button("已通过可信渠道核对") {
-                if let identityCandidate {
-                    do { try viewModel.trustOnlineIdentity(identityCandidate, user: user, friend: friend) }
-                    catch { featureNote = LumaError.message(for: error) }
-                }
-                identityCandidate = nil
-            }
-        } message: {
-            Text("请与对方当面或通过可信渠道核对完整指纹。身份变化后旧在线会话已暂停；仅点击此处不能证明服务器提供的密钥真实属于对方。\n\n\(identityCandidate ?? "")")
-        }
         .onAppear {
             updateVisiblePrivacyShield()
-            if viewModel.onlineAvailable(for: user) && messages.contains(where: { $0.transportEncryptionVersion == 3 }) {
+            if viewModel.onlineAvailable(for: user) && messages.contains(where: {
+                [3, 4].contains($0.transportEncryptionVersion ?? 0)
+            }) {
                 onlineMode = true
             }
             loadDraftIfAllowed(); markVisibleRead()
@@ -334,8 +369,7 @@ struct ChatDetailView: View {
             Button { showingSecurity = true } label: {
                 HStack(spacing: 6) {
                     Image(systemName: "lock.shield")
-                    Text(friend.sessionStatus == "identityKeyChanged" ? "身份密钥已变化 · 在线发送暂停，需重新验证" :
-                         onlineMode ? "设备间密文传输基础 · 非完整 E2EE 协议" : "本地加密保护已开启 · 端到端加密尚未启用")
+                    Text(friend.sessionStatus == "identityKeyChanged" ? "身份密钥已变化 · 需要重新验证" : "隐私保护已开启")
                 }
             }
             .font(.caption)
@@ -351,6 +385,12 @@ struct ChatDetailView: View {
                                    showReadReceipts: security.preferences.readReceipts,
                                    replyPreview: message.replyToID.map { id in messages.first(where: { $0.id == id }).map { viewModel.visibleContent(for: $0) } ?? "原消息不可用" },
                                    onReplyTap: { if let id = message.replyToID { withAnimation { proxy.scrollTo(id, anchor: .center) } } },
+                                   onOpen: { Task {
+                                       do {
+                                           let result = try await viewModel.downloadOnlineAttachment(message, user: user)
+                                           attachmentPreview = AttachmentPreview(data: result.0, name: result.1, type: result.2)
+                                       } catch { featureNote = LumaError.message(for: error) }
+                                   } },
                                    onRetry: { Task {
                                        do { try await viewModel.retryFailedOnline(message.id, user: user) }
                                        catch { featureNote = LumaError.message(for: error) }
@@ -358,7 +398,7 @@ struct ChatDetailView: View {
                             .contextMenu {
                                 ForEach(["👍", "❤️", "😂", "‼️"], id: \.self) { emoji in
                                     Button(emoji) {
-                                        if onlineMode && message.transportEncryptionVersion == 3, let conversation {
+                                        if [3, 4].contains(message.transportEncryptionVersion ?? 0), let conversation {
                                             Task {
                                                 do { try await viewModel.reactOnline(emoji, to: message, user: user,
                                                     friend: friend, conversation: conversation) }
@@ -456,13 +496,6 @@ struct ChatDetailView: View {
         } catch { featureNote = LumaError.message(for: error) }
     }
 
-    private func verifyOnlineIdentity() {
-        Task {
-            do { identityCandidate = try await viewModel.onlineIdentityFingerprint(user: user, friend: friend) }
-            catch { featureNote = LumaError.message(for: error) }
-        }
-    }
-
     private func syncOnline() async {
         guard onlineMode, canViewChat else { return }
         do { _ = try await viewModel.syncOnline(user: user) }
@@ -476,9 +509,15 @@ struct ChatDetailView: View {
         } catch { featureNote = LumaError.message(for: error) }
     }
 
+    private func sendAttachment(_ data: Data, name: String, type: MessageType) async throws {
+        guard onlineMode, canViewChat, let conversation else { throw V4AttachmentError.invalidDescriptor }
+        try await viewModel.sendOnlineAttachment(data, name: name, type: type,
+            user: user, friend: friend, conversation: conversation)
+    }
+
     private func delete(forEveryone: Bool) {
         guard let deleting else { return }
-        if onlineMode && forEveryone && deleting.transportEncryptionVersion == 3 {
+        if forEveryone && [3, 4].contains(deleting.transportEncryptionVersion ?? 0) {
             Task {
                 do { try await viewModel.deleteOnline(deleting, user: user) }
                 catch { featureNote = LumaError.message(for: error) }
@@ -514,6 +553,7 @@ private struct MessageRow: View {
     let showReadReceipts: Bool
     let replyPreview: String?
     let onReplyTap: () -> Void
+    let onOpen: () -> Void
     let onRetry: () -> Void
     var body: some View {
         HStack {
@@ -529,9 +569,15 @@ private struct MessageRow: View {
                 }
                 switch message.type {
                 case .text: Text(content)
-                case .image: Label(content, systemImage: "photo")
-                case .file: Label(content, systemImage: "doc")
-                case .voice: Label(content, systemImage: "waveform")
+                case .image:
+                    if message.transportEncryptionVersion == 4 { Button(action: onOpen) { Label("打开图片", systemImage: "photo") } }
+                    else { Label(content, systemImage: "photo") }
+                case .file:
+                    if message.transportEncryptionVersion == 4 { Button(action: onOpen) { Label("打开文件", systemImage: "doc") } }
+                    else { Label(content, systemImage: "doc") }
+                case .voice:
+                    if message.transportEncryptionVersion == 4 { Button(action: onOpen) { Label("播放语音", systemImage: "waveform") } }
+                    else { Label(content, systemImage: "waveform") }
                 }
                 if message.editedAt != nil { Text("（已编辑）").font(.caption2).opacity(0.7) }
                 if !reactions.isEmpty { Text(reactions.joined(separator: " ")).font(.caption) }
@@ -562,22 +608,98 @@ private struct MessageRow: View {
 }
 
 private struct AttachmentActionsView: View {
+    let onlineMode: Bool
     let onSimulate: (MessageType) -> Void
+    let onPick: (MessageType) -> Void
     let onUnavailable: (String) -> Void
     var body: some View {
         NavigationStack {
             List {
-                Button { onSimulate(.image) } label: { Label("图片", systemImage: "photo") }
-                Button { onSimulate(.file) } label: { Label("文件", systemImage: "doc") }
+                Button { onlineMode ? onPick(.image) : onSimulate(.image) } label: { Label("图片", systemImage: "photo") }
+                Button { onlineMode ? onPick(.file) : onSimulate(.file) } label: { Label("文件", systemImage: "doc") }
                 Button { onUnavailable("相机接口将在后续阶段接入。") } label: { Label("相机", systemImage: "camera") }
-                Button { onSimulate(.voice) } label: { Label("语音", systemImage: "waveform") }
+                Button { onlineMode ? onPick(.voice) : onSimulate(.voice) } label: { Label("语音", systemImage: "waveform") }
                 Button { onUnavailable("可在设置中开启本机阅后即焚；当前不向其他设备发送销毁指令。") } label: { Label("阅后即焚", systemImage: "flame") }
             }
             .navigationTitle("添加内容")
             .navigationBarTitleDisplayMode(.inline)
             .presentationDetents([.medium])
-            .safeAreaInset(edge: .bottom) { Text("图片、文件和语音当前创建本地模拟消息。").font(.caption).foregroundStyle(.secondary).padding() }
+            .safeAreaInset(edge: .bottom) { Text(onlineMode ? "先在本机加密，再上传密文附件。语音可从文件中选择。" : "图片、文件和语音当前创建本地模拟消息。")
+                .font(.caption).foregroundStyle(.secondary).padding() }
         }
+    }
+}
+
+private struct AttachmentPreview: Identifiable {
+    let id = UUID()
+    let data: Data
+    let name: String
+    let type: MessageType
+}
+
+private struct AttachmentDocument: FileDocument {
+    static var readableContentTypes: [UTType] { [.data] }
+    let data: Data
+    init(data: Data) { self.data = data }
+    init(configuration: ReadConfiguration) throws {
+        guard let data = configuration.file.regularFileContents else { throw V4AttachmentError.invalidDescriptor }
+        self.data = data
+    }
+    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
+        FileWrapper(regularFileWithContents: data)
+    }
+}
+
+private struct AttachmentPreviewView: View {
+    let preview: AttachmentPreview
+    @Environment(\.dismiss) private var dismiss
+    @State private var exporting = false
+    @State private var player: AVAudioPlayer?
+    @State private var errorMessage: String?
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                switch preview.type {
+                case .image:
+                    if let image = UIImage(data: preview.data) {
+                        ScrollView { Image(uiImage: image).resizable().scaledToFit() }
+                    } else { ContentUnavailableView("图片无法显示", systemImage: "photo.badge.exclamationmark") }
+                case .voice:
+                    VStack(spacing: 16) {
+                        Image(systemName: "waveform").font(.largeTitle)
+                        Button("播放语音") {
+                            do {
+                                player = try AVAudioPlayer(data: preview.data)
+                                player?.play()
+                            } catch { errorMessage = "语音文件无法播放。" }
+                        }
+                    }
+                case .file:
+                    VStack(spacing: 12) {
+                        Image(systemName: "doc").font(.largeTitle)
+                        Text(preview.name)
+                        Text(ByteCountFormatter.string(fromByteCount: Int64(preview.data.count),
+                                                       countStyle: .file)).foregroundStyle(.secondary)
+                        Button("导出解密文件") { exporting = true }
+                    }
+                case .text: EmptyView()
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .navigationTitle(preview.name)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { Button("完成") { dismiss() } }
+        }
+        .fileExporter(isPresented: $exporting, document: AttachmentDocument(data: preview.data),
+                      contentType: UTType(filenameExtension: URL(fileURLWithPath: preview.name).pathExtension) ?? .data,
+                      defaultFilename: preview.name) { result in
+            if case .failure = result { errorMessage = "导出失败。" }
+        }
+        .onDisappear { player?.stop(); player = nil }
+        .alert("附件", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
+            Button("好", role: .cancel) { errorMessage = nil }
+        } message: { Text(errorMessage ?? "") }
     }
 }
 
@@ -779,7 +901,7 @@ private struct FavoriteMessagesView: View {
 }
 
 #Preview("聊天 · 深色与大字体") {
-    let container = try! ModelContainer(for: User.self, Device.self, Friend.self, Conversation.self, Message.self, Attachment.self, UserPresence.self, Reaction.self, SearchIndexEntry.self, SessionKey.self, PreKeyMetadata.self, ChainState.self, OutgoingMessageQueueItem.self, CleanupState.self,
+    let container = try! ModelContainer(for: User.self, Device.self, Friend.self, Conversation.self, Message.self, Attachment.self, UserPresence.self, Reaction.self, SearchIndexEntry.self, V4PendingEvent.self, SessionKey.self, PreKeyMetadata.self, ChainState.self, V4SessionMetadata.self, V4DeviceMetadata.self, OutgoingMessageQueueItem.self, CleanupState.self,
                                         configurations: ModelConfiguration(isStoredInMemoryOnly: true))
     let user = User(userID: "alice", nickname: "Alice", passwordHash: "preview")
     let friend = Friend(ownerID: user.id, userID: "bob", nickname: "Bob")

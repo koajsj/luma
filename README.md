@@ -8,11 +8,11 @@
 
 完整文档见 [Documentation/README.md](Documentation/README.md)：`Product` 记录需求与路线图，`Architecture` 记录客户端和数据结构，`Crypto` 记录本机密钥/加密边界，`Backend` 记录《Luma Backend Architecture & API Specification》及后端方案，`Protocol` 记录未来消息与同步协议，`Security` 记录隐私、威胁和审计清单。
 
-开发新功能前必须阅读相关的 **Architecture、Security、Protocol** 文档，并与当前代码核对。独立后端基础服务已存在；iOS 可显式登记设备并访问账号、好友及同步查询接口。默认聊天仍是 Local First；显式在线文字模式已有 v3 逐设备信封和游标接收代码，但真实双设备联调、完整 E2EE 与 APNs 发送尚未完成。
+开发新功能前必须阅读相关的 **Architecture、Security、Protocol** 文档，并与当前代码核对。独立后端基础服务已存在；iOS 可显式登记设备并访问账号、好友及同步查询接口。默认聊天仍是 Local First；显式在线文字模式支持 v3 历史信封读取和 v4 新消息。两个独立模拟器已完成本地 HTTPS 后端联调；实体设备、完整 E2EE 安全验收与 APNs 发送尚未完成。
 
 ## 独立后端基础服务
 
-新增 [backend/README.md](backend/README.md) 与 [OpenAPI](backend/openapi/openapi.yaml)：Go、PostgreSQL、Redis、S3 兼容对象存储接口及 WebSocket 的密文路由基础。隔离的本机 HTTPS 后端与模拟器双账号已验证文字发送、同步、回执、编辑和删除；设置页可自愿进行设备登记、签名登录、资料/好友操作。双实体设备和完整 E2EE 尚未验证。
+新增 [backend/README.md](backend/README.md) 与 [OpenAPI](backend/openapi/openapi.yaml)：Go、PostgreSQL、Redis、S3 兼容对象存储接口及 WebSocket 的密文路由基础。隔离的本机 HTTPS 后端与两个独立模拟器已验证 v4 双向文字、已读、编辑、删除和 Reaction；设置页可自愿进行设备登记、签名登录、资料/好友操作。实体设备闭环、身份线下核验和完整 E2EE 安全审计尚未完成。
 
 ## 当前可用
 
