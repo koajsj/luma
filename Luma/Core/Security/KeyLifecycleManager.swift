@@ -13,7 +13,10 @@ struct KeyLifecycleManager {
     init(keychain: KeychainManager = KeychainManager()) { self.keychain = keychain }
 
     func provisionNewAccount(_ user: User, context: ModelContext) throws {
-        _ = try masters.create(for: user.userID)
+        let key = try masters.create(for: user.userID)
+        try PrivateMetadataStore(context: context, encryption: EncryptionService(key: key))
+            .saveProfile(UserPrivateProfile(nickname: user.nickname, avatar: user.avatar, bio: user.bio),
+                         for: user, persist: false)
         try ensureIdentityAndDevice(for: user, context: context)
         let prekeys = PreKeyManager(context: context, keychain: keychain)
         _ = try prekeys.signedKey(for: user)

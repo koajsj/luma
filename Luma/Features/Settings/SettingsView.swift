@@ -17,10 +17,11 @@ struct SettingsView: View {
                         UserProfileView(user: user)
                     } label: {
                         HStack(spacing: 12) {
-                            AvatarView(name: user.nickname, imageData: user.avatar)
+                            AvatarView(name: (try? security.userProfile(user, context: context).nickname) ?? user.userID,
+                                       imageData: try? security.userProfile(user, context: context).avatar)
                             VStack(alignment: .leading) {
                                 Text("个人资料")
-                                Text(user.nickname).font(.footnote).foregroundStyle(.secondary)
+                                Text((try? security.userProfile(user, context: context).nickname) ?? "资料不可读取").font(.footnote).foregroundStyle(.secondary)
                             }
                         }
                     }
@@ -198,6 +199,8 @@ private struct ChatLockSettingsView: View {
 private struct IdentitySettingsView: View {
     let user: User
     @Query private var friends: [Friend]
+    @Environment(SecurityManager.self) private var security
+    @Environment(\.modelContext) private var context
 
     var body: some View {
         List {
@@ -207,7 +210,7 @@ private struct IdentitySettingsView: View {
                     ContentUnavailableView("暂无可核对的在线好友", systemImage: "person.crop.circle.badge.questionmark")
                 }
                 ForEach(candidates) { friend in
-                    NavigationLink(friend.nickname) { IdentityVerificationView(user: user, friend: friend) }
+                    NavigationLink(security.friendDisplayName(friend, context: context)) { IdentityVerificationView(user: user, friend: friend) }
                 }
             } footer: {
                 Text("与好友通过独立可信渠道比较安全码。身份密钥变化后需要重新核对。")

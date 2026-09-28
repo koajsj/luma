@@ -1,10 +1,10 @@
 # 未来 PostgreSQL Schema
 
-**状态：逻辑设计，尚无迁移脚本或运行数据库。** 表名用蛇形复数；UUID 主键，`created_at` 使用带时区时间。敏感密文字段用 `bytea`；实际索引、分区和保留期应按规模与隐私评审确定。
+**状态：后端已有 SQL migration；生产运行尚未验收。** 表名用蛇形复数；UUID 主键，`created_at` 使用带时区时间。敏感密文字段用 `bytea`；实际索引、分区和保留期应按规模与隐私评审确定。
 
 | 表 | 核心字段 | 约束与说明 |
 | --- | --- | --- |
-| `users` | `id`, `user_id`, `nickname`, `avatar_ref`, `identity_public_key`, `searchable`, `created_at` | 规范化 `user_id` 唯一；头像仅存受控引用，头像是否公开需单独定义。 |
+| `users` | `id`, `user_id`, `user_id_hash`, `nickname`, `avatar_object_id`, `identity_public_key`, `searchable`, `created_at` | 规范化 `user_id` 唯一；`user_id_hash` 在迁移 006 后保存 Go 服务使用环境密钥计算的 HMAC-SHA256。启动前为旧行补齐；密钥不写入数据库。账号标识仍为明文，服务端仍可见 UserID。 |
 | `devices` | `id`, `user_id`, `device_name`, `device_public_key`, `auth_public_key`, `last_active_at`, `revoked_at` | `user_id → users.id`；协商公钥与认证签名公钥分角色。 |
 | `signed_prekeys` | `id`, `device_id`, `public_key`, `signature`, `version`, `created_at`, `expires_at` | 服务端只持公钥与签名。 |
 | `one_time_prekeys` | `id`, `device_id`, `public_key`, `created_at`, `consumed_at` | 取用须事务性标记；不存私钥。 |

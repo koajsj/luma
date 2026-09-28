@@ -3,11 +3,15 @@ package user
 import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"luma/backend/internal/middleware"
+	"luma/backend/internal/useridindex"
 	"net/http"
 	"strings"
 )
 
-type Service struct{ DB *pgxpool.Pool }
+type Service struct {
+	DB             *pgxpool.Pool
+	UserIDIndexKey useridindex.Key
+}
 
 func (s Service) Me(w http.ResponseWriter, r *http.Request) {
 	i := middleware.Current(r)
@@ -47,7 +51,7 @@ func (s Service) Search(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var id, name, nick string
-	e := s.DB.QueryRow(r.Context(), "SELECT id,user_id,nickname FROM users WHERE user_id=$1 AND searchable=true AND disabled_at IS NULL AND id<>$2", q, middleware.Current(r).UserID).Scan(&id, &name, &nick)
+	e := s.DB.QueryRow(r.Context(), "SELECT id,user_id,nickname FROM users WHERE user_id_hash=$1 AND searchable=true AND disabled_at IS NULL AND id<>$2", s.UserIDIndexKey.Sum(q), middleware.Current(r).UserID).Scan(&id, &name, &nick)
 	if e != nil {
 		middleware.Fail(w, r, 404, "not_found")
 		return

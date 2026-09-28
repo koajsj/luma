@@ -3,6 +3,7 @@ services:
     build: .
     environment:
       DATABASE_URL: postgres://luma:luma_dev_only@postgres:5432/luma?sslmode=disable
+      LUMA_USERID_HMAC_SECRET: ${LUMA_USERID_HMAC_SECRET:?Generate once with openssl rand -hex 32 and store in private .env}
       REDIS_URL: redis://redis:6379/0
       LUMA_ALLOW_INSECURE_LOCAL: "true"
       LOCAL_STORAGE_DIR: /app/storage

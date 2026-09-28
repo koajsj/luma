@@ -3,10 +3,15 @@ package friend
 import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"luma/backend/internal/middleware"
+	"luma/backend/internal/useridindex"
 	"net/http"
+	"strings"
 )
 
-type Service struct{ DB *pgxpool.Pool }
+type Service struct {
+	DB             *pgxpool.Pool
+	UserIDIndexKey useridindex.Key
+}
 
 func (s Service) List(w http.ResponseWriter, r *http.Request) {
 	me := middleware.Current(r).UserID
@@ -44,8 +49,13 @@ func (s Service) Request(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	me := middleware.Current(r).UserID
+	query := strings.ToLower(strings.TrimSpace(in.UserID))
+	if len(query) < 3 || len(query) > 32 {
+		middleware.Fail(w, r, 404, "not_found")
+		return
+	}
 	var target string
-	e := s.DB.QueryRow(r.Context(), "SELECT id FROM users WHERE user_id=$1 AND searchable=true AND disabled_at IS NULL AND id<>$2", in.UserID, me).Scan(&target)
+	e := s.DB.QueryRow(r.Context(), "SELECT id FROM users WHERE user_id_hash=$1 AND searchable=true AND disabled_at IS NULL AND id<>$2", s.UserIDIndexKey.Sum(query), me).Scan(&target)
 	if e != nil {
 		middleware.Fail(w, r, 404, "not_found")
 		return

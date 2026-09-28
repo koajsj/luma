@@ -56,6 +56,7 @@ struct BackupManager {
         var id: UUID; var userID: String; var nickname: String; var remark: String
         var avatar: Data?; var privacyRestricted: Bool
         var remoteUserID: UUID?; var identityFingerprint: String?
+        var privateNote: String?
     }
     private struct ConversationRecord: Codable {
         var id: UUID; var friendID: UUID; var draft: String; var requiresUnlock: Bool
@@ -97,13 +98,18 @@ struct BackupManager {
         let messageIDs = Set(messages.map(\.id))
         let attachments = try context.fetch(FetchDescriptor<Attachment>()).filter { messageIDs.contains($0.messageID) }
         let reactions = try context.fetch(FetchDescriptor<Reaction>()).filter { messageIDs.contains($0.messageID) }
-        let archive = Archive(version: 1, userID: user.userID, nickname: user.nickname, bio: user.bio, avatar: user.avatar,
+        let userProfile = try metadata.profile(for: user)
+        let archive = Archive(version: 1, userID: user.userID, nickname: userProfile.nickname, bio: userProfile.bio, avatar: userProfile.avatar,
                               preferences: try metadata.preferences(for: user),
-                              friends: try friends.map { FriendRecord(id: $0.id, userID: $0.userID, nickname: $0.nickname,
-                                                                      remark: try metadata.remark(for: $0), avatar: $0.avatar,
-                                                                      privacyRestricted: $0.privacyRestricted ?? false,
-                                                                      remoteUserID: $0.remoteUserID,
-                                                                      identityFingerprint: $0.identityFingerprint) },
+                              friends: try friends.map { friend in
+                                  let profile = try metadata.profile(for: friend)
+                                  return FriendRecord(id: friend.id, userID: friend.userID, nickname: profile.nickname,
+                                                                      remark: profile.remark, avatar: profile.avatar,
+                                                                      privacyRestricted: profile.privacyRestricted,
+                                                                      remoteUserID: friend.remoteUserID,
+                                                                      identityFingerprint: friend.identityFingerprint,
+                                                                      privateNote: profile.privateNote)
+                              },
                               conversations: try conversations.map { ConversationRecord(id: $0.id, friendID: $0.friendID,
                                                                                          draft: try messageStore.draft(in: $0), requiresUnlock: $0.requiresUnlock ?? false,
                                                                                          isPinned: $0.isPinned ?? false, unreadCount: $0.unreadCount ?? 0,
@@ -215,14 +221,18 @@ struct BackupManager {
 
                 let metadata = PrivateMetadataStore(context: context, encryption: encryption)
                 let messageStore = MessageStore(context: context, encryption: encryption)
-                user.nickname = archive.nickname; user.bio = archive.bio; user.avatar = archive.avatar
+                try metadata.saveProfile(UserPrivateProfile(nickname: archive.nickname, avatar: archive.avatar,
+                                                            bio: archive.bio), for: user, persist: false)
                 try metadata.save(archive.preferences, for: user, persist: false)
                 for record in archive.friends {
                     let friend = Friend(ownerID: user.id, userID: record.userID, nickname: record.nickname)
-                    friend.id = record.id; friend.avatar = record.avatar; friend.privacyRestricted = record.privacyRestricted
+                    friend.id = record.id
                     friend.remoteUserID = record.remoteUserID; friend.identityFingerprint = record.identityFingerprint
                     context.insert(friend)
-                    try metadata.saveRemark(record.remark, for: friend, persist: false)
+                    try metadata.saveProfile(FriendPrivateProfile(nickname: record.nickname, avatar: record.avatar,
+                                                                 remark: record.remark, privateNote: record.privateNote,
+                                                                 privacyRestricted: record.privacyRestricted),
+                                             for: friend, persist: false)
                     context.insert(UserPresence(friendID: friend.id))
                 }
                 for record in archive.conversations {

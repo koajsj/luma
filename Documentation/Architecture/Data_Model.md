@@ -4,9 +4,9 @@
 
 | 模型 | 关键字段与关系 | 存储边界 |
 | --- | --- | --- |
-| `User` | `id`、唯一 `userID`、`nickname`、头像/简介、`identityPublicKey`、`identityFingerprint`、`encryptedPreferences` | `passwordHash` 是本地验证值，不是明文密码；`searchable` 为本机发现标志。 |
+| `User` | `id`、唯一 `userID`、`userIDHMAC`、迁移用 `userIDHash`、`encryptedProfile`、`identityPublicKey`、`identityFingerprint`、`encryptedPreferences` | 精确发现使用设备 Keychain 密钥计算的 HMAC-SHA256 索引，旧 SHA-256 索引在解锁迁移后清空；明文 UserID 仍供账号标识、Keychain 和协议路由使用。昵称、头像和简介在主密钥加密的资料字段中；旧明文字段仅用于解锁后迁移。`passwordHash` 是本地验证值。 |
 | `Device` | `id`、`ownerID`、设备名、系统版本、`publicKey`、创建与最后活动时间 | 私钥在 Keychain，当前只表示本机设备。 |
-| `Friend` | `id`、`ownerID`、对方 `userID`、昵称、`encryptedRemark`、身份指纹、会话状态、待核验指纹 | 备注经主密钥加密；旧 `remark` 是迁移字段。身份变更状态阻止旧在线信封继续发送。 |
+| `Friend` | `id`、`ownerID`、对方 `userID`、`encryptedProfile`、身份指纹、会话状态、待核验指纹 | 昵称、头像、备注、私密笔记及本地限制标记经主密钥加密；旧资料与 `encryptedRemark` 仅供迁移。身份变更状态阻止旧在线信封继续发送。 |
 | `Conversation` | `id`、`ownerID`、`friendID`、`draft`、聊天锁、置顶、未读数 | `draft` 为加密字节；关系和计数仍是元数据。 |
 | `Message` | `id`、`conversationID`、`senderID`、类型、`ciphertext`、时间、状态、回执/编辑/删除时间、`deviceID`、`lastEventID`、`encryptionVersion`、`sessionKeyVersion`、`messageKeyIndex` | 正文在 `ciphertext`；`content` 仅供旧版迁移，新记录为空。 |
 | `Attachment` | `id`、`messageID`、类型、`encryptedMetadata` | 真实附件上传尚无；旧路径字段仅供迁移。 |

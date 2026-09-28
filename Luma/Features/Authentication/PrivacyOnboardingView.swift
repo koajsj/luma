@@ -11,26 +11,13 @@ struct PrivacyOnboardingView: View {
             VStack(alignment: .leading, spacing: 0) {
                 Spacer(minLength: 60)
 
-                Image(systemName: "lock.shield.fill")
-                    .font(.system(size: 54, weight: .regular))
-                    .foregroundStyle(.tint)
-                    .accessibilityHidden(true)
-                    .padding(.bottom, 34)
-
-                Text("Luma，极度重视您的隐私安全。")
-                    .font(.largeTitle.bold())
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.bottom, 18)
-
-                VStack(alignment: .leading, spacing: 22) {
-                    Text("服务器位于欧盟及美国，受欧盟及美国隐私保护法规约束。")
-                    Text("服务器全盘存储及数据传输链路均采用 AES-256 加密技术保护。")
-                    Text("通过端到端加密机制，您的数据仅可由授权设备进行解密访问。即使是 Luma，也无法获取您的解密密钥或读取受保护的数据内容。")
-                    Text("Luma 承诺，绝不会向任何第三方提供您的解密密钥及用户数据。")
+                VStack(alignment: .leading, spacing: 26) {
+                    statement("Luma极度重视您的隐私安全。", symbol: "lock.shield.fill", prominent: true)
+                    statement("服务器位于欧盟及美国，受欧盟及美国隐私法保护。", symbol: "globe.europe.africa.fill")
+                    statement("服务器及数据传输链路均受AES-256加密算法保护。", symbol: "lock.fill")
+                    statement("即使是Luma也无法解密您的数据。", symbol: "shield.lefthalf.filled")
+                    statement("Luma承诺绝不会向任何第三方提供解密金钥及用户数据。", symbol: "person.2.fill")
                 }
-                .font(.body)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
 
                 Spacer(minLength: 48)
 
@@ -58,6 +45,21 @@ struct PrivacyOnboardingView: View {
             if reduceMotion { appeared = true }
             else { withAnimation(.easeOut(duration: 0.45)) { appeared = true } }
         }
+    }
+
+    private func statement(_ value: String, symbol: String, prominent: Bool = false) -> some View {
+        HStack(alignment: .top, spacing: 16) {
+            Image(systemName: symbol)
+                .font(.title2)
+                .foregroundStyle(.tint)
+                .frame(width: 32)
+                .accessibilityHidden(true)
+            Text(value)
+                .font(prominent ? .title.bold() : .body)
+                .foregroundStyle(prominent ? .primary : .secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .accessibilityElement(children: .combine)
     }
 
 }

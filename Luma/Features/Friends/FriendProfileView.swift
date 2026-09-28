@@ -24,8 +24,8 @@ struct FriendProfileView: View {
     var body: some View {
         Form {
             Section {
-                HStack { Spacer(); AvatarView(name: security.friendDisplayName(friend, context: context), imageData: friend.avatar, size: 72); Spacer() }
-                LabeledContent("昵称", value: friend.nickname)
+                HStack { Spacer(); AvatarView(name: security.friendDisplayName(friend, context: context), imageData: security.friendAvatar(friend, context: context), size: 72); Spacer() }
+                LabeledContent("昵称", value: (try? security.friendProfile(friend, context: context).nickname) ?? "资料不可读取")
                 LabeledContent("UserID", value: friend.userID)
                 LabeledContent("备注", value: (try? security.privateStore(context: context).remark(for: friend)).flatMap { $0.isEmpty ? nil : $0 } ?? "未设置")
                 Button("修改备注") {
@@ -43,7 +43,10 @@ struct FriendProfileView: View {
                 }
             }
             Section("隐私设置") {
-                Toggle("限制此好友的本地资料展示", isOn: Binding(get: { friend.privacyRestricted ?? false }, set: { friend.privacyRestricted = $0; save() }))
+                Toggle("限制此好友的本地资料展示", isOn: Binding(get: { (try? security.friendProfile(friend, context: context).privacyRestricted) ?? false }, set: {
+                    do { try security.privateStore(context: context).savePrivacyRestricted($0, for: friend) }
+                    catch { errorMessage = error.localizedDescription }
+                }))
                 Text("仅保存在本机；不会通知对方或改变服务器权限。")
                     .font(.footnote).foregroundStyle(.secondary)
             }
@@ -74,7 +77,6 @@ struct FriendProfileView: View {
         } message: { Text(errorMessage ?? "") }
     }
 
-    private func save() { do { try context.save() } catch { errorMessage = error.localizedDescription } }
     private func deleteFriend() {
         Task {
             do {

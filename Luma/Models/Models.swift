@@ -4,6 +4,10 @@ import SwiftData
 @Model
 final class User {
     @Attribute(.unique) var userID: String
+    /// Legacy unkeyed SHA-256 index, cleared after account unlock migration.
+    var userIDHash: String?
+    /// Device-keyed HMAC-SHA256 exact-match index; key stays in Keychain.
+    var userIDHMAC: String?
     var id: UUID
     var nickname: String
     var passwordHash: String
@@ -25,6 +29,8 @@ final class User {
     var identityPublicKey: Data?
     var identityFingerprint: String?
     var encryptedPreferences: Data?
+    /// AES-GCM profile field; legacy nickname/avatar/bio are cleared after unlock migration.
+    var encryptedProfile: Data?
 
     var effectiveOnlineStatus: Bool { !(privacyModeEnabled ?? false) && (showOnlineStatus ?? true) }
     var effectiveLastSeen: Bool { !(privacyModeEnabled ?? false) && (showLastSeen ?? true) }
@@ -34,6 +40,8 @@ final class User {
     init(userID: String, nickname: String, passwordHash: String) {
         self.id = UUID()
         self.userID = userID
+        self.userIDHash = nil
+        self.userIDHMAC = nil
         self.nickname = nickname
         self.passwordHash = passwordHash
         self.searchable = false
@@ -49,6 +57,7 @@ final class User {
         self.privacyModeEnabled = false; self.privacyModeLockChats = false
         self.identityPublicKey = nil; self.identityFingerprint = nil
         self.encryptedPreferences = nil
+        self.encryptedProfile = nil
     }
 }
 
@@ -80,16 +89,18 @@ final class Friend {
     var avatar: Data?
     var privacyRestricted: Bool?
     var encryptedRemark: Data?
+    /// AES-GCM local profile, including private remark, note and display restriction.
+    var encryptedProfile: Data?
     var identityFingerprint: String?
     var sessionStatus: String?
     /// A server-advertised replacement remains untrusted until explicitly verified.
     var pendingIdentityFingerprint: String?
     /// Server UUID is routing metadata; local Friend.id remains stable.
     var remoteUserID: UUID?
-    var displayName: String { let value = remark?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""; return value.isEmpty ? nickname : value }
     init(ownerID: UUID, userID: String, nickname: String) {
         self.id = UUID(); self.ownerID = ownerID; self.userID = userID; self.nickname = nickname
         self.remark = nil; self.avatar = nil; self.privacyRestricted = false; self.encryptedRemark = nil
+        self.encryptedProfile = nil
         self.identityFingerprint = nil; self.sessionStatus = "none"; self.pendingIdentityFingerprint = nil
         self.remoteUserID = nil
     }

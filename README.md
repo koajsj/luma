@@ -4,6 +4,8 @@
 
 本地联调步骤见 [backend/LOCAL_DEVELOPMENT.md](backend/LOCAL_DEVELOPMENT.md)。设置 → 隐私中心 → 安全与隐私报告展示本机安全能力及当前限制。在线开发地址可由 Xcode Run Scheme 的 `LUMA_DEV_API_URL` 注入；默认聊天仍在本机。
 
+Ubuntu VPS 的 Docker Compose 部署与备份步骤见 [deploy/README_DEPLOY.md](deploy/README_DEPLOY.md)。`deploy/` 是生产部署配置；`backend/docker-compose.yml` 仍只供本机开发。
+
 ## 工程文档
 
 完整文档见 [Documentation/README.md](Documentation/README.md)：`Product` 记录需求与路线图，`Architecture` 记录客户端和数据结构，`Crypto` 记录本机密钥/加密边界，`Backend` 记录《Luma Backend Architecture & API Specification》及后端方案，`Protocol` 记录未来消息与同步协议，`Security` 记录隐私、威胁和审计清单。

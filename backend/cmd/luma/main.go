@@ -16,6 +16,7 @@ import (
 	"luma/backend/internal/presence"
 	"luma/backend/internal/sync"
 	"luma/backend/internal/user"
+	"luma/backend/internal/useridindex"
 	ws "luma/backend/internal/websocket"
 	"net/http"
 	"os"
@@ -29,24 +30,32 @@ func main() {
 	if e != nil {
 		log.Fatal(e)
 	}
+	userIDIndexKey, e := useridindex.ParseKey(cfg.UserIDHMACSecret)
+	if e != nil {
+		log.Fatal(e)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	db, e := database.Open(ctx, cfg.DatabaseURL)
 	if e != nil {
-		log.Fatal(e)
+		// Driver errors may echo connection strings. Never place credentials in logs.
+		log.Fatal("database unavailable; check DATABASE_URL and PostgreSQL")
 	}
 	defer db.Close()
 	if e = database.Migrate(ctx, db, cfg.MigrationsDir); e != nil {
 		log.Fatal(e)
 	}
+	if e = userIDIndexKey.Backfill(ctx, db); e != nil {
+		log.Fatal("UserID HMAC index unavailable; check secret continuity and database migration")
+	}
 	opt, e := redis.ParseURL(cfg.RedisURL)
 	if e != nil {
-		log.Fatal(e)
+		log.Fatal("invalid REDIS_URL")
 	}
 	cache := redis.NewClient(opt)
 	defer cache.Close()
 	if e = cache.Ping(ctx).Err(); e != nil {
-		log.Fatal(e)
+		log.Fatal("redis unavailable")
 	}
 	files, e := file.New(cfg, db)
 	if e != nil {
@@ -69,10 +78,10 @@ func main() {
 			}
 		}
 	}()
-	authSvc := auth.Service{DB: db, Cache: cache}
-	userSvc := user.Service{DB: db}
+	authSvc := auth.Service{DB: db, Cache: cache, UserIDIndexKey: userIDIndexKey}
+	userSvc := user.Service{DB: db, UserIDIndexKey: userIDIndexKey}
 	deviceSvc := device.Service{DB: db}
-	friendSvc := friend.Service{DB: db}
+	friendSvc := friend.Service{DB: db, UserIDIndexKey: userIDIndexKey}
 	convSvc := conversation.Service{DB: db}
 	syncSvc := sync.Service{DB: db}
 	hub := ws.New(db, cache)

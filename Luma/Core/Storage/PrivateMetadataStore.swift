@@ -1,5 +1,6 @@
 import Foundation
 import SwiftData
+import CryptoKit
 
 struct PrivacyPreferences: Codable {
     var searchable = false
@@ -22,11 +23,66 @@ struct PrivacyPreferences: Codable {
     var effectiveScreenCaptureProtection: Bool { screenCaptureProtection ?? true }
 }
 
+struct UserPrivateProfile: Codable {
+    var nickname: String
+    var avatar: Data?
+    var bio: String?
+}
+
+struct FriendPrivateProfile: Codable {
+    var nickname: String
+    var avatar: Data?
+    var remark: String
+    var privateNote: String?
+    var privacyRestricted: Bool
+}
+
 /// Encrypts private SwiftData metadata with the existing account master key.
 @MainActor
 struct PrivateMetadataStore {
     let context: ModelContext
     let encryption: EncryptionService
+
+    func profile(for user: User) throws -> UserPrivateProfile {
+        guard let bytes = user.encryptedProfile else {
+            return UserPrivateProfile(nickname: user.nickname, avatar: user.avatar, bio: user.bio)
+        }
+        return try JSONDecoder().decode(UserPrivateProfile.self, from:
+            encryption.decryptField(bytes, authenticatedData: binding("user-profile", user.id)))
+    }
+
+    func saveProfile(_ profile: UserPrivateProfile, for user: User, persist: Bool = true) throws {
+        let bytes = try encryption.encryptField(JSONEncoder().encode(profile),
+            authenticatedData: binding("user-profile", user.id))
+        user.encryptedProfile = bytes
+        user.nickname = ""; user.avatar = nil; user.bio = nil
+        if persist { try context.save() }
+    }
+
+    func profile(for friend: Friend) throws -> FriendPrivateProfile {
+        if let bytes = friend.encryptedProfile {
+            return try JSONDecoder().decode(FriendPrivateProfile.self, from:
+                encryption.decryptField(bytes, authenticatedData: binding("friend-profile", friend.id)))
+        }
+        let legacyRemark: String
+        if let bytes = friend.encryptedRemark {
+            let data = try encryption.decrypt(EncryptedData(bytes: bytes), authenticatedData: binding("remark", friend.id))
+            guard let value = String(data: data, encoding: .utf8) else { throw EncryptionError.invalidText }
+            legacyRemark = value
+        } else { legacyRemark = friend.remark ?? "" }
+        return FriendPrivateProfile(nickname: friend.nickname, avatar: friend.avatar,
+                                    remark: legacyRemark, privateNote: nil,
+                                    privacyRestricted: friend.privacyRestricted ?? false)
+    }
+
+    func saveProfile(_ profile: FriendPrivateProfile, for friend: Friend, persist: Bool = true) throws {
+        let bytes = try encryption.encryptField(JSONEncoder().encode(profile),
+            authenticatedData: binding("friend-profile", friend.id))
+        friend.encryptedProfile = bytes
+        friend.nickname = ""; friend.avatar = nil; friend.remark = nil
+        friend.encryptedRemark = nil; friend.privacyRestricted = nil
+        if persist { try context.save() }
+    }
 
     func preferences(for user: User) throws -> PrivacyPreferences {
         guard let bytes = user.encryptedPreferences else { return legacyPreferences(for: user) }
@@ -42,35 +98,62 @@ struct PrivateMetadataStore {
     }
 
     func remark(for friend: Friend) throws -> String {
-        guard let bytes = friend.encryptedRemark else { return friend.remark ?? "" }
-        let data = try encryption.decrypt(EncryptedData(bytes: bytes), authenticatedData: binding("remark", friend.id))
-        guard let value = String(data: data, encoding: .utf8) else { throw EncryptionError.invalidText }
-        return value
+        try profile(for: friend).remark
     }
 
     func displayName(for friend: Friend) throws -> String {
-        let value = try remark(for: friend).trimmingCharacters(in: .whitespacesAndNewlines)
-        return value.isEmpty ? friend.nickname : value
+        let profile = try profile(for: friend)
+        let value = profile.remark.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? profile.nickname : value
     }
 
     func saveRemark(_ value: String, for friend: Friend, persist: Bool = true) throws {
-        friend.encryptedRemark = try encryption.encrypt(Data(value.trimmingCharacters(in: .whitespacesAndNewlines).utf8),
-                                                         authenticatedData: binding("remark", friend.id)).bytes
-        friend.remark = nil
-        if persist { try context.save() }
+        var profile = try profile(for: friend)
+        profile.remark = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        try saveProfile(profile, for: friend, persist: persist)
+    }
+
+    func savePrivateNote(_ value: String?, for friend: Friend) throws {
+        var profile = try profile(for: friend)
+        profile.privateNote = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+        try saveProfile(profile, for: friend)
+    }
+
+    func savePrivacyRestricted(_ value: Bool, for friend: Friend) throws {
+        var profile = try profile(for: friend)
+        profile.privacyRestricted = value
+        try saveProfile(profile, for: friend)
     }
 
     func migrate(owner: User) throws {
-        if owner.encryptedPreferences == nil { try save(legacyPreferences(for: owner), for: owner) }
+        let normalizedID = try LocalRepository.normalizedUserID(owner.userID)
+        let expectedHMAC = try LocalRepository.userIDHMAC(normalizedID)
+        if let storedHMAC = owner.userIDHMAC, storedHMAC != expectedHMAC { throw LocalDataError.invalidUserID }
+        if let legacyHash = owner.userIDHash {
+            let expectedLegacy = SHA256.hash(data: Data(normalizedID.utf8))
+                .map { String(format: "%02x", $0) }.joined()
+            guard legacyHash == expectedLegacy else { throw LocalDataError.invalidUserID }
+        }
+        owner.userIDHMAC = expectedHMAC
+        owner.userIDHash = nil
+        if owner.encryptedProfile == nil {
+            try saveProfile(profile(for: owner), for: owner, persist: false)
+        } else if !owner.nickname.isEmpty || owner.avatar != nil || owner.bio != nil {
+            _ = try profile(for: owner)
+            owner.nickname = ""; owner.avatar = nil; owner.bio = nil
+        }
         let friends = try context.fetch(FetchDescriptor<Friend>()).filter { $0.ownerID == owner.id }
         for friend in friends {
-            if friend.encryptedRemark == nil, let remark = friend.remark {
-                try saveRemark(remark, for: friend)
-            } else if friend.encryptedRemark != nil, friend.remark != nil {
-                _ = try self.remark(for: friend)
-                friend.remark = nil
+            if friend.encryptedProfile == nil {
+                try saveProfile(profile(for: friend), for: friend, persist: false)
+            } else if !friend.nickname.isEmpty || friend.avatar != nil || friend.remark != nil ||
+                        friend.encryptedRemark != nil || friend.privacyRestricted != nil {
+                _ = try profile(for: friend)
+                friend.nickname = ""; friend.avatar = nil; friend.remark = nil
+                friend.encryptedRemark = nil; friend.privacyRestricted = nil
             }
         }
+        if owner.encryptedPreferences == nil { try save(legacyPreferences(for: owner), for: owner, persist: false) }
         let conversationIDs = Set(try context.fetch(FetchDescriptor<Conversation>())
             .filter { $0.ownerID == owner.id }.map(\.id))
         let messageIDs = Set(try context.fetch(FetchDescriptor<Message>())

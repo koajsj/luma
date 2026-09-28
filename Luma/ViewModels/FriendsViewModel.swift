@@ -6,12 +6,14 @@ struct FriendsViewModel {
     let context: ModelContext
 
     func searchableUser(for rawID: String, among users: [User], excluding owner: User) -> User? {
-        let id = rawID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return users.first { $0.userID == id && $0.searchable && $0.id != owner.id }
+        guard let id = try? LocalRepository.normalizedUserID(rawID) else { return nil }
+        guard let hash = try? LocalRepository.userIDHMAC(id) else { return nil }
+        return users.first { $0.userIDHMAC == hash && $0.searchable && $0.id != owner.id }
     }
 
-    func addLocalContact(owner: User, userID: String, nickname: String) throws {
-        _ = try LocalRepository(context: context).addFriend(owner: owner, userID: userID, nickname: nickname)
+    func addLocalContact(owner: User, userID: String, nickname: String, security: SecurityManager) throws {
+        _ = try LocalRepository(context: context).addFriend(owner: owner, userID: userID, nickname: nickname,
+                                                            encryption: try security.encryptionService())
     }
 
     func setMockOnline(_ online: Bool, for friend: Friend) throws {

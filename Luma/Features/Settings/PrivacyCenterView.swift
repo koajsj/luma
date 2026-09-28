@@ -283,18 +283,22 @@ struct DeviceManagerView: View {
 struct UserProfileView: View {
     @Bindable var user: User
     @Environment(\.modelContext) private var context
+    @Environment(SecurityManager.self) private var security
     @Environment(\.dismiss) private var dismiss
     @State private var selectedPhoto: PhotosPickerItem?
     @State private var nickname = ""
     @State private var bio = ""
+    @State private var avatar: Data?
+    @State private var profileLoaded = false
     @State private var errorMessage: String?
 
     var body: some View {
         Form {
             Section {
-                HStack { Spacer(); AvatarView(name: user.nickname, imageData: user.avatar, size: 80); Spacer() }
+                HStack { Spacer(); AvatarView(name: nickname, imageData: avatar, size: 80); Spacer() }
                 PhotosPicker(selection: $selectedPhoto, matching: .images) { Label("从相册选择头像", systemImage: "photo") }
-                if user.avatar != nil { Button("删除头像", role: .destructive) { user.avatar = nil; save() } }
+                    .disabled(!profileLoaded)
+                if avatar != nil { Button("删除头像", role: .destructive) { avatar = nil; save() }.disabled(!profileLoaded) }
             }
             Section("资料") {
                 LabeledContent("UserID", value: user.userID)
@@ -303,9 +307,9 @@ struct UserProfileView: View {
                 Button("保存资料") {
                     let value = nickname.trimmingCharacters(in: .whitespacesAndNewlines)
                     guard !value.isEmpty else { errorMessage = "昵称不能为空"; return }
-                    user.nickname = value; user.bio = bio.trimmingCharacters(in: .whitespacesAndNewlines)
+                    nickname = value
                     save(); if errorMessage == nil { dismiss() }
-                }
+                }.disabled(!profileLoaded)
             }
             Section("身份指纹") {
                 if let fingerprint = user.identityFingerprint {
@@ -321,16 +325,23 @@ struct UserProfileView: View {
             }
         }
         .navigationTitle("我的资料")
-        .onAppear { nickname = user.nickname; bio = user.bio ?? "" }
+        .onAppear {
+            do {
+                let profile = try security.userProfile(user, context: context)
+                nickname = profile.nickname; bio = profile.bio ?? ""; avatar = profile.avatar
+                profileLoaded = true
+            } catch { errorMessage = error.localizedDescription }
+        }
         .onChange(of: selectedPhoto) { _, item in
             Task {
                 do {
+                    guard profileLoaded else { return }
                     guard let data = try await item?.loadTransferable(type: Data.self), let image = UIImage(data: data) else { return }
                     let maxSide: CGFloat = 512
                     let scale = min(1, maxSide / max(image.size.width, image.size.height))
                     let size = CGSize(width: image.size.width * scale, height: image.size.height * scale)
                     let renderer = UIGraphicsImageRenderer(size: size)
-                    user.avatar = renderer.jpegData(withCompressionQuality: 0.75) { _ in image.draw(in: CGRect(origin: .zero, size: size)) }
+                    avatar = renderer.jpegData(withCompressionQuality: 0.75) { _ in image.draw(in: CGRect(origin: .zero, size: size)) }
                     save()
                 } catch { errorMessage = error.localizedDescription }
             }
@@ -339,5 +350,11 @@ struct UserProfileView: View {
             Button("好", role: .cancel) { errorMessage = nil }
         } message: { Text(errorMessage ?? "") }
     }
-    private func save() { do { try context.save() } catch { errorMessage = error.localizedDescription } }
+    private func save() {
+        do {
+            try security.privateStore(context: context).saveProfile(
+                UserPrivateProfile(nickname: nickname, avatar: avatar,
+                                   bio: bio.trimmingCharacters(in: .whitespacesAndNewlines)), for: user)
+        } catch { errorMessage = error.localizedDescription }
+    }
 }

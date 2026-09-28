@@ -1,0 +1,8 @@
+{
+    email {$ACME_EMAIL}
+}
+
+{$LUMA_DOMAIN} {
+    encode zstd gzip
+    reverse_proxy backend:8080
+}

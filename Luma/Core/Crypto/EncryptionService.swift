@@ -5,6 +5,14 @@ struct EncryptedData {
     let bytes: Data
 }
 
+/// Versioned AES-GCM field persisted as encoded data. No key material is included.
+struct EncryptedField: Codable {
+    let version: UInt8
+    let nonce: Data
+    let ciphertext: Data
+    let authenticationTag: Data
+}
+
 enum EncryptionError: LocalizedError {
     case invalidEnvelope, authenticationFailed, invalidText
 
@@ -39,5 +47,25 @@ struct EncryptionService {
         } catch {
             throw EncryptionError.authenticationFailed
         }
+    }
+
+    func encryptField(_ plaintext: Data, authenticatedData: Data) throws -> Data {
+        let envelope = try encrypt(plaintext, authenticatedData: authenticatedData).bytes
+        let combined = envelope.dropFirst()
+        guard combined.count >= 28 else { throw EncryptionError.invalidEnvelope }
+        let field = EncryptedField(version: Self.version,
+                                   nonce: Data(combined.prefix(12)),
+                                   ciphertext: Data(combined.dropFirst(12).dropLast(16)),
+                                   authenticationTag: Data(combined.suffix(16)))
+        return try JSONEncoder().encode(field)
+    }
+
+    func decryptField(_ stored: Data, authenticatedData: Data) throws -> Data {
+        let field = try JSONDecoder().decode(EncryptedField.self, from: stored)
+        guard field.version == Self.version, field.nonce.count == 12,
+              field.authenticationTag.count == 16 else { throw EncryptionError.invalidEnvelope }
+        return try decrypt(EncryptedData(bytes: Data([field.version]) + field.nonce +
+                                         field.ciphertext + field.authenticationTag),
+                           authenticatedData: authenticatedData)
     }
 }

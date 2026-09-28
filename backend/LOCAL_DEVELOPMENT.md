@@ -4,9 +4,9 @@
 
 ## 后端与依赖
 
-方式一：有 Docker 时，在 `backend/` 执行 `docker compose up --build`。开发 Compose 启动 PostgreSQL、Redis、Go 服务和持久化本地密文卷，监听宿主机 `127.0.0.1:8080`，仅供后端接口检查。它使用开发凭据与明文 HTTP，**不能**作为 iOS 在线模式地址。
+方式一：有 Docker 时，在 `backend/` 先生成仅本机使用的持久环境文件：`printf 'LUMA_USERID_HMAC_SECRET=%s\n' "$(openssl rand -hex 32)" > .env`，然后执行 `docker compose up --build`。不要每次启动重新生成该密钥，也不要提交 `.env`。开发 Compose 启动 PostgreSQL、Redis、Go 服务和持久化本地密文卷，监听宿主机 `127.0.0.1:8080`，仅供后端接口检查。它使用开发凭据与明文 HTTP，**不能**作为 iOS 在线模式地址。
 
-方式二：本机已安装 PostgreSQL、Redis 和 Go 1.24+ 时，启动独立的 PostgreSQL 数据库和 Redis，复制 `.env.local.example` 为 `.env.local`，填入隔离数据库、绝对存储目录和 TLS 文件路径，然后执行 `bash scripts/run-local.sh`。服务启动会运行 SQL migration，并在数据库/Redis 无法连接时退出。`curl --cacert <根证书> https://localhost:8080/health` 应返回 `{"status":"ok"}`。
+方式二：本机已安装 PostgreSQL、Redis 和 Go 1.24+ 时，启动独立的 PostgreSQL 数据库和 Redis，复制 `.env.local.example` 为 `.env.local`，填入隔离数据库、绝对存储目录和 TLS 文件路径，并用 `openssl rand -hex 32` 填写 `LUMA_USERID_HMAC_SECRET`，然后执行 `bash scripts/run-local.sh`。服务启动会运行 SQL migration，并在数据库/Redis 无法连接或 HMAC 密钥与现有索引不符时退出。`curl --cacert <根证书> https://localhost:8080/health` 应返回 `{"status":"ok"}`。
 
 iOS 在线模式要求可信 HTTPS。可用本机开发 CA 工具为 `localhost` 及真机使用的局域网 IP 签发开发证书，并在模拟器或测试设备上**显式安装并信任**开发 CA；不要关闭 URLSession 的证书校验。真机联调时将 `LUMA_ADDR` 设为局域网可达的监听地址并限制在可信网络，证书须包含实际访问的 IP 或主机名。开发证书、私钥和 `.env.local` 不提交 Git。
 

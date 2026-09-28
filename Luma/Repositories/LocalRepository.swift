@@ -26,21 +26,31 @@ struct LocalRepository {
         return value
     }
 
+    static func userIDHMAC(_ normalizedID: String) throws -> String {
+        try UserIDIndex().digest(normalizedID)
+    }
+
     func user(_ userID: String) throws -> User? {
-        let id = userID.lowercased()
+        let id = try Self.normalizedUserID(userID)
+        let hash = try Self.userIDHMAC(id)
+        if let match = try context.fetch(FetchDescriptor<User>(predicate: #Predicate { $0.userIDHMAC == hash })).first {
+            return match
+        }
+        // Legacy records still carry the canonical ID until unlock migration.
         return try context.fetch(FetchDescriptor<User>(predicate: #Predicate { $0.userID == id })).first
     }
 
-    func createUser(userID: String, nickname: String, passwordHash: String) throws -> User {
+    func createUser(userID: String, nickname: String, passwordHash: String, persist: Bool = false) throws -> User {
         let id = try Self.normalizedUserID(userID)
         guard try user(id) == nil else { throw LocalDataError.duplicateUserID }
         let user = User(userID: id, nickname: nickname.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? id : nickname.trimmingCharacters(in: .whitespacesAndNewlines), passwordHash: passwordHash)
+        user.userIDHMAC = try Self.userIDHMAC(id)
         context.insert(user)
-        try context.save()
+        if persist { try context.save() }
         return user
     }
 
-    func addFriend(owner: User, userID: String, nickname: String) throws -> Friend {
+    func addFriend(owner: User, userID: String, nickname: String, encryption: EncryptionService) throws -> Friend {
         let id = try Self.normalizedUserID(userID)
         guard id != owner.userID else { throw LocalDataError.selfFriend }
         let ownerID = owner.id
@@ -51,6 +61,9 @@ struct LocalRepository {
         context.insert(friend)
         context.insert(Conversation(ownerID: owner.id, friendID: friend.id))
         context.insert(UserPresence(friendID: friend.id))
+        try PrivateMetadataStore(context: context, encryption: encryption).saveProfile(
+            FriendPrivateProfile(nickname: friend.nickname, avatar: nil, remark: "", privateNote: nil,
+                                 privacyRestricted: false), for: friend, persist: false)
         try context.save()
         return friend
     }

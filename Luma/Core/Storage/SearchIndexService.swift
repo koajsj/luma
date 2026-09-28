@@ -44,8 +44,8 @@ struct SearchIndexService {
             $0.requiresPrivacyShield == true || $0.requiresUnlock == true || lockAllChats
         }.map(\.friendID))
         for friend in friends where !shieldedFriendIDs.contains(friend.id) {
-            let remark = try metadata.remark(for: friend)
-            try add("\(friend.userID) \(friend.nickname) \(remark)", sourceID: friend.id, kind: "friend")
+            let profile = try metadata.profile(for: friend)
+            try add("\(friend.userID) \(profile.nickname) \(profile.remark)", sourceID: friend.id, kind: "friend")
         }
         for item in existing { context.delete(item) }
         for item in entries { context.insert(item) }

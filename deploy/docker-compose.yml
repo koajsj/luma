@@ -1,0 +1,84 @@
+name: luma
+
+services:
+  backend:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    environment:
+      LUMA_ADDR: ":8080"
+      # Only the private Docker network can reach this HTTP listener; Caddy terminates public TLS.
+      LUMA_ALLOW_INSECURE_LOCAL: "true"
+      DATABASE_URL: "postgres://luma:${POSTGRES_PASSWORD}@postgres:5432/luma?sslmode=disable"
+      REDIS_URL: "redis://redis:6379/0"
+      LUMA_USERID_HMAC_SECRET: ${LUMA_USERID_HMAC_SECRET:?Set a persistent 32-byte hex UserID HMAC secret}
+      LOCAL_STORAGE_DIR: /app/storage
+      MIGRATIONS_DIR: /app/migrations
+    volumes:
+      - ${LUMA_STORAGE_DIR:-/opt/luma/data/storage}:/app/storage
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    networks: [private]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 30s
+
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: luma
+      POSTGRES_USER: luma
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the private env file}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks: [private]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U luma -d luma"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    networks: [private]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      LUMA_DOMAIN: ${LUMA_DOMAIN:?Set LUMA_DOMAIN in the private env file}
+      ACME_EMAIL: ${ACME_EMAIL:?Set ACME_EMAIL in the private env file}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      backend: {condition: service_healthy}
+    networks: [private, edge]
+
+networks:
+  private:
+    internal: true
+  edge:
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:

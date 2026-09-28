@@ -13,6 +13,7 @@ struct RemoteDeviceInfo: Decodable, Identifiable {
 struct OnlineConnectionViewModel {
     let user: User
     let context: ModelContext
+    let security: SecurityManager
     private var store: RemoteSessionStore { RemoteSessionStore() }
 
     func localState() throws -> (RemoteRegistration?, Bool) {
@@ -21,7 +22,8 @@ struct OnlineConnectionViewModel {
 
     func register(address: String) async throws -> RemoteRegistration {
         guard let url = URL(string: address) else { throw RemoteError.invalidURL }
-        return try await RemoteAuthProvider(context: context).register(user: user, baseURL: url)
+        return try await RemoteAuthProvider(context: context).register(user: user, baseURL: url,
+            nickname: security.userProfile(user, context: context).nickname)
     }
 
     func login() async throws {
@@ -72,7 +74,7 @@ struct OnlineConnectionViewModel {
     }
 
     func pushNickname() async throws -> RemoteProfile {
-        try await RemoteAccountRepository(client: client()).updateProfile(nickname: user.nickname)
+        try await RemoteAccountRepository(client: client()).updateProfile(nickname: security.userProfile(user, context: context).nickname)
     }
 
     func search(_ userID: String) async throws -> RemoteUserResult {
@@ -86,7 +88,7 @@ struct OnlineConnectionViewModel {
             $0.ownerID == user.id && $0.userID == normalized
         }) == false {
             _ = try LocalRepository(context: context).addFriend(owner: user, userID: normalized,
-                                                                nickname: normalized)
+                                                                nickname: normalized, encryption: try security.encryptionService())
         }
     }
 
@@ -99,7 +101,7 @@ struct OnlineConnectionViewModel {
         if accept {
             try await repository.accept(item.requestID)
             _ = try? LocalRepository(context: context).addFriend(owner: user, userID: item.fromUserID,
-                                                                   nickname: item.fromUserID)
+                                                                   nickname: item.fromUserID, encryption: try security.encryptionService())
             _ = try await syncConfirmedContacts()
         } else {
             try await repository.reject(item.requestID)
@@ -124,7 +126,7 @@ struct OnlineConnectionViewModel {
                 existing.remoteUserID = contact.id
             } else {
                 let friend = try LocalRepository(context: context).addFriend(owner: user,
-                    userID: contact.userID, nickname: contact.nickname)
+                    userID: contact.userID, nickname: contact.nickname, encryption: try security.encryptionService())
                 friend.remoteUserID = contact.id
                 added += 1
             }

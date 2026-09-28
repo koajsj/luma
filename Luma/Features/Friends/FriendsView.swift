@@ -22,7 +22,7 @@ struct FriendsView: View {
                             ChatDetailView(user: user, friend: friend)
                         } label: {
                             HStack(spacing: 12) {
-                                AvatarView(name: security.friendDisplayName(friend, context: context), imageData: friend.avatar)
+                                AvatarView(name: security.friendDisplayName(friend, context: context), imageData: security.friendAvatar(friend, context: context))
                                 VStack(alignment: .leading) {
                                     Text(security.friendDisplayName(friend, context: context)).font(.headline)
                                     Text("@\(friend.userID)").font(.subheadline).foregroundStyle(.secondary)
@@ -45,6 +45,7 @@ struct AddFriendView: View {
     let user: User
     @Environment(\.dismiss) private var dismiss
     @Environment(\.modelContext) private var context
+    @Environment(SecurityManager.self) private var security
     @Query private var users: [User]
     @State private var searchID = ""
     @State private var nickname = ""
@@ -64,9 +65,9 @@ struct AddFriendView: View {
                     TextField("UserID", text: $searchID)
                         .textInputAutocapitalization(.never).autocorrectionDisabled()
                     if let foundUser {
-                        Label("找到本机账号：\(foundUser.nickname)", systemImage: "checkmark.circle.fill")
+                        Label("找到本机账号：\((try? security.userProfile(foundUser, context: context).nickname) ?? foundUser.userID)", systemImage: "checkmark.circle.fill")
                             .foregroundStyle(.green)
-                        Button("添加 \(foundUser.nickname)") { add(id: foundUser.userID, name: foundUser.nickname) }
+                        Button("添加 \((try? security.userProfile(foundUser, context: context).nickname) ?? foundUser.userID)") { add(id: foundUser.userID, name: (try? security.userProfile(foundUser, context: context).nickname) ?? foundUser.userID) }
                     } else if !searchID.isEmpty {
                         Text("本机没有可搜索的匹配账号。")
                             .foregroundStyle(.secondary)
@@ -102,7 +103,7 @@ struct AddFriendView: View {
 
     private func add(id: String, name: String) {
         do {
-            try viewModel.addLocalContact(owner: user, userID: id, nickname: name)
+            try viewModel.addLocalContact(owner: user, userID: id, nickname: name, security: security)
             dismiss()
         } catch { errorMessage = error.localizedDescription }
     }

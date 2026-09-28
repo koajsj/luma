@@ -59,7 +59,7 @@ final class SecurityManager {
 
     func register(userID: String, nickname: String, password: String, context: ModelContext) throws {
         let hash = try PasswordHasher.hash(password)
-        let user = try LocalRepository(context: context).createUser(userID: userID, nickname: nickname, passwordHash: hash)
+        let user = try LocalRepository(context: context).createUser(userID: userID, nickname: nickname, passwordHash: hash, persist: false)
         do { try lifecycle.provisionNewAccount(user, context: context) }
         catch {
             try? lifecycle.deleteKeys(for: user, context: context)
@@ -209,7 +209,19 @@ final class SecurityManager {
     }
 
     func friendDisplayName(_ friend: Friend, context: ModelContext) -> String {
-        (try? privateStore(context: context).displayName(for: friend)) ?? friend.nickname
+        (try? privateStore(context: context).displayName(for: friend)) ?? "资料不可读取"
+    }
+
+    func userProfile(_ user: User, context: ModelContext) throws -> UserPrivateProfile {
+        try privateStore(context: context).profile(for: user)
+    }
+
+    func friendProfile(_ friend: Friend, context: ModelContext) throws -> FriendPrivateProfile {
+        try privateStore(context: context).profile(for: friend)
+    }
+
+    func friendAvatar(_ friend: Friend, context: ModelContext) -> Data? {
+        try? friendProfile(friend, context: context).avatar
     }
 
     func keychainStatus() -> String {

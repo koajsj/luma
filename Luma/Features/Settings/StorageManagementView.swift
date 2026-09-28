@@ -24,7 +24,8 @@ struct StorageManagementView: View {
         return messages.filter { ids.contains($0.conversationID) }
     }
     private var imageBytes: Int {
-        (user.avatar?.count ?? 0) + friends.filter { $0.ownerID == user.id }.reduce(0) { $0 + ($1.avatar?.count ?? 0) }
+        ((try? security.userProfile(user, context: context).avatar?.count) ?? 0) +
+            friends.filter { $0.ownerID == user.id }.reduce(0) { $0 + ((try? security.friendProfile($1, context: context).avatar?.count) ?? 0) }
     }
     private var cacheDirectory: URL { FileManager.default.temporaryDirectory.appendingPathComponent("LumaBackups", isDirectory: true) }
     private var cacheBytes: Int {

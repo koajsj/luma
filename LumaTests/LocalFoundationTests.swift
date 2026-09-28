@@ -39,6 +39,39 @@ final class LocalFoundationTests: XCTestCase {
         return ModelContext(container)
     }
 
+    func testPrivateProfileMigrationAndEncryptedPersistence() throws {
+        let context = try makeContext()
+        let user = User(userID: "alice", nickname: "Alice", passwordHash: "legacy")
+        user.userIDHash = SHA256.hash(data: Data("alice".utf8))
+            .map { String(format: "%02x", $0) }.joined()
+        user.bio = "private bio"
+        let friend = Friend(ownerID: user.id, userID: "bob", nickname: "Bob")
+        friend.remark = "private remark"
+        friend.privacyRestricted = true
+        context.insert(user); context.insert(friend)
+        try context.save()
+        let metadata = PrivateMetadataStore(context: context,
+            encryption: EncryptionService(key: SymmetricKey(size: .bits256)))
+        try metadata.migrate(owner: user)
+        XCTAssertEqual(user.userIDHMAC, try LocalRepository.userIDHMAC("alice"))
+        XCTAssertNil(user.userIDHash)
+        XCTAssertNotEqual(user.userIDHMAC, SHA256.hash(data: Data("alice".utf8))
+            .map { String(format: "%02x", $0) }.joined())
+        XCTAssertEqual(try LocalRepository(context: context).user("ALICE")?.id, user.id)
+        XCTAssertEqual(user.nickname, "")
+        XCTAssertNil(user.bio)
+        XCTAssertEqual(friend.nickname, "")
+        XCTAssertNil(friend.remark)
+        XCTAssertNil(friend.privacyRestricted)
+        XCTAssertEqual(try metadata.profile(for: user).bio, "private bio")
+        XCTAssertEqual(try metadata.profile(for: friend).remark, "private remark")
+        XCTAssertTrue(try metadata.profile(for: friend).privacyRestricted)
+        try metadata.savePrivateNote("only me", for: friend)
+        XCTAssertEqual(try metadata.profile(for: friend).privateNote, "only me")
+        XCTAssertNil(user.encryptedProfile?.range(of: Data("private bio".utf8)))
+        XCTAssertNil(friend.encryptedProfile?.range(of: Data("private remark".utf8)))
+    }
+
     func testPrivacyShieldEventAndBackgroundPolicy() throws {
         let manager = PrivacyShieldManager()
         manager.screenshotObserved(enabled: false)
@@ -62,7 +95,7 @@ final class LocalFoundationTests: XCTestCase {
 
     func testLegacyMessageIsEncryptedAndTamperingFails() throws {
         let context = try makeContext()
-        let owner = try LocalRepository(context: context).createUser(userID: "alice", nickname: "Alice", passwordHash: "verifier")
+        let owner = try LocalRepository(context: context).createUser(userID: "alice", nickname: "Alice", passwordHash: "verifier", persist: true)
         let conversation = Conversation(ownerID: owner.id, friendID: UUID())
         let oldMessage = Message(conversationID: conversation.id, type: .text, isMine: true)
         oldMessage.content = "旧版明文"
@@ -89,13 +122,28 @@ final class LocalFoundationTests: XCTestCase {
         try security.register(userID: "alice", nickname: "Alice", password: "password123", context: context)
         try security.setPIN("123456", context: context)
         let user = try XCTUnwrap(try LocalRepository(context: context).user("alice"))
+        XCTAssertEqual(user.nickname, "")
+        XCTAssertEqual(user.userIDHMAC, try LocalRepository.userIDHMAC("alice"))
+        let searchableUser = User(userID: "bob", nickname: "Bob", passwordHash: "verifier")
+        searchableUser.userIDHMAC = try LocalRepository.userIDHMAC("bob")
+        let friends = FriendsViewModel(context: context)
+        XCTAssertNil(friends.searchableUser(for: " BOB ", among: [user, searchableUser], excluding: user))
+        searchableUser.searchable = true
+        XCTAssertEqual(friends.searchableUser(for: " BOB ", among: [user, searchableUser], excluding: user)?.id,
+                       searchableUser.id)
+        XCTAssertNotNil(user.encryptedProfile)
+        XCTAssertEqual(try security.userProfile(user, context: context).nickname, "Alice")
         security.lock()
         XCTAssertThrowsError(try security.verifyPIN("000000", context: context))
         try security.verifyPIN("123456", context: context)
         try security.logout()
         try security.login(userID: "alice", password: "password123", context: context)
 
-        let friend = try LocalRepository(context: context).addFriend(owner: user, userID: "bob", nickname: "Bob")
+        let friend = try LocalRepository(context: context).addFriend(owner: user, userID: "bob", nickname: "Bob",
+                                                                     encryption: try security.encryptionService())
+        XCTAssertEqual(friend.nickname, "")
+        XCTAssertNotNil(friend.encryptedProfile)
+        XCTAssertEqual(try security.friendProfile(friend, context: context).nickname, "Bob")
         let conversation = try XCTUnwrap(try LocalRepository(context: context).conversation(ownerID: user.id, friendID: friend.id))
         let chat = ChatViewModel(context: context, security: security)
         XCTAssertTrue(try chat.sendText("你好", in: conversation, replyingTo: nil))
@@ -129,7 +177,8 @@ final class LocalFoundationTests: XCTestCase {
         try security.register(userID: "alice", nickname: "Alice", password: "password123", context: context)
         try security.setPIN("123456", context: context)
         let user = try XCTUnwrap(try LocalRepository(context: context).user("alice"))
-        let friend = try LocalRepository(context: context).addFriend(owner: user, userID: "bob", nickname: "Bob")
+        let friend = try LocalRepository(context: context).addFriend(owner: user, userID: "bob", nickname: "Bob",
+                                                                     encryption: try security.encryptionService())
         let conversation = try XCTUnwrap(try LocalRepository(context: context).conversation(ownerID: user.id, friendID: friend.id))
         let chat = ChatViewModel(context: context, security: security)
         try chat.saveDraft("待发", in: conversation)
@@ -143,10 +192,18 @@ final class LocalFoundationTests: XCTestCase {
                                     sessions: try security.sessionManager(context: context))
         let backup = try manager.export(user: user, password: "backup-secret")
         XCTAssertFalse(String(data: backup, encoding: .utf8)?.contains("备份消息") ?? false)
+        XCTAssertFalse(String(data: backup, encoding: .utf8)?.contains("Alice") ?? false)
+        XCTAssertFalse(String(data: backup, encoding: .utf8)?.contains("Bob") ?? false)
         XCTAssertThrowsError(try manager.restore(backup, password: "wrong-secret", into: user))
         let original = try XCTUnwrap(context.fetch(FetchDescriptor<Message>()).first)
         try chat.edit(original, text: "已修改")
         try manager.restore(backup, password: "backup-secret", into: user)
+        XCTAssertEqual(user.userIDHMAC, try LocalRepository.userIDHMAC("alice"))
+        XCTAssertEqual(try security.userProfile(user, context: context).nickname, "Alice")
+        XCTAssertEqual(user.nickname, "")
+        let restoredFriend = try XCTUnwrap(context.fetch(FetchDescriptor<Friend>()).first)
+        XCTAssertEqual(try security.friendProfile(restoredFriend, context: context).nickname, "Bob")
+        XCTAssertEqual(restoredFriend.nickname, "")
         let restored = try XCTUnwrap(context.fetch(FetchDescriptor<Message>()).first)
         XCTAssertEqual(try chat.displayContent(for: restored), "备份消息")
         let restoredConversation = try XCTUnwrap(context.fetch(FetchDescriptor<Conversation>()).first)

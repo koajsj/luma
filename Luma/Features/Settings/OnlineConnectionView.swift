@@ -4,6 +4,7 @@ import SwiftUI
 struct OnlineConnectionView: View {
     let user: User
     @Environment(\.modelContext) private var context
+    @Environment(SecurityManager.self) private var security
     @State private var address = ""
     @State private var registration: RemoteRegistration?
     @State private var hasTokens = false
@@ -19,7 +20,7 @@ struct OnlineConnectionView: View {
     @State private var notice: String?
     @State private var working = false
 
-    private var viewModel: OnlineConnectionViewModel { OnlineConnectionViewModel(user: user, context: context) }
+    private var viewModel: OnlineConnectionViewModel { OnlineConnectionViewModel(user: user, context: context, security: security) }
 
     var body: some View {
         Form {

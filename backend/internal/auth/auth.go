@@ -10,6 +10,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"luma/backend/internal/crypto"
 	"luma/backend/internal/middleware"
+	"luma/backend/internal/useridindex"
 	"net/http"
 	"strconv"
 	"strings"
@@ -17,8 +18,9 @@ import (
 )
 
 type Service struct {
-	DB    *pgxpool.Pool
-	Cache *redis.Client
+	DB             *pgxpool.Pool
+	Cache          *redis.Client
+	UserIDIndexKey useridindex.Key
 }
 
 func (s Service) Challenge(w http.ResponseWriter, r *http.Request) {
@@ -104,7 +106,7 @@ func (s Service) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	uid, did := uuid.NewString(), uuid.NewString()
-	_, e = tx.Exec(r.Context(), "INSERT INTO users(id,user_id,nickname,identity_public_key) VALUES($1,$2,$3,$4)", uid, in.UserID, in.Nickname, identity)
+	_, e = tx.Exec(r.Context(), "INSERT INTO users(id,user_id,user_id_hash,nickname,identity_public_key) VALUES($1,$2,$3,$4,$5)", uid, in.UserID, s.UserIDIndexKey.Sum(in.UserID), in.Nickname, identity)
 	if e != nil {
 		middleware.Fail(w, r, 409, "registration_conflict")
 		return

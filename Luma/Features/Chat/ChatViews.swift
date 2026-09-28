@@ -40,7 +40,7 @@ struct ChatListView: View {
                             ChatDetailView(user: user, friend: friend)
                         } label: {
                             HStack(spacing: 12) {
-                                AvatarView(name: security.friendDisplayName(friend, context: context), imageData: friend.avatar)
+                                AvatarView(name: security.friendDisplayName(friend, context: context), imageData: security.friendAvatar(friend, context: context))
                                     .overlay(alignment: .bottomTrailing) {
                                         if presences.first(where: { $0.friendID == friend.id })?.onlineStatus == .online {
                                             Circle().fill(.green).frame(width: 11, height: 11).overlay(Circle().stroke(.background, lineWidth: 2))
@@ -175,7 +175,7 @@ struct ChatDetailView: View {
         .toolbar {
             ToolbarItem(placement: .principal) {
                 HStack(spacing: 8) {
-                    AvatarView(name: security.friendDisplayName(friend, context: context), imageData: friend.avatar, size: 30)
+                    AvatarView(name: security.friendDisplayName(friend, context: context), imageData: security.friendAvatar(friend, context: context), size: 30)
                     VStack(alignment: .leading) {
                         Text(security.friendDisplayName(friend, context: context)).font(.headline).lineLimit(1)
                         if typingStatus == .typing && canViewChat { Text("\(security.friendDisplayName(friend, context: context)) 正在输入…（本地演示）").font(.caption2).foregroundStyle(.secondary) }
@@ -717,8 +717,8 @@ private struct ChatInfoView: View {
         NavigationStack {
             Form {
                 Section {
-                    HStack { Spacer(); AvatarView(name: security.friendDisplayName(friend, context: context), imageData: friend.avatar); Spacer() }
-                    LabeledContent("昵称", value: friend.nickname)
+                    HStack { Spacer(); AvatarView(name: security.friendDisplayName(friend, context: context), imageData: security.friendAvatar(friend, context: context)); Spacer() }
+                    LabeledContent("昵称", value: (try? security.friendProfile(friend, context: context).nickname) ?? "资料不可读取")
                     LabeledContent("UserID", value: friend.userID)
                 }
                 Section("聊天") {

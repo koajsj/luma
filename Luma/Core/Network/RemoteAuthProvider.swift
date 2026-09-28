@@ -9,7 +9,7 @@ struct RemoteAuthProvider {
     let store = RemoteSessionStore()
     let signer = RemoteDeviceSigner()
 
-    func register(user: User, baseURL: URL) async throws -> RemoteRegistration {
+    func register(user: User, baseURL: URL, nickname: String) async throws -> RemoteRegistration {
         guard try store.registration(for: user.userID) == nil else { throw RemoteError.server(409, "device_already_registered") }
         guard let device = try localDevice(for: user),
               let identity = user.identityPublicKey,
@@ -34,7 +34,7 @@ struct RemoteAuthProvider {
         let prekeyText = signed.publicKey.base64URLEncodedString()
         let canonical = "luma.register.v1\n\(challenge.nonce)\n\(user.userID)\n\(identityText)\n\(deviceText)\n\(authText)\n\(prekeyText)"
         let body = try JSONEncoder().encode(RegisterRequest(challengeID: challenge.challengeID,
-            nonce: challenge.nonce, userID: user.userID, nickname: user.nickname,
+            nonce: challenge.nonce, userID: user.userID, nickname: nickname,
             identityPublicKey: identityText, devicePublicKey: deviceText, authPublicKey: authText,
             deviceName: device.deviceName ?? device.name, signedPreKey: prekeyText,
             signedPreKeySignature: signedPrekeySignature.base64URLEncodedString(),

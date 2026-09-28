@@ -5,3 +5,15 @@ xcuserdata/
 backend/.env.local
 backend/local-data/
 backend/local-certs/
+.env
+**/.env
+*.pem
+*.key
+*.p8
+*.p12
+*.crt
+*.log
+*.sqlite*
+*.db
+deploy/backups/
+deploy/data/
