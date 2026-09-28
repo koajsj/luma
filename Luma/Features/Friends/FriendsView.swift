@@ -6,37 +6,78 @@ struct FriendsView: View {
     @Environment(SecurityManager.self) private var security
     @Environment(\.modelContext) private var context
     @Query private var allFriends: [Friend]
+    @Query private var presences: [UserPresence]
+    @Query private var conversations: [Conversation]
     @State private var showingAdd = false
     @State private var selectedFriend: Friend?
+    @State private var searchText = ""
 
     private var friends: [Friend] { allFriends.filter { $0.ownerID == user.id }.sorted { security.friendDisplayName($0, context: context).localizedStandardCompare(security.friendDisplayName($1, context: context)) == .orderedAscending } }
+    private var visibleFriends: [Friend] {
+        guard !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return friends }
+        return friends.filter {
+            security.friendDisplayName($0, context: context).localizedStandardContains(searchText) ||
+                $0.userID.localizedStandardContains(searchText)
+        }
+    }
+    private func isProtected(_ friend: Friend) -> Bool {
+        guard let conversation = conversations.first(where: { $0.ownerID == user.id && $0.friendID == friend.id }) else { return false }
+        return conversation.requiresUnlock == true || conversation.requiresPrivacyShield == true ||
+            (security.preferences.privacyModeEnabled && security.preferences.privacyModeLockChats)
+    }
 
     var body: some View {
         NavigationStack {
             List {
                 if friends.isEmpty {
-                    ContentUnavailableView("还没有好友", systemImage: "person.2", description: Text("可以搜索本机账号，或添加用于聊天框架的本地联系人。"))
+                    ContentUnavailableView {
+                        Label("还没有好友", systemImage: "person.2")
+                    } description: {
+                        Text("添加好友，开始一段新的聊天。")
+                    } actions: {
+                        Button("添加好友") { showingAdd = true }
+                            .buttonStyle(.borderedProminent)
+                    }
+                } else if visibleFriends.isEmpty {
+                    ContentUnavailableView.search(text: searchText)
                 } else {
-                    ForEach(friends) { friend in
+                    ForEach(visibleFriends) { friend in
                         NavigationLink {
                             ChatDetailView(user: user, friend: friend)
                         } label: {
                             HStack(spacing: 12) {
                                 AvatarView(name: security.friendDisplayName(friend, context: context), imageData: security.friendAvatar(friend, context: context))
-                                VStack(alignment: .leading) {
-                                    Text(security.friendDisplayName(friend, context: context)).font(.headline)
-                                    Text("@\(friend.userID)").font(.subheadline).foregroundStyle(.secondary)
+                                    .overlay(alignment: .bottomTrailing) {
+                                        if !isProtected(friend), presences.first(where: { $0.friendID == friend.id })?.onlineStatus == .online {
+                                            Circle().fill(.green).frame(width: 11, height: 11)
+                                                .overlay(Circle().stroke(.background, lineWidth: 2))
+                                                .accessibilityLabel("在线 · 本地模拟")
+                                        }
+                                    }
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(security.friendDisplayName(friend, context: context)).font(.headline).lineLimit(1)
+                                    Text("@\(friend.userID)").font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
+                                    if !isProtected(friend), presences.first(where: { $0.friendID == friend.id })?.onlineStatus == .online {
+                                        Text("在线 · 本地模拟").font(.caption2).foregroundStyle(.secondary)
+                                    }
                                 }
                             }
+                            .padding(.vertical, 3)
                         }
                         .swipeActions { Button { selectedFriend = friend } label: { Label("资料", systemImage: "person.crop.circle") } }
                     }
                 }
             }
             .navigationTitle("好友")
+            .searchable(text: $searchText, prompt: "搜索好友")
             .toolbar { Button { showingAdd = true } label: { Label("添加好友", systemImage: "person.badge.plus") } }
             .sheet(isPresented: $showingAdd) { AddFriendView(user: user) }
-            .sheet(item: $selectedFriend) { friend in NavigationStack { FriendProfileView(friend: friend) } }
+            .sheet(item: $selectedFriend) { friend in
+                NavigationStack {
+                    FriendProfileView(friend: friend)
+                        .toolbar { Button("完成") { selectedFriend = nil } }
+                }
+            }
         }
     }
 }
@@ -65,11 +106,17 @@ struct AddFriendView: View {
                     TextField("UserID", text: $searchID)
                         .textInputAutocapitalization(.never).autocorrectionDisabled()
                     if let foundUser {
-                        Label("找到本机账号：\((try? security.userProfile(foundUser, context: context).nickname) ?? foundUser.userID)", systemImage: "checkmark.circle.fill")
-                            .foregroundStyle(.green)
-                        Button("添加 \((try? security.userProfile(foundUser, context: context).nickname) ?? foundUser.userID)") { add(id: foundUser.userID, name: (try? security.userProfile(foundUser, context: context).nickname) ?? foundUser.userID) }
+                        let name = (try? security.userProfile(foundUser, context: context).nickname) ?? foundUser.userID
+                        HStack(spacing: 12) {
+                            AvatarView(name: name, imageData: try? security.userProfile(foundUser, context: context).avatar)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(name).font(.headline)
+                                Text("@\(foundUser.userID)").font(.subheadline).foregroundStyle(.secondary)
+                            }
+                        }
+                        Button("添加好友") { add(id: foundUser.userID, name: name) }
                     } else if !searchID.isEmpty {
-                        Text("本机没有可搜索的匹配账号。")
+                        Label("未找到可搜索的本机账号", systemImage: "magnifyingglass")
                             .foregroundStyle(.secondary)
                     }
                 }
@@ -119,11 +166,29 @@ struct AvatarView: View {
                 Image(uiImage: image).resizable().scaledToFill()
             } else {
                 Text(String(name.prefix(1)).uppercased())
-                    .font(.headline).foregroundStyle(.white)
+                    .font(.system(size: size * 0.4, weight: .semibold, design: .rounded)).foregroundStyle(.white)
                     .frame(width: size, height: size)
-                    .background(.blue.gradient)
+                    .background(Color.accentColor)
             }
         }
         .frame(width: size, height: size).clipShape(Circle()).accessibilityLabel(name)
+    }
+}
+
+struct ProfileHeaderView: View {
+    let name: String
+    let subtitle: String
+    let imageData: Data?
+
+    var body: some View {
+        VStack(spacing: 8) {
+            AvatarView(name: name, imageData: imageData, size: 80)
+            Text(name).font(.title2.weight(.semibold)).lineLimit(2)
+            Text(subtitle).font(.subheadline).foregroundStyle(.secondary).lineLimit(2)
+        }
+        .frame(maxWidth: .infinity)
+        .multilineTextAlignment(.center)
+        .padding(.vertical, 12)
+        .accessibilityElement(children: .combine)
     }
 }

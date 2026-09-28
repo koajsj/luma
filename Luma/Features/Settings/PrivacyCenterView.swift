@@ -11,33 +11,39 @@ struct PrivacyCenterView: View {
     var body: some View {
         Form {
             Section {
-                VStack(alignment: .leading, spacing: 18) {
-                    Label("Luma 安全状态", systemImage: "checkmark.shield.fill")
-                        .font(.title3.weight(.semibold))
-                        .foregroundStyle(.primary)
-                    statusRow("本地数据保护", available: true)
-                    statusRow("密钥安全管理", available: security.keychainStatus() == "可读取")
-                    statusRow("设备身份保护", available: security.deviceKeyStatus(for: user, context: context) == "Keychain 已保护")
-                    statusRow("隐私护盾", available: security.preferences.effectiveScreenCaptureProtection || security.preferences.effectiveBackgroundHide)
+                Label {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(keyProtectionReady ? "本机保护状态良好" : "部分保护需要检查")
+                            .font(.headline)
+                        Text("查看你的本机保护与隐私设置")
+                            .font(.subheadline).foregroundStyle(.secondary)
+                    }
+                } icon: {
+                    Image(systemName: keyProtectionReady ? "checkmark.shield.fill" : "exclamationmark.shield.fill")
+                        .foregroundStyle(keyProtectionReady ? Color.green : Color.orange)
                 }
-                .padding(.vertical, 10)
-                .accessibilityElement(children: .contain)
+                .padding(.vertical, 8)
+                statusRow("本地数据保护", available: true)
+                statusRow("密钥安全管理", available: security.keychainStatus() == "可读取")
+                statusRow("设备身份保护", available: security.deviceKeyStatus(for: user, context: context) == "Keychain 已保护")
+                statusRow("隐私护盾", available: security.preferences.effectiveScreenCaptureProtection || security.preferences.effectiveBackgroundHide)
+            } header: {
+                Text("安全状态")
             } footer: {
-                Text("状态仅反映本机功能和设置；在线通信尚未通过完整端到端加密验收。")
+                Text("仅反映本机状态；通信保护范围请查看安全报告。")
             }
             Section("隐私与安全") {
                 NavigationLink("隐私选项") { PrivacyOptionsView(user: user) }
                 NavigationLink("隐私护盾") { PrivacyShieldView(user: user) }
-                NavigationLink("安全与隐私报告") { PrivacyReportView(user: user) }
-            }
-            Section("更多信息") {
-                NavigationLink("技术详情") { SecurityTechnicalDetailsView(user: user) }
-#if DEBUG
-                NavigationLink("E2EE Diagnostics（Debug）") { E2EEDiagnosticsView(user: user) }
-#endif
+                NavigationLink("安全报告") { PrivacyReportView(user: user) }
             }
         }
         .navigationTitle("安全中心")
+    }
+
+    private var keyProtectionReady: Bool {
+        security.keychainStatus() == "可读取" &&
+            security.deviceKeyStatus(for: user, context: context) == "Keychain 已保护"
     }
 
     private func statusRow(_ title: String, available: Bool) -> some View {
@@ -82,7 +88,7 @@ private struct E2EEDiagnosticsView: View {
 }
 #endif
 
-private struct PrivacyOptionsView: View {
+struct PrivacyOptionsView: View {
     let user: User
     @Environment(SecurityManager.self) private var security
     @Environment(\.modelContext) private var context
@@ -101,7 +107,7 @@ private struct PrivacyOptionsView: View {
                 Toggle("显示最后上线时间", isOn: preference(\.showLastSeen))
                 Toggle("已读回执", isOn: preference(\.readReceipts))
             }
-            Section { Text("本机隐私偏好不会自动同步到开发服务器；在线状态演示不代表好友真实在线。") }
+            Section { Text("设置仅保存在本机。当前在线状态仅供本机查看，不能代表好友的实时状态。") }
                 .font(.footnote).foregroundStyle(.secondary)
         }
         .navigationTitle("隐私选项")
@@ -130,10 +136,23 @@ private struct SecurityTechnicalDetailsView: View {
                 LabeledContent("Keychain", value: security.keychainStatus())
                 LabeledContent("Identity Key", value: security.identityKeyStatus(for: user))
                 LabeledContent("Device Key", value: security.deviceKeyStatus(for: user, context: context))
+                if let fingerprint = user.identityFingerprint {
+                    LabeledContent("身份指纹") {
+                        Text(IdentityFingerprint.grouped(fingerprint))
+                            .font(.system(.footnote, design: .monospaced))
+                            .textSelection(.enabled)
+                    }
+                }
             }
             Section("在线协议") {
                 Text("在线 v4 采用逐设备密文信封及独立收发链。历史 v1/v2/v3 消息保持兼容读取。")
                 Text("真实双设备完整链路、安全审计与公钥目录透明性尚未完成。")
+            }
+            Section("开发与诊断") {
+                NavigationLink("开发服务器连接") { OnlineConnectionView(user: user) }
+#if DEBUG
+                NavigationLink("E2EE Diagnostics（Debug）") { E2EEDiagnosticsView(user: user) }
+#endif
             }
         }
         .navigationTitle("技术详情")
@@ -149,14 +168,14 @@ struct PrivacyReportView: View {
         Form {
             Section("数据保护") {
                 status("本地消息保护", "已启用", "lock.doc")
-                status("系统密钥存储", security.keychainStatus(), "key.horizontal")
+                status("系统密钥存储", security.keychainStatus() == "可读取" ? "已保护" : "需要检查", "key.horizontal")
             }
             Section("身份") {
-                status("身份保护", security.identityKeyStatus(for: user), "person.crop.circle.badge.checkmark")
-                status("设备保护", security.deviceKeyStatus(for: user, context: context), "iphone.gen3")
+                status("身份保护", security.identityKeyStatus(for: user) == "已生成" ? "已启用" : "需要检查", "person.crop.circle.badge.checkmark")
+                status("设备保护", security.deviceKeyStatus(for: user, context: context) == "Keychain 已保护" ? "已启用" : "需要检查", "iphone.gen3")
             }
             Section("通信") {
-                status("密文消息传输", "在线模式可用；真机验收未完成", "lock.bubble")
+                status("密文消息传输", "在线模式可使用", "lock.bubble")
                 status("设备身份验证", "在线登记后使用设备签名", "checkmark.shield")
                 Text("服务器可见通信关系、时间及密文大小；本地聊天不会自动上传。")
                     .font(.footnote).foregroundStyle(.secondary)
@@ -168,7 +187,7 @@ struct PrivacyReportView: View {
                 status("后台隐藏", security.preferences.hideInBackground ? "已开启" : "已关闭", "rectangle.on.rectangle.slash")
             }
             Section("当前限制") {
-                Text("设备间文字、附件和聊天操作已有加密实现，但尚未完成双真实设备验收及独立安全审查。当前不能宣称完整端到端加密。")
+                Text("当前提供设备间加密通信基础；完整端到端加密仍待验收。")
                 Text("截图检测发生在截图之后；无法禁止截图或保证遮罩覆盖所有采集方式。")
                 Text("本页展示本机能力与设置状态，不代表对远端设备或服务器的实时安全审计。")
             }
@@ -194,46 +213,47 @@ struct PrivacyShieldView: View {
     let user: User
     @Environment(SecurityManager.self) private var security
     @Environment(\.modelContext) private var context
-    @Query private var conversations: [Conversation]
-    @Query private var friends: [Friend]
     @State private var errorMessage: String?
 
     var body: some View {
         Form {
             Section {
-                Toggle("检测截图行为", isOn: preference(\.screenshotAlerts))
-                Toggle("录屏时隐藏内容", isOn: Binding(
+                Toggle(isOn: preference(\.screenshotAlerts)) {
+                    settingLabel("截图提醒", detail: "检测截图行为", symbol: "camera.viewfinder")
+                }
+                Toggle(isOn: Binding(
                     get: { security.preferences.effectiveScreenCaptureProtection },
                     set: { value in update { $0.screenCaptureProtection = value } }
-                ))
-                Toggle("后台隐藏隐私信息", isOn: preference(\.hideInBackground))
-            } header: { Text("系统检测") } footer: {
-                Text("截图发生后才能检测，无法阻止截图；录屏时隐藏内容仅对系统报告的录屏、镜像和 AirPlay 捕获生效。")
-            }
-            Section {
-                let owned = conversations.filter { $0.ownerID == user.id }
-                if owned.isEmpty {
-                    Text("还没有聊天").foregroundStyle(.secondary)
+                )) {
+                    settingLabel("录屏保护", detail: "录屏时隐藏内容", symbol: "record.circle")
                 }
-                ForEach(owned) { conversation in
-                    if let friend = friends.first(where: { $0.id == conversation.friendID }) {
-                        Toggle(security.friendDisplayName(friend, context: context), isOn: Binding(
-                            get: { conversation.requiresPrivacyShield == true },
-                            set: { value in
-                                conversation.requiresPrivacyShield = value
-                                do { try context.save() } catch { errorMessage = error.localizedDescription }
-                            }
-                        ))
-                    }
+                Toggle(isOn: preference(\.hideInBackground)) {
+                    settingLabel("后台隐藏", detail: "保护 App 切后台预览", symbol: "eye.slash")
                 }
-            } header: { Text("敏感聊天保护") } footer: {
-                Text("开启后需要再次解锁，不进入本地搜索与收藏摘要。通知预览控制待通知服务接入后生效。")
+                NavigationLink {
+                    SensitiveChatsView(user: user)
+                } label: {
+                    settingLabel("敏感聊天保护", detail: "为指定聊天增加保护", symbol: "lock.bubble")
+                }
+            } header: {
+                Text("隐私保护")
+            } footer: {
+                Text("截图只能在发生后检测，无法阻止截图。")
             }
         }
         .navigationTitle("隐私护盾")
         .alert("保存失败", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
             Button("好", role: .cancel) { errorMessage = nil }
         } message: { Text(errorMessage ?? "") }
+    }
+
+    private func settingLabel(_ title: String, detail: String, symbol: String) -> some View {
+        Label {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                Text(detail).font(.footnote).foregroundStyle(.secondary)
+            }
+        } icon: { Image(systemName: symbol).foregroundStyle(.tint) }
     }
 
     private func preference(_ keyPath: WritableKeyPath<PrivacyPreferences, Bool>) -> Binding<Bool> {
@@ -247,6 +267,48 @@ struct PrivacyShieldView: View {
     }
 }
 
+private struct SensitiveChatsView: View {
+    let user: User
+    @Environment(SecurityManager.self) private var security
+    @Environment(\.modelContext) private var context
+    @Query private var conversations: [Conversation]
+    @Query private var friends: [Friend]
+    @State private var errorMessage: String?
+
+    var body: some View {
+        Form {
+            Section {
+                let owned = conversations.filter { $0.ownerID == user.id }
+                if owned.isEmpty {
+                    ContentUnavailableView("还没有聊天", systemImage: "message")
+                }
+                ForEach(owned) { conversation in
+                    if let friend = friends.first(where: { $0.id == conversation.friendID }) {
+                        Toggle(security.friendDisplayName(friend, context: context), isOn: Binding(
+                            get: { conversation.requiresPrivacyShield == true },
+                            set: { value in
+                                let previous = conversation.requiresPrivacyShield
+                                conversation.requiresPrivacyShield = value
+                                do { try context.save() }
+                                catch {
+                                    conversation.requiresPrivacyShield = previous
+                                    errorMessage = LumaError.message(for: error)
+                                }
+                            }
+                        ))
+                    }
+                }
+            } footer: {
+                Text("开启后需再次解锁，并从本地搜索与收藏摘要中隐藏。通知预览控制待通知服务接入后生效。")
+            }
+        }
+        .navigationTitle("敏感聊天保护")
+        .alert("保存失败", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
+            Button("好", role: .cancel) { errorMessage = nil }
+        } message: { Text(errorMessage ?? "") }
+    }
+}
+
 struct DeviceManagerView: View {
     let user: User
     @Environment(SecurityManager.self) private var security
@@ -257,14 +319,17 @@ struct DeviceManagerView: View {
     var body: some View {
         Form {
             Section("当前设备") {
-                LabeledContent("名称", value: current?.deviceName ?? current?.name ?? UIDevice.current.name)
+                Label(current?.deviceName ?? current?.name ?? UIDevice.current.name, systemImage: "iphone.gen3")
+                LabeledContent("最近活动") {
+                    if let date = current?.lastActiveAt { Text(date, style: .relative) }
+                    else { Text("暂无记录") }
+                }
+                LabeledContent("安全状态", value: security.deviceKeyStatus(for: user, context: context) == "Keychain 已保护" ? "已保护" : "需要检查")
                 LabeledContent("系统", value: current?.systemVersion ?? "\(UIDevice.current.systemName) \(UIDevice.current.systemVersion)")
-                LabeledContent("设备密钥", value: security.deviceKeyStatus(for: user, context: context))
-                if let date = current?.createdAt { LabeledContent("创建时间") { Text(date, style: .date) } }
-                if let date = current?.lastActiveAt { LabeledContent("最后活动") { Text(date, style: .relative) } }
             }
-            Section { Text("仅显示当前设备。本地没有其他设备的可信记录；多设备管理将在同步服务接入后启用。") }
-                .font(.footnote).foregroundStyle(.secondary)
+            Section("其他设备") {
+                NavigationLink("已登记设备与撤销") { RegisteredDevicesView(user: user) }
+            }
         }.navigationTitle("设备管理")
             .onAppear {
                 guard let device = current else { errorMessage = "当前设备记录不存在，请重新登录以检查密钥"; return }
@@ -277,6 +342,95 @@ struct DeviceManagerView: View {
             .alert("设备记录保存失败", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
                 Button("好", role: .cancel) { errorMessage = nil }
             } message: { Text(errorMessage ?? "") }
+    }
+}
+
+private struct RegisteredDevicesView: View {
+    let user: User
+    @Environment(\.modelContext) private var context
+    @Environment(SecurityManager.self) private var security
+    @State private var devices: [RemoteDeviceInfo] = []
+    @State private var currentID: UUID?
+    @State private var connected = false
+    @State private var loading = true
+    @State private var revoking: RemoteDeviceInfo?
+    @State private var errorMessage: String?
+
+    private var viewModel: OnlineConnectionViewModel {
+        OnlineConnectionViewModel(user: user, context: context, security: security)
+    }
+
+    var body: some View {
+        Form {
+            Section {
+                if loading {
+                    ProgressView("正在读取设备")
+                } else if !connected {
+                    ContentUnavailableView("设备列表不可用", systemImage: "iphone.slash",
+                        description: Text("在线登录后可查看和撤销已登记设备。"))
+                } else if devices.allSatisfy({ $0.revokedAt != nil }) {
+                    ContentUnavailableView("暂无已登记设备", systemImage: "iphone")
+                } else {
+                    ForEach(devices.filter { $0.revokedAt == nil }) { device in
+                        HStack {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(device.deviceName)
+                                Text(device.id == currentID ? "当前设备" : "已登记")
+                                    .font(.footnote).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            if device.id != currentID {
+                                Button("撤销", role: .destructive) { revoking = device }
+                                    .buttonStyle(.borderless)
+                            }
+                        }
+                    }
+                }
+            } footer: {
+                Text("撤销后，该设备将无法继续使用服务器会话；其本机离线数据不会被远程擦除。")
+            }
+        }
+        .navigationTitle("已登记设备")
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button("刷新") { Task { await load() } }
+                    .disabled(loading || !connected)
+            }
+        }
+        .task { await load() }
+        .confirmationDialog("撤销这台设备？", isPresented: Binding(
+            get: { revoking != nil }, set: { if !$0 { revoking = nil } }
+        )) {
+            Button("撤销设备", role: .destructive) {
+                guard let device = revoking else { return }
+                revoking = nil
+                Task {
+                    do {
+                        try await viewModel.revoke(deviceID: device.id)
+                        await load()
+                    } catch { errorMessage = LumaError.message(for: error) }
+                }
+            }
+            Button("取消", role: .cancel) { revoking = nil }
+        } message: {
+            Text("撤销后将断开这台设备的在线连接，操作不可自动撤销。")
+        }
+        .alert("设备操作失败", isPresented: Binding(
+            get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } }
+        )) {
+            Button("好", role: .cancel) { errorMessage = nil }
+        } message: { Text(errorMessage ?? "") }
+    }
+
+    private func load() async {
+        loading = true
+        defer { loading = false }
+        do {
+            let (registration, hasTokens) = try viewModel.localState()
+            currentID = registration?.backendDeviceID
+            connected = registration != nil && hasTokens
+            devices = connected ? try await viewModel.devices() : []
+        } catch { errorMessage = LumaError.message(for: error) }
     }
 }
 
@@ -295,13 +449,14 @@ struct UserProfileView: View {
     var body: some View {
         Form {
             Section {
-                HStack { Spacer(); AvatarView(name: nickname, imageData: avatar, size: 80); Spacer() }
-                PhotosPicker(selection: $selectedPhoto, matching: .images) { Label("从相册选择头像", systemImage: "photo") }
+                ProfileHeaderView(name: profileLoaded ? nickname : "我的资料",
+                                  subtitle: "@\(user.userID)", imageData: avatar)
+                if !bio.isEmpty { Text(bio).font(.subheadline).foregroundStyle(.secondary) }
+            }
+            Section("编辑资料") {
+                PhotosPicker(selection: $selectedPhoto, matching: .images) { Label("更换头像", systemImage: "photo") }
                     .disabled(!profileLoaded)
                 if avatar != nil { Button("删除头像", role: .destructive) { avatar = nil; save() }.disabled(!profileLoaded) }
-            }
-            Section("资料") {
-                LabeledContent("UserID", value: user.userID)
                 TextField("昵称", text: $nickname)
                 TextField("简介", text: $bio, axis: .vertical).lineLimit(2...4)
                 Button("保存资料") {
@@ -311,17 +466,14 @@ struct UserProfileView: View {
                     save(); if errorMessage == nil { dismiss() }
                 }.disabled(!profileLoaded)
             }
-            Section("身份指纹") {
-                if let fingerprint = user.identityFingerprint {
-                    Text(IdentityFingerprint.grouped(fingerprint))
-                        .font(.system(.footnote, design: .monospaced))
-                        .textSelection(.enabled)
-                        .accessibilityLabel("身份指纹 \(fingerprint)")
-                } else {
-                    Text("尚未生成").foregroundStyle(.secondary)
+            Section("账号与安全") {
+                LabeledContent("UserID", value: user.userID)
+                NavigationLink { IdentitySettingsView(user: user) } label: {
+                    Label("安全验证", systemImage: "checkmark.shield")
                 }
-                Text("此指纹仅来自本机身份公钥。好友身份验证将在后续版本实现。")
-                    .font(.footnote).foregroundStyle(.secondary)
+                NavigationLink { DeviceManagerView(user: user) } label: {
+                    Label("设备管理", systemImage: "iphone.gen3")
+                }
             }
         }
         .navigationTitle("我的资料")

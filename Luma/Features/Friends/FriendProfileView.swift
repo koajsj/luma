@@ -24,23 +24,17 @@ struct FriendProfileView: View {
     var body: some View {
         Form {
             Section {
-                HStack { Spacer(); AvatarView(name: security.friendDisplayName(friend, context: context), imageData: security.friendAvatar(friend, context: context), size: 72); Spacer() }
+                ProfileHeaderView(name: security.friendDisplayName(friend, context: context),
+                                  subtitle: "@\(friend.userID)", imageData: security.friendAvatar(friend, context: context))
+            }
+            Section("资料") {
                 LabeledContent("昵称", value: (try? security.friendProfile(friend, context: context).nickname) ?? "资料不可读取")
                 LabeledContent("UserID", value: friend.userID)
                 LabeledContent("备注", value: (try? security.privateStore(context: context).remark(for: friend)).flatMap { $0.isEmpty ? nil : $0 } ?? "未设置")
-                Button("修改备注") {
+                Button {
                     do { remark = try security.privateStore(context: context).remark(for: friend); editingRemark = true }
                     catch { errorMessage = error.localizedDescription }
-                }
-            }
-            Section("在线状态 · 本地模型") {
-                LabeledContent("状态", value: presence?.onlineStatus == .online ? "在线（本地模拟）" :
-                               presence?.onlineStatus == .offline ? "离线（本地模拟）" : "未知")
-                if let date = presence?.lastSeenAt { LabeledContent("最后在线") { Text(date, style: .relative) } }
-                Button(presence?.onlineStatus == .online ? "模拟离线" : "模拟在线") {
-                    do { try FriendsViewModel(context: context).setMockOnline(presence?.onlineStatus != .online, for: friend) }
-                    catch { errorMessage = error.localizedDescription }
-                }
+                } label: { Label("修改备注", systemImage: "pencil") }
             }
             Section("隐私设置") {
                 Toggle("限制此好友的本地资料展示", isOn: Binding(get: { (try? security.friendProfile(friend, context: context).privacyRestricted) ?? false }, set: {
@@ -53,9 +47,18 @@ struct FriendProfileView: View {
             if friend.remoteUserID != nil,
                let owner = users.first(where: { $0.id == friend.ownerID }) {
                 Section("身份") {
-                    NavigationLink("安全验证") {
+                    NavigationLink {
                         IdentityVerificationView(user: owner, friend: friend)
-                    }
+                    } label: { Label("安全验证", systemImage: "checkmark.shield") }
+                }
+            }
+            Section("在线状态 · 本地演示") {
+                LabeledContent("状态", value: presence?.onlineStatus == .online ? "在线（本地模拟）" :
+                               presence?.onlineStatus == .offline ? "离线（本地模拟）" : "未知")
+                if let date = presence?.lastSeenAt { LabeledContent("最后在线") { Text(date, style: .relative) } }
+                Button(presence?.onlineStatus == .online ? "模拟离线" : "模拟在线") {
+                    do { try FriendsViewModel(context: context).setMockOnline(presence?.onlineStatus != .online, for: friend) }
+                    catch { errorMessage = error.localizedDescription }
                 }
             }
             Section { Button("删除好友及本地聊天", role: .destructive) { confirmingDelete = true } }

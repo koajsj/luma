@@ -16,6 +16,7 @@ struct ChatListView: View {
     @State private var showingAdd = false
     @State private var showingSearch = false
     @State private var showingFavorites = false
+    @State private var chatQuery = ""
     @State private var errorMessage: String?
 
     private var friends: [Friend] { allFriends.filter { $0.ownerID == user.id } }
@@ -27,44 +28,70 @@ struct ChatListView: View {
             return (lastMessage(for: left)?.timestamp ?? .distantPast) > (lastMessage(for: right)?.timestamp ?? .distantPast)
         }
     }
+    private var visibleFriends: [Friend] {
+        guard !chatQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return sortedFriends }
+        return sortedFriends.filter { friend in
+            !isProtected(friend) && (security.friendDisplayName(friend, context: context)
+                .localizedStandardContains(chatQuery) || friend.userID.localizedStandardContains(chatQuery))
+        }
+    }
     private var viewModel: ChatViewModel { ChatViewModel(context: context, security: security) }
 
     var body: some View {
         NavigationStack {
             List {
                 if friends.isEmpty {
-                    ContentUnavailableView("开始聊天", systemImage: "message", description: Text("添加本地联系人后即可试用聊天界面。"))
+                    ContentUnavailableView {
+                        Label("开始聊天", systemImage: "message")
+                    } description: {
+                        Text("添加好友，发送第一条消息。")
+                    } actions: {
+                        Button("添加好友") { showingAdd = true }
+                            .buttonStyle(.borderedProminent)
+                    }
+                } else if visibleFriends.isEmpty {
+                    ContentUnavailableView.search(text: chatQuery)
                 } else {
-                    ForEach(sortedFriends) { friend in
+                    ForEach(visibleFriends) { friend in
                         NavigationLink {
                             ChatDetailView(user: user, friend: friend)
                         } label: {
-                            HStack(spacing: 12) {
+                            HStack(alignment: .top, spacing: 12) {
                                 AvatarView(name: security.friendDisplayName(friend, context: context), imageData: security.friendAvatar(friend, context: context))
                                     .overlay(alignment: .bottomTrailing) {
-                                        if presences.first(where: { $0.friendID == friend.id })?.onlineStatus == .online {
+                                        if !isProtected(friend) && presences.first(where: { $0.friendID == friend.id })?.onlineStatus == .online {
                                             Circle().fill(.green).frame(width: 11, height: 11).overlay(Circle().stroke(.background, lineWidth: 2))
                                                 .accessibilityLabel("在线 · 本地模拟")
                                         }
                                     }
                                 VStack(alignment: .leading, spacing: 4) {
-                                    Text(security.friendDisplayName(friend, context: context)).font(.headline)
-                                    Text(preview(for: friend)).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
+                                    HStack(spacing: 5) {
+                                        Text(security.friendDisplayName(friend, context: context))
+                                            .font(.headline).lineLimit(1)
+                                        if conversation(for: friend)?.isPinned == true {
+                                            Image(systemName: "pin.fill").font(.caption2).foregroundStyle(.tertiary)
+                                                .accessibilityLabel("已置顶")
+                                        }
+                                    }
+                                    Text(preview(for: friend))
+                                        .font(.subheadline)
+                                        .foregroundStyle(conversation(for: friend)?.draft != nil && !isProtected(friend) ? .blue : .secondary)
+                                        .lineLimit(1)
                                 }
                                 Spacer(minLength: 4)
-                                if let count = allConversations.first(where: { $0.ownerID == user.id && $0.friendID == friend.id })?.unreadCount,
-                                   count > 0 {
-                                    Text("\(count)").font(.caption.bold()).foregroundStyle(.white)
-                                        .padding(.horizontal, 7).padding(.vertical, 3).background(.blue, in: Capsule())
-                                        .accessibilityLabel("\(count) 条未读")
-                                }
-                                if allConversations.first(where: { $0.ownerID == user.id && $0.friendID == friend.id })?.isPinned == true {
-                                    Image(systemName: "pin.fill").font(.caption).foregroundStyle(.secondary)
-                                }
-                                if let date = lastMessage(for: friend)?.timestamp {
-                                    Text(date, style: .time).font(.caption).foregroundStyle(.secondary)
+                                VStack(alignment: .trailing, spacing: 7) {
+                                    if let date = lastMessage(for: friend)?.timestamp {
+                                        Text(chatListTime(for: date))
+                                            .font(.caption2).foregroundStyle(.secondary)
+                                    }
+                                    if let count = conversation(for: friend)?.unreadCount, count > 0 {
+                                        Text("\(count)").font(.caption2.bold()).foregroundStyle(.white)
+                                            .padding(.horizontal, 7).padding(.vertical, 3).background(.blue, in: Capsule())
+                                            .accessibilityLabel("\(count) 条未读")
+                                    }
                                 }
                             }
+                            .padding(.vertical, 3)
                         }
                         .swipeActions(edge: .leading) {
                             if let conversation = allConversations.first(where: { $0.ownerID == user.id && $0.friendID == friend.id }) {
@@ -82,10 +109,22 @@ struct ChatListView: View {
                 }
             }
             .navigationTitle("聊天")
+            .searchable(text: $chatQuery, prompt: "搜索聊天")
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    NavigationLink {
+                        UserProfileView(user: user)
+                    } label: {
+                        AvatarView(name: (try? security.userProfile(user, context: context).nickname) ?? user.userID,
+                                   imageData: try? security.userProfile(user, context: context).avatar, size: 30)
+                    }
+                    .accessibilityLabel("个人资料")
+                }
                 ToolbarItemGroup(placement: .topBarTrailing) {
-                    Button { showingSearch = true } label: { Label("搜索", systemImage: "magnifyingglass") }
-                    Button { showingFavorites = true } label: { Label("收藏", systemImage: "star") }
+                    Menu {
+                        Button { showingSearch = true } label: { Label("搜索消息与文件", systemImage: "magnifyingglass") }
+                        Button { showingFavorites = true } label: { Label("收藏消息", systemImage: "star") }
+                    } label: { Label("更多", systemImage: "ellipsis.circle") }
                     Button { showingAdd = true } label: { Label("新聊天", systemImage: "square.and.pencil") }
                 }
             }
@@ -99,15 +138,31 @@ struct ChatListView: View {
     }
 
     private func lastMessage(for friend: Friend) -> Message? {
-        guard let conversation = allConversations.first(where: { $0.ownerID == user.id && $0.friendID == friend.id }) else { return nil }
+        guard let conversation = conversation(for: friend) else { return nil }
         return allMessages.first { $0.conversationID == conversation.id && !$0.deleted }
     }
 
+    private func conversation(for friend: Friend) -> Conversation? {
+        allConversations.first { $0.ownerID == user.id && $0.friendID == friend.id }
+    }
+
+    private func isProtected(_ friend: Friend) -> Bool {
+        guard let conversation = conversation(for: friend) else { return false }
+        return conversation.requiresUnlock == true || conversation.requiresPrivacyShield == true ||
+            (security.preferences.privacyModeEnabled && security.preferences.privacyModeLockChats)
+    }
+
+    private func chatListTime(for date: Date) -> String {
+        if Calendar.current.isDateInToday(date) { return date.formatted(date: .omitted, time: .shortened) }
+        if Calendar.current.isDateInYesterday(date) { return "昨天" }
+        return date.formatted(.dateTime.month(.abbreviated).day())
+    }
+
     private func preview(for friend: Friend) -> String {
-        guard let conversation = allConversations.first(where: { $0.ownerID == user.id && $0.friendID == friend.id }) else { return "暂无消息" }
-        if conversation.requiresUnlock == true || conversation.requiresPrivacyShield == true || (security.preferences.privacyModeEnabled && security.preferences.privacyModeLockChats) { return "已锁定的聊天" }
+        guard let conversation = conversation(for: friend) else { return "暂无消息" }
+        if isProtected(friend) { return "已保护的聊天" }
         if !security.preferences.effectiveMessagePreviews { return "消息预览已关闭" }
-        if conversation.draft != nil { return "草稿：已保存" }
+        if conversation.draft != nil { return "草稿 · 已保存" }
         guard let message = lastMessage(for: friend) else { return "暂无消息" }
         switch message.type {
         case .text: return viewModel.visibleContent(for: message)
@@ -125,14 +180,19 @@ struct ChatDetailView: View {
     @Environment(\.modelContext) private var context
     @Environment(SecurityManager.self) private var security
     @Environment(PrivacyShieldManager.self) private var privacyShield
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Query private var conversations: [Conversation]
     @Query private var allFriends: [Friend]
     @Query private var presences: [UserPresence]
     @Query(sort: \Message.timestamp) private var allMessages: [Message]
     @Query private var allReactions: [Reaction]
+    @Query private var outgoingItems: [OutgoingMessageQueueItem]
+    @Query private var pendingEvents: [V4PendingEvent]
     @State private var draft = ""
     @State private var replyTo: Message?
     @State private var deleting: Message?
+    @State private var confirmingClear = false
+    @State private var clearRequested = false
     @State private var showingActions = false
     @State private var showingInfo = false
     @State private var showingSecurity = false
@@ -152,6 +212,7 @@ struct ChatDetailView: View {
     @State private var importingAttachment: MessageType = .file
     @State private var showingFileImporter = false
     @State private var attachmentPreview: AttachmentPreview?
+    @State private var sendingAttachment = false
     @Environment(\.scenePhase) private var scenePhase
 
     private var viewModel: ChatViewModel { ChatViewModel(context: context, security: security) }
@@ -159,8 +220,9 @@ struct ChatDetailView: View {
     private var conversation: Conversation? { conversations.first { $0.ownerID == user.id && $0.friendID == friend.id } }
     private var messages: [Message] {
         guard let conversation else { return [] }
-        return allMessages.filter { $0.conversationID == conversation.id && !$0.deleted }
+        return allMessages.filter { $0.conversationID == conversation.id && (!$0.deleted || $0.deletedForEveryone) }
     }
+    private var messageIDs: [UUID] { messages.map(\.id) }
     private var needsChatUnlock: Bool { conversation?.requiresUnlock == true || conversation?.requiresPrivacyShield == true || (security.preferences.privacyModeEnabled && security.preferences.privacyModeLockChats) }
     private var canViewChat: Bool { !needsChatUnlock || chatUnlocked }
     private var presence: UserPresence? { presences.first { $0.friendID == friend.id } }
@@ -174,15 +236,19 @@ struct ChatDetailView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .principal) {
-                HStack(spacing: 8) {
-                    AvatarView(name: security.friendDisplayName(friend, context: context), imageData: security.friendAvatar(friend, context: context), size: 30)
-                    VStack(alignment: .leading) {
-                        Text(security.friendDisplayName(friend, context: context)).font(.headline).lineLimit(1)
-                        if typingStatus == .typing && canViewChat { Text("\(security.friendDisplayName(friend, context: context)) 正在输入…（本地演示）").font(.caption2).foregroundStyle(.secondary) }
-                        else if presence?.onlineStatus == .online { Text("● 在线 · 本地模拟").font(.caption2).foregroundStyle(.green) }
-                        else if presence?.onlineStatus == .offline, let lastSeen = presence?.lastSeenAt { Text("最后在线 \(lastSeen, style: .relative) · 本地模拟").font(.caption2).foregroundStyle(.secondary) }
+                Button { if canViewChat { showingInfo = true } } label: {
+                    HStack(spacing: 8) {
+                        AvatarView(name: security.friendDisplayName(friend, context: context), imageData: security.friendAvatar(friend, context: context), size: 30)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(security.friendDisplayName(friend, context: context)).font(.headline).lineLimit(1)
+                            if typingStatus == .typing && canViewChat { Text("正在输入 · 本地演示").font(.caption2).foregroundStyle(.secondary) }
+                            else if canViewChat && presence?.onlineStatus == .online { Text("在线 · 本地模拟").font(.caption2).foregroundStyle(.green) }
+                            else if canViewChat && presence?.onlineStatus == .offline, let lastSeen = presence?.lastSeenAt { Text("最后在线 \(lastSeen, style: .relative) · 本地模拟").font(.caption2).foregroundStyle(.secondary) }
+                        }
                     }
                 }
+                .buttonStyle(.plain)
+                .accessibilityLabel("查看\(security.friendDisplayName(friend, context: context))的聊天详情")
             }
             ToolbarItem(placement: .topBarTrailing) {
                 if canViewChat {
@@ -249,8 +315,10 @@ struct ChatDetailView: View {
         .sheet(isPresented: $showingIdentityVerification) {
             NavigationStack { IdentityVerificationView(user: user, friend: friend) }
         }
-        .sheet(isPresented: $showingInfo) { ChatInfoView(user: user, friend: friend, conversation: conversation,
-                                                        onlineMode: onlineMode, typingStatus: $typingStatus) }
+        .sheet(isPresented: $showingInfo, onDismiss: {
+            if clearRequested { clearRequested = false; confirmingClear = true }
+        }) { ChatInfoView(user: user, friend: friend, conversation: conversation,
+                         typingStatus: $typingStatus, onClear: { clearRequested = true }) }
         .sheet(isPresented: $showingSecurity) { ChatSecurityView(user: user, friend: friend, onlineMode: onlineMode) }
         .sheet(item: $editing) { message in
             NavigationStack {
@@ -297,6 +365,9 @@ struct ChatDetailView: View {
             }
         } message: { Text([3, 4].contains(deleting?.transportEncryptionVersion ?? 0) ?
                           "服务器将发送删除事件；已下载副本不能保证物理擦除。" : "当前仅清理此设备的数据，不会影响其他设备。") }
+        .confirmationDialog("清空此设备上的聊天记录？", isPresented: $confirmingClear) {
+            Button("清空本机记录", role: .destructive) { clearLocalChat() }
+        } message: { Text("不会撤回其他设备已收到的消息。此操作无法撤销。") }
         .alert("提示", isPresented: Binding(get: { featureNote != nil }, set: { if !$0 { featureNote = nil } })) {
             Button("好", role: .cancel) { featureNote = nil }
         } message: { Text(featureNote ?? "") }
@@ -311,7 +382,8 @@ struct ChatDetailView: View {
         }
         .onDisappear { privacyShield.setVisibleConversation(nil, protected: false) }
         .onChange(of: conversation?.requiresPrivacyShield) { _, _ in
-            chatUnlocked = false; draftLoaded = false; draft = ""; updateVisiblePrivacyShield()
+            chatUnlocked = false; draftLoaded = false; draft = ""; showingInfo = false
+            attachmentPreview = nil; updateVisiblePrivacyShield()
         }
         .onChange(of: messages.count) { _, _ in markVisibleRead() }
         .task(id: ExpirationTaskID(date: nextExpiration, canView: canViewChat)) {
@@ -327,11 +399,14 @@ struct ChatDetailView: View {
             do { try viewModel.saveDraft(value, in: conversation) } catch { featureNote = LumaError.message(for: error) }
         }
         .onChange(of: scenePhase) { _, phase in
-            if phase != .active { chatUnlocked = false; draftLoaded = false; draft = "" }
+            if phase != .active {
+                chatUnlocked = false; draftLoaded = false; draft = ""
+                if needsChatUnlock { showingInfo = false; showingSecurity = false; attachmentPreview = nil }
+            }
         }
-        .onChange(of: conversation?.requiresUnlock) { _, _ in chatUnlocked = false; draftLoaded = false; draft = "" }
-        .onChange(of: security.preferences.privacyModeEnabled) { _, _ in chatUnlocked = false; draftLoaded = false; draft = "" }
-        .onChange(of: security.preferences.privacyModeLockChats) { _, _ in chatUnlocked = false; draftLoaded = false; draft = "" }
+        .onChange(of: conversation?.requiresUnlock) { _, _ in chatUnlocked = false; draftLoaded = false; draft = ""; closePrivateContent() }
+        .onChange(of: security.preferences.privacyModeEnabled) { _, _ in chatUnlocked = false; draftLoaded = false; draft = ""; closePrivateContent() }
+        .onChange(of: security.preferences.privacyModeLockChats) { _, _ in chatUnlocked = false; draftLoaded = false; draft = ""; closePrivateContent() }
         .task(id: onlineMode) {
             guard onlineMode else { return }
             while !Task.isCancelled {
@@ -343,6 +418,10 @@ struct ChatDetailView: View {
 
     private func updateVisiblePrivacyShield() {
         privacyShield.setVisibleConversation(conversation?.id, protected: conversation?.requiresPrivacyShield == true)
+    }
+
+    private func closePrivateContent() {
+        if needsChatUnlock { showingInfo = false; showingSecurity = false; attachmentPreview = nil }
     }
 
     private var chatUnlockView: some View {
@@ -375,15 +454,24 @@ struct ChatDetailView: View {
             .font(.caption)
             .foregroundStyle(.secondary)
             .padding(.vertical, 8)
+            .accessibilityHint("查看此聊天的安全详情")
 
             ScrollViewReader { proxy in ScrollView {
                 LazyVStack(spacing: 12) {
+                    if messages.isEmpty {
+                        ContentUnavailableView("还没有消息", systemImage: "bubble.left.and.bubble.right",
+                            description: Text("发送一条消息，开始聊天。"))
+                            .padding(.top, 72)
+                    }
                     ForEach(messages) { message in
                         MessageRow(message: message,
-                                   content: viewModel.visibleContent(for: message),
+                                   content: message.deleted ? "消息已删除" : viewModel.visibleContent(for: message),
                                    reactions: allReactions.filter { $0.messageID == message.id }.map(\.emoji),
                                    showReadReceipts: security.preferences.readReceipts,
-                                   replyPreview: message.replyToID.map { id in messages.first(where: { $0.id == id }).map { viewModel.visibleContent(for: $0) } ?? "原消息不可用" },
+                                   replyPreview: message.replyToID.map { id in
+                                       guard let original = messages.first(where: { $0.id == id }) else { return "原消息不可用" }
+                                       return original.deleted ? "原消息已删除" : viewModel.visibleContent(for: original)
+                                   },
                                    onReplyTap: { if let id = message.replyToID { withAnimation { proxy.scrollTo(id, anchor: .center) } } },
                                    onOpen: { Task {
                                        do {
@@ -396,6 +484,7 @@ struct ChatDetailView: View {
                                        catch { featureNote = LumaError.message(for: error) }
                                    } })
                             .contextMenu {
+                                if !message.deleted {
                                 ForEach(["👍", "❤️", "😂", "‼️"], id: \.self) { emoji in
                                     Button(emoji) {
                                         if [3, 4].contains(message.transportEncryptionVersion ?? 0), let conversation {
@@ -410,26 +499,30 @@ struct ChatDetailView: View {
                                         }
                                     }
                                 }
-                                if message.type == .text && message.isMine {
-                                    Button { editing = message; editText = viewModel.visibleContent(for: message) } label: { Label("编辑", systemImage: "pencil") }
-                                }
+                                Button { replyTo = message; UIImpactFeedbackGenerator(style: .light).impactOccurred() } label: { Label("回复", systemImage: "arrowshape.turn.up.left") }
                                 if message.type == .text {
                                     Button {
                                         do { UIPasteboard.general.string = try viewModel.displayContent(for: message) }
                                         catch { featureNote = LumaError.message(for: error) }
                                     } label: { Label("复制", systemImage: "doc.on.doc") }
                                 }
-                                Button { replyTo = message } label: { Label("回复", systemImage: "arrowshape.turn.up.left") }
-                                Button { forwarding = message } label: { Label("转发", systemImage: "arrowshape.turn.up.right") }
+                                if message.type == .text && message.isMine {
+                                    Button { editing = message; editText = viewModel.visibleContent(for: message) } label: { Label("编辑", systemImage: "pencil") }
+                                }
                                 Button {
                                     do { try viewModel.setFavorite(message.isFavorite != true, for: message) }
                                     catch { featureNote = LumaError.message(for: error) }
                                 } label: { Label(message.isFavorite == true ? "取消收藏" : "收藏", systemImage: message.isFavorite == true ? "star.slash" : "star") }
                                 Button(role: .destructive) { deleting = message } label: { Label("删除", systemImage: "trash") }
+                                Menu { Button { forwarding = message } label: { Label("转发到本地聊天", systemImage: "arrowshape.turn.up.right") } }
+                                    label: { Label("更多", systemImage: "ellipsis") }
+                                }
                             }
                             .id(message.id)
+                            .transition(.opacity.combined(with: .move(edge: message.isMine ? .trailing : .leading)))
                     }
                 }
+                .animation(reduceMotion ? nil : .smooth(duration: 0.2), value: messageIDs)
                 .padding(.horizontal, 16)
                 .padding(.vertical, 12)
             } }
@@ -439,7 +532,7 @@ struct ChatDetailView: View {
             if let replyTo {
                 HStack {
                     Image(systemName: "arrowshape.turn.up.left")
-                    Text("回复：\(viewModel.visibleContent(for: replyTo))").lineLimit(1)
+                    Text("回复：\(replyTo.deleted ? "原消息已删除" : viewModel.visibleContent(for: replyTo))").lineLimit(1)
                     Spacer()
                     Button { self.replyTo = nil } label: { Image(systemName: "xmark.circle.fill") }
                 }
@@ -454,7 +547,9 @@ struct ChatDetailView: View {
                     .lineLimit(1...5)
                     .padding(.horizontal, 12).padding(.vertical, 8)
                     .background(.quaternary, in: RoundedRectangle(cornerRadius: 18))
-                if draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                if sendingAttachment {
+                    ProgressView().accessibilityLabel("正在处理附件")
+                } else if draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     Button { featureNote = "语音录制接口将在后续阶段接入。" } label: { Image(systemName: "waveform").font(.title3) }
                         .accessibilityLabel("语音")
                 } else {
@@ -480,6 +575,7 @@ struct ChatDetailView: View {
             guard let conversation else { featureNote = "请先建立本地聊天"; return }
             let text = draft
             sendingOnline = true
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
             Task {
                 defer { sendingOnline = false }
                 do {
@@ -491,6 +587,7 @@ struct ChatDetailView: View {
         }
         do {
             if try viewModel.sendText(draft, in: conversation, replyingTo: replyTo) {
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
                 draft = ""; replyTo = nil
             }
         } catch { featureNote = LumaError.message(for: error) }
@@ -511,8 +608,31 @@ struct ChatDetailView: View {
 
     private func sendAttachment(_ data: Data, name: String, type: MessageType) async throws {
         guard onlineMode, canViewChat, let conversation else { throw V4AttachmentError.invalidDescriptor }
+        sendingAttachment = true
+        defer { sendingAttachment = false }
         try await viewModel.sendOnlineAttachment(data, name: name, type: type,
             user: user, friend: friend, conversation: conversation)
+    }
+
+    private func clearLocalChat() {
+        let messageIDs = Set(messages.map(\.id))
+        guard !outgoingItems.contains(where: { messageIDs.contains($0.messageID) }),
+              !pendingEvents.contains(where: { messageIDs.contains($0.messageID) }) else {
+            featureNote = "仍有待同步内容，请等待发送完成后再清空本机记录。"
+            return
+        }
+        do {
+            for message in messages {
+                if message.deleted {
+                    // A remote deletion tombstone remains for sync, but clearing this device hides it.
+                    message.deletedForEveryone = false
+                } else {
+                    try viewModel.delete(message, forEveryone: false)
+                }
+            }
+            try context.save()
+            UINotificationFeedbackGenerator().notificationOccurred(.success)
+        } catch { featureNote = LumaError.message(for: error) }
     }
 
     private func delete(forEveryone: Bool) {
@@ -558,15 +678,23 @@ private struct MessageRow: View {
     var body: some View {
         HStack {
             if message.isMine { Spacer(minLength: 50) }
-            VStack(alignment: message.isMine ? .trailing : .leading, spacing: 3) {
-              VStack(alignment: .leading, spacing: 4) {
-                if let origin = message.forwardedFrom { Text(origin).font(.caption2).opacity(0.7) }
-                if let replyPreview {
-                    Button(action: onReplyTap) { Label("回复：\(replyPreview)", systemImage: "arrowshape.turn.up.left") }
+            VStack(alignment: message.isMine ? .trailing : .leading, spacing: 4) {
+              VStack(alignment: .leading, spacing: 5) {
+                if !message.deleted, let origin = message.forwardedFrom { Text(origin).font(.caption2).opacity(0.8) }
+                if !message.deleted, let replyPreview {
+                    Button(action: onReplyTap) {
+                        HStack(spacing: 7) {
+                            RoundedRectangle(cornerRadius: 2).frame(width: 3)
+                            Text("回复：\(replyPreview)").lineLimit(2).multilineTextAlignment(.leading)
+                        }
                         .font(.caption)
-                        .lineLimit(1)
-                        .opacity(0.75)
+                    }
+                    .buttonStyle(.plain)
+                    .opacity(0.8)
                 }
+                if message.deleted {
+                    Label("消息已删除", systemImage: "trash")
+                } else {
                 switch message.type {
                 case .text: Text(content)
                 case .image:
@@ -579,15 +707,23 @@ private struct MessageRow: View {
                     if message.transportEncryptionVersion == 4 { Button(action: onOpen) { Label("播放语音", systemImage: "waveform") } }
                     else { Label(content, systemImage: "waveform") }
                 }
-                if message.editedAt != nil { Text("（已编辑）").font(.caption2).opacity(0.7) }
-                if !reactions.isEmpty { Text(reactions.joined(separator: " ")).font(.caption) }
+                }
+                if !message.deleted && message.editedAt != nil { Text("已编辑").font(.caption2).opacity(0.75) }
               }
               .font(.body)
               .padding(.horizontal, 14).padding(.vertical, 9)
               .foregroundStyle(message.isMine ? Color.white : Color.primary)
               .background(message.isMine ? Color.blue : Color(uiColor: .secondarySystemFill), in: RoundedRectangle(cornerRadius: 18))
+              if !message.deleted && !reactions.isEmpty {
+                  Text(reactions.joined(separator: " "))
+                      .font(.caption)
+                      .padding(.horizontal, 8).padding(.vertical, 3)
+                      .background(Color(uiColor: .secondarySystemBackground), in: Capsule())
+                      .accessibilityLabel("回应：\(reactions.joined(separator: "、"))")
+              }
               HStack(spacing: 5) {
-                  if message.isMine {
+                  Text(message.timestamp, format: .dateTime.hour().minute())
+                  if message.isMine && !message.deleted {
                       switch message.deliveryStatus {
                       case .sending: Text("发送中")
                       case .failed: Button("发送失败 · 重试", action: onRetry)
@@ -598,7 +734,7 @@ private struct MessageRow: View {
                               Text("已读"); Text(date, format: .dateTime.hour().minute())
                           } else { Text("已发送") }
                       }
-                  } else { Text(message.timestamp, style: .time) }
+                  }
               }
               .font(.caption2).foregroundStyle(.secondary)
             }
@@ -654,6 +790,7 @@ private struct AttachmentPreviewView: View {
     let preview: AttachmentPreview
     @Environment(\.dismiss) private var dismiss
     @State private var exporting = false
+    @State private var imageZoomed = false
     @State private var player: AVAudioPlayer?
     @State private var errorMessage: String?
 
@@ -663,7 +800,14 @@ private struct AttachmentPreviewView: View {
                 switch preview.type {
                 case .image:
                     if let image = UIImage(data: preview.data) {
-                        ScrollView { Image(uiImage: image).resizable().scaledToFit() }
+                        ScrollView([.horizontal, .vertical]) {
+                            Image(uiImage: image)
+                                .resizable().scaledToFit()
+                                .scaleEffect(imageZoomed ? 1.6 : 1)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                                .onTapGesture { withAnimation(.smooth(duration: 0.25)) { imageZoomed.toggle() } }
+                                .accessibilityHint("轻点放大或缩小图片")
+                        }
                     } else { ContentUnavailableView("图片无法显示", systemImage: "photo.badge.exclamationmark") }
                 case .voice:
                     VStack(spacing: 16) {
@@ -696,7 +840,7 @@ private struct AttachmentPreviewView: View {
                       defaultFilename: preview.name) { result in
             if case .failure = result { errorMessage = "导出失败。" }
         }
-        .onDisappear { player?.stop(); player = nil }
+        .onDisappear { player?.stop(); player = nil; imageZoomed = false }
         .alert("附件", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
             Button("好", role: .cancel) { errorMessage = nil }
         } message: { Text(errorMessage ?? "") }
@@ -707,8 +851,8 @@ private struct ChatInfoView: View {
     let user: User
     let friend: Friend
     let conversation: Conversation?
-    let onlineMode: Bool
     @Binding var typingStatus: TypingStatus
+    let onClear: () -> Void
     @Environment(\.modelContext) private var context
     @Environment(SecurityManager.self) private var security
     @State private var errorMessage: String?
@@ -717,34 +861,128 @@ private struct ChatInfoView: View {
         NavigationStack {
             Form {
                 Section {
-                    HStack { Spacer(); AvatarView(name: security.friendDisplayName(friend, context: context), imageData: security.friendAvatar(friend, context: context)); Spacer() }
-                    LabeledContent("昵称", value: (try? security.friendProfile(friend, context: context).nickname) ?? "资料不可读取")
-                    LabeledContent("UserID", value: friend.userID)
+                    ProfileHeaderView(name: security.friendDisplayName(friend, context: context),
+                                      subtitle: "@\(friend.userID)",
+                                      imageData: security.friendAvatar(friend, context: context))
                 }
-                Section("聊天") {
+                Section {
+                    NavigationLink { FriendProfileView(friend: friend) } label: { Label("好友资料", systemImage: "person.crop.circle") }
                     if let conversation {
-                        Toggle("聊天锁", isOn: Binding(get: { conversation.requiresUnlock ?? false }, set: { conversation.requiresUnlock = $0; save() }))
-                        Toggle("敏感聊天保护", isOn: Binding(get: { conversation.requiresPrivacyShield ?? false }, set: { conversation.requiresPrivacyShield = $0; save() }))
+                        NavigationLink { LocalSearchView(user: user, conversationID: conversation.id) } label: {
+                            Label("搜索聊天内容", systemImage: "magnifyingglass")
+                        }
+                        NavigationLink { ChatAttachmentsView(user: user, conversation: conversation) } label: {
+                            Label("媒体与文件", systemImage: "photo.on.rectangle")
+                        }
                     }
-                    Toggle("演示正在输入状态", isOn: Binding(get: { typingStatus == .typing }, set: { typingStatus = $0 ? .typing : .idle }))
-                    Toggle("已读回执", isOn: Binding(get: { security.preferences.readReceipts }, set: { value in
-                        do { try security.updatePreferences(for: user, context: context) { $0.readReceipts = value } }
-                        catch { errorMessage = LumaError.message(for: error) }
-                    }))
                 }
-                Section { NavigationLink("好友资料与备注") { FriendProfileView(friend: friend) } }
-                Section { Text(onlineMode ?
-                    "在线文字以逐设备密文信封发送；本机继续加密保存。当前不是完整端到端加密协议。" :
-                    "消息内容在本机加密保存。此模式不会发送到其他设备。") }
+                if let conversation {
+                    Section("聊天") {
+                        Toggle("置顶聊天", isOn: Binding(get: { conversation.isPinned == true }, set: { value in
+                            let previous = conversation.isPinned
+                            conversation.isPinned = value
+                            do { try context.save() } catch {
+                                conversation.isPinned = previous
+                                errorMessage = LumaError.message(for: error)
+                            }
+                        }))
+                        Button {
+                            guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+                            UIApplication.shared.open(url)
+                        } label: { Label("系统通知设置", systemImage: "bell") }
+                        Toggle("聊天锁", isOn: Binding(get: { conversation.requiresUnlock ?? false }, set: { value in
+                            let previous = conversation.requiresUnlock
+                            conversation.requiresUnlock = value
+                            save(orRestore: { conversation.requiresUnlock = previous })
+                        }))
+                        Toggle("敏感聊天保护", isOn: Binding(get: { conversation.requiresPrivacyShield ?? false }, set: { value in
+                            let previous = conversation.requiresPrivacyShield
+                            conversation.requiresPrivacyShield = value
+                            save(orRestore: { conversation.requiresPrivacyShield = previous })
+                        }))
+                    }
+                    Section {
+                        Button("清空此设备聊天记录", role: .destructive) { onClear(); dismiss() }
+                        NavigationLink { FriendProfileView(friend: friend) } label: {
+                            Text("删除好友与本地聊天").foregroundStyle(.red)
+                        }
+                    } footer: {
+                        Text("清空仅作用于本机，不会撤回其他设备已收到的消息。")
+                    }
+                }
+                Section("本地演示") {
+                    Toggle("正在输入状态", isOn: Binding(get: { typingStatus == .typing }, set: { typingStatus = $0 ? .typing : .idle }))
+                }
             }
-            .navigationTitle("聊天信息")
+            .navigationTitle("聊天详情")
             .toolbar { Button("完成") { dismiss() } }
             .alert("保存失败", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
                 Button("好", role: .cancel) { errorMessage = nil }
             } message: { Text(errorMessage ?? "") }
         }
     }
-    private func save() { do { try context.save() } catch { errorMessage = LumaError.message(for: error) } }
+    private func save(orRestore restore: () -> Void) {
+        do { try context.save() }
+        catch { restore(); errorMessage = LumaError.message(for: error) }
+    }
+}
+
+private struct ChatAttachmentsView: View {
+    let user: User
+    let conversation: Conversation
+    @Environment(\.modelContext) private var context
+    @Environment(SecurityManager.self) private var security
+    @Query(sort: \Message.timestamp, order: .reverse) private var allMessages: [Message]
+    @State private var preview: AttachmentPreview?
+    @State private var loadingID: UUID?
+    @State private var errorMessage: String?
+
+    private var attachments: [Message] {
+        allMessages.filter { $0.conversationID == conversation.id && !$0.deleted && $0.type != .text }
+    }
+
+    var body: some View {
+        List {
+            if attachments.isEmpty {
+                ContentUnavailableView("还没有媒体或文件", systemImage: "photo.on.rectangle")
+            }
+            ForEach(attachments) { message in
+                Button {
+                    guard message.transportEncryptionVersion == 4 else { return }
+                    loadingID = message.id
+                    Task {
+                        defer { loadingID = nil }
+                        do {
+                            let result = try await ChatViewModel(context: context, security: security)
+                                .downloadOnlineAttachment(message, user: user)
+                            preview = AttachmentPreview(data: result.0, name: result.1, type: result.2)
+                        } catch { errorMessage = LumaError.message(for: error) }
+                    }
+                } label: {
+                    HStack(spacing: 12) {
+                        Image(systemName: message.type == .image ? "photo" : message.type == .voice ? "waveform" : "doc")
+                            .frame(width: 28)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(message.type == .image ? "图片" : message.type == .voice ? "语音" : "文件")
+                            Text(message.timestamp, format: .dateTime.year().month().day())
+                                .font(.caption).foregroundStyle(.secondary)
+                            if message.transportEncryptionVersion != 4 {
+                                Text("本地模拟附件不可预览").font(.caption2).foregroundStyle(.secondary)
+                            }
+                        }
+                        Spacer()
+                        if loadingID == message.id { ProgressView() }
+                    }
+                }
+                .disabled(message.transportEncryptionVersion != 4 || loadingID != nil)
+            }
+        }
+        .navigationTitle("媒体与文件")
+        .sheet(item: $preview) { AttachmentPreviewView(preview: $0) }
+        .alert("附件无法打开", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
+            Button("好", role: .cancel) { errorMessage = nil }
+        } message: { Text(errorMessage ?? "") }
+    }
 }
 
 private struct ChatSecurityView: View {
@@ -806,6 +1044,7 @@ private struct ChatSecurityView: View {
 
 private struct LocalSearchView: View {
     let user: User
+    var conversationID: UUID? = nil
     @Environment(\.modelContext) private var context
     @Environment(SecurityManager.self) private var security
     @Query private var friends: [Friend]
@@ -818,7 +1057,8 @@ private struct LocalSearchView: View {
     var body: some View {
         List {
             if query.isEmpty {
-                ContentUnavailableView("本地搜索", systemImage: "magnifyingglass", description: Text("搜索消息、文件名和好友备注。索引仅加密保存在本机。"))
+                ContentUnavailableView("本地搜索", systemImage: "magnifyingglass", description:
+                    Text(conversationID == nil ? "搜索消息、文件名和好友备注。索引仅加密保存在本机。" : "搜索这段聊天的消息与文件。"))
             } else if isSearching {
                 ProgressView("正在搜索")
             } else if results.isEmpty {
@@ -840,8 +1080,9 @@ private struct LocalSearchView: View {
             }
         }
         .searchable(text: $query, prompt: "搜索本机内容")
+        .onChange(of: query) { _, _ in results = [] }
         .onSubmit(of: .search) { performSearch() }
-        .navigationTitle("本地搜索")
+        .navigationTitle(conversationID == nil ? "本地搜索" : "搜索聊天")
         .alert("搜索失败", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
             Button("好", role: .cancel) { errorMessage = nil }
         } message: { Text(errorMessage ?? "") }
@@ -858,7 +1099,8 @@ private struct LocalSearchView: View {
         isSearching = true
         defer { isSearching = false }
         do {
-            results = try ChatViewModel(context: context, security: security).search(query, for: user)
+            let found = try ChatViewModel(context: context, security: security).search(query, for: user)
+            results = conversationID.map { id in found.filter { $0.conversationID == id } } ?? found
         } catch { errorMessage = LumaError.message(for: error) }
     }
 }

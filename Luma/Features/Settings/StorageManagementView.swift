@@ -2,8 +2,13 @@ import SwiftData
 import SwiftUI
 import UniformTypeIdentifiers
 
+enum StorageManagementMode {
+    case overview, backup, cache
+}
+
 struct StorageManagementView: View {
     let user: User
+    var mode: StorageManagementMode = .overview
     @Environment(SecurityManager.self) private var security
     @Environment(\.modelContext) private var context
     @Query private var friends: [Friend]
@@ -35,43 +40,52 @@ struct StorageManagementView: View {
 
     var body: some View {
         Form {
-            Section("本机用量") {
-                LabeledContent("消息", value: "\(ownedMessages.count) 条")
-                LabeledContent("图片", value: ByteCountFormatter.string(fromByteCount: Int64(imageBytes), countStyle: .file))
-                LabeledContent("文件", value: "0 B · 尚无真实附件")
-                LabeledContent("缓存", value: ByteCountFormatter.string(fromByteCount: Int64(cacheBytes), countStyle: .file))
-            }
-            Section("加密备份") {
-                SecureField("备份密码（至少 8 位）", text: $backupPassword)
-                Button("生成加密备份") { createBackup() }
-                    .disabled(backupPassword.count < 8 || busy)
-                if let backupURL {
-                    ShareLink(item: backupURL) { Label("导出 Luma Backup", systemImage: "square.and.arrow.up") }
+            if mode != .backup {
+                Section("本机用量") {
+                    LabeledContent("消息", value: "\(ownedMessages.count) 条")
+                    LabeledContent("头像图片", value: ByteCountFormatter.string(fromByteCount: Int64(imageBytes), countStyle: .file))
+                    LabeledContent("临时备份", value: ByteCountFormatter.string(fromByteCount: Int64(cacheBytes), countStyle: .file))
                 }
-                Button("从备份恢复") { showingImporter = true }
-                    .disabled(backupPassword.isEmpty || busy)
-                Text("备份使用独立密码加密，不含账号密码验证值、PIN、登录状态或 Keychain 私钥。恢复仅支持当前 UserID；含在线消息、未发送队列或在线同步进度时暂不允许恢复，以免丢失远端事件。")
-                    .font(.footnote).foregroundStyle(.secondary)
-                if cleanupStates.contains(where: { $0.ownerID == user.id && $0.operation == "backupRestore" && $0.dataCommitted && $0.state != "completed" }) {
-                    Button("继续完成恢复清理") {
-                        do {
-                            try BackupManager.resumeRestoreCleanup(for: user, context: context,
-                                encryption: security.encryptionService(),
-                                keychain: security.sessionManager(context: context).keychain)
-                            try security.reloadPreferences(for: user, context: context)
-                            notice = "恢复清理已完成"
-                        } catch { notice = LumaError.message(for: error) }
+            }
+            if mode == .backup {
+                Section {
+                    Label("备份你的 Luma 数据", systemImage: "externaldrive.badge.timemachine")
+                    Text("设置备份密码后，可创建或恢复本机数据。")
+                        .foregroundStyle(.secondary)
+                }
+                Section("加密备份") {
+                    SecureField("备份密码（至少 8 位）", text: $backupPassword)
+                    Button("创建备份") { createBackup() }
+                        .disabled(backupPassword.count < 8 || busy)
+                    if let backupURL {
+                        ShareLink(item: backupURL) { Label("导出 Luma 备份", systemImage: "square.and.arrow.up") }
+                    }
+                    Button("恢复备份") { showingImporter = true }
+                        .disabled(backupPassword.isEmpty || busy)
+                    NavigationLink("备份说明") { BackupDetailsView() }
+                    if cleanupStates.contains(where: { $0.ownerID == user.id && $0.operation == "backupRestore" && $0.dataCommitted && $0.state != "completed" }) {
+                        Button("继续完成恢复清理") {
+                            do {
+                                try BackupManager.resumeRestoreCleanup(for: user, context: context,
+                                    encryption: security.encryptionService(),
+                                    keychain: security.sessionManager(context: context).keychain)
+                                try security.reloadPreferences(for: user, context: context)
+                                notice = "恢复清理已完成"
+                            } catch { notice = LumaError.message(for: error) }
+                        }
                     }
                 }
             }
-            Section("缓存") {
-                Button("清理缓存") { clearCache() }
-                Text("仅清理由本页生成的临时加密备份文件；不会删除聊天、索引或密钥。")
-                    .font(.footnote).foregroundStyle(.secondary)
+            if mode == .cache {
+                Section("缓存") {
+                    Button("清理缓存") { clearCache() }
+                    Text("仅清理由本页生成的临时加密备份文件；不会删除聊天、索引或密钥。")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
             }
             if busy { ProgressView("正在处理") }
         }
-        .navigationTitle("存储管理")
+        .navigationTitle(mode == .overview ? "数据管理" : mode == .backup ? "备份与恢复" : "缓存管理")
         .fileImporter(isPresented: $showingImporter, allowedContentTypes: [.data]) { result in
             do {
                 let url = try result.get()
@@ -124,5 +138,19 @@ struct StorageManagementView: View {
             backupURL = nil
             notice = "缓存已清理"
         } catch { notice = LumaError.message(for: error) }
+    }
+}
+
+private struct BackupDetailsView: View {
+    var body: some View {
+        Form {
+            Section("保护方式") {
+                Text("备份使用独立密码加密，不含账号密码验证值、PIN、登录状态或 Keychain 私钥。")
+            }
+            Section("恢复范围") {
+                Text("仅支持恢复当前 UserID。含在线消息、未发送队列或在线同步进度时暂不允许恢复，以免丢失远端事件。")
+            }
+        }
+        .navigationTitle("备份说明")
     }
 }
