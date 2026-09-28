@@ -39,7 +39,13 @@ struct FriendsView: View {
                             .buttonStyle(.borderedProminent)
                     }
                 } else if visibleFriends.isEmpty {
-                    ContentUnavailableView.search(text: searchText)
+                    ContentUnavailableView {
+                        Label("没有找到好友", systemImage: "magnifyingglass")
+                    } description: {
+                        Text("试试其他昵称或 UserID。")
+                    } actions: {
+                        Button("清除搜索") { searchText = "" }
+                    }
                 } else {
                     ForEach(visibleFriends) { friend in
                         NavigationLink {
@@ -140,10 +146,10 @@ struct AddFriendView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("完成") { dismiss() } } }
             .alert("无法添加", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
-                Button("好", role: .cancel) { errorMessage = nil }
+                Button("确认", role: .cancel) { errorMessage = nil }
             } message: { Text(errorMessage ?? "") }
             .alert("扫码功能预留", isPresented: $showingScanner) {
-                Button("好", role: .cancel) { }
+                Button("确认", role: .cancel) { }
             } message: { Text("接入好友服务和二维码身份验证后启用。") }
         }
     }
@@ -152,7 +158,7 @@ struct AddFriendView: View {
         do {
             try viewModel.addLocalContact(owner: user, userID: id, nickname: name, security: security)
             dismiss()
-        } catch { errorMessage = error.localizedDescription }
+        } catch { errorMessage = LumaError.message(for: error) }
     }
 }
 

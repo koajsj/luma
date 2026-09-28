@@ -33,13 +33,13 @@ struct FriendProfileView: View {
                 LabeledContent("备注", value: (try? security.privateStore(context: context).remark(for: friend)).flatMap { $0.isEmpty ? nil : $0 } ?? "未设置")
                 Button {
                     do { remark = try security.privateStore(context: context).remark(for: friend); editingRemark = true }
-                    catch { errorMessage = error.localizedDescription }
+                    catch { errorMessage = LumaError.message(for: error) }
                 } label: { Label("修改备注", systemImage: "pencil") }
             }
             Section("隐私设置") {
                 Toggle("限制此好友的本地资料展示", isOn: Binding(get: { (try? security.friendProfile(friend, context: context).privacyRestricted) ?? false }, set: {
                     do { try security.privateStore(context: context).savePrivacyRestricted($0, for: friend) }
-                    catch { errorMessage = error.localizedDescription }
+                    catch { errorMessage = LumaError.message(for: error) }
                 }))
                 Text("仅保存在本机；不会通知对方或改变服务器权限。")
                     .font(.footnote).foregroundStyle(.secondary)
@@ -58,25 +58,26 @@ struct FriendProfileView: View {
                 if let date = presence?.lastSeenAt { LabeledContent("最后在线") { Text(date, style: .relative) } }
                 Button(presence?.onlineStatus == .online ? "模拟离线" : "模拟在线") {
                     do { try FriendsViewModel(context: context).setMockOnline(presence?.onlineStatus != .online, for: friend) }
-                    catch { errorMessage = error.localizedDescription }
+                    catch { errorMessage = LumaError.message(for: error) }
                 }
             }
-            Section { Button("删除好友及本地聊天", role: .destructive) { confirmingDelete = true } }
+            Section { Button("移除好友", role: .destructive) { confirmingDelete = true } }
         }
         .navigationTitle("好友资料")
         .alert("修改备注", isPresented: $editingRemark) {
             TextField("备注", text: $remark)
             Button("保存") {
                 do { try security.privateStore(context: context).saveRemark(remark, for: friend) }
-                catch { errorMessage = error.localizedDescription }
+                catch { errorMessage = LumaError.message(for: error) }
             }
             Button("取消", role: .cancel) { }
         } message: { Text("备注仅自己可见。") }
-        .confirmationDialog("删除好友及本机聊天记录？", isPresented: $confirmingDelete) {
-            Button("删除", role: .destructive) { deleteFriend() }
-        } message: { Text("此操作会删除这位好友的本地会话与消息，无法撤销。") }
+        .confirmationDialog("移除这位好友？", isPresented: $confirmingDelete) {
+            Button("移除好友", role: .destructive) { deleteFriend() }
+            Button("取消", role: .cancel) { }
+        } message: { Text("同时删除这位好友的本地聊天记录与会话，无法撤销；在线好友关系也会移除。") }
         .alert("操作失败", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
-            Button("好", role: .cancel) { errorMessage = nil }
+            Button("确认", role: .cancel) { errorMessage = nil }
         } message: { Text(errorMessage ?? "") }
     }
 
@@ -85,7 +86,7 @@ struct FriendProfileView: View {
             do {
                 try await FriendsViewModel(context: context).removeRemoteFriendIfNeeded(friend, security: security)
                 try deleteLocalFriend()
-            } catch { errorMessage = error.localizedDescription }
+            } catch { errorMessage = LumaError.message(for: error) }
         }
     }
 

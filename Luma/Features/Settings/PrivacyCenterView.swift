@@ -5,6 +5,35 @@ import UIKit
 
 struct PrivacyCenterView: View {
     let user: User
+
+    var body: some View {
+        Form {
+            Section("安全") {
+                NavigationLink { SecurityCenterView(user: user) } label: {
+                    Label("安全中心", systemImage: "checkmark.shield")
+                }
+                NavigationLink { PrivacyShieldView(user: user) } label: {
+                    Label("隐私护盾", systemImage: "hand.raised")
+                }
+                NavigationLink { PrivacyOptionsView(user: user) } label: {
+                    Label("隐私选项", systemImage: "slider.horizontal.3")
+                }
+            }
+            Section("账号与数据") {
+                NavigationLink { DeviceManagerView(user: user) } label: {
+                    Label("设备管理", systemImage: "iphone.gen3")
+                }
+                NavigationLink { StorageManagementView(user: user) } label: {
+                    Label("数据管理", systemImage: "externaldrive")
+                }
+            }
+        }
+        .navigationTitle("隐私与安全")
+    }
+}
+
+private struct SecurityCenterView: View {
+    let user: User
     @Environment(SecurityManager.self) private var security
     @Environment(\.modelContext) private var context
 
@@ -32,10 +61,8 @@ struct PrivacyCenterView: View {
             } footer: {
                 Text("仅反映本机状态；通信保护范围请查看安全报告。")
             }
-            Section("隐私与安全") {
-                NavigationLink("隐私选项") { PrivacyOptionsView(user: user) }
-                NavigationLink("隐私护盾") { PrivacyShieldView(user: user) }
-                NavigationLink("安全报告") { PrivacyReportView(user: user) }
+            Section {
+                NavigationLink("安全与隐私报告") { PrivacyReportView(user: user) }
             }
         }
         .navigationTitle("安全中心")
@@ -105,21 +132,20 @@ struct PrivacyOptionsView: View {
                 Toggle("消息预览", isOn: preference(\.messagePreviews))
                 Toggle("显示在线状态", isOn: preference(\.showOnlineStatus))
                 Toggle("显示最后上线时间", isOn: preference(\.showLastSeen))
-                Toggle("已读回执", isOn: preference(\.readReceipts))
             }
             Section { Text("设置仅保存在本机。当前在线状态仅供本机查看，不能代表好友的实时状态。") }
                 .font(.footnote).foregroundStyle(.secondary)
         }
         .navigationTitle("隐私选项")
         .alert("保存失败", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
-            Button("好", role: .cancel) { errorMessage = nil }
+            Button("确认", role: .cancel) { errorMessage = nil }
         } message: { Text(errorMessage ?? "") }
     }
 
     private func preference(_ keyPath: WritableKeyPath<PrivacyPreferences, Bool>) -> Binding<Bool> {
         Binding(get: { security.preferences[keyPath: keyPath] }, set: { value in
             do { try security.updatePreferences(for: user, context: context) { $0[keyPath: keyPath] = value } }
-            catch { errorMessage = error.localizedDescription }
+            catch { errorMessage = LumaError.message(for: error) }
         })
     }
 }
@@ -181,9 +207,9 @@ struct PrivacyReportView: View {
                     .font(.footnote).foregroundStyle(.secondary)
             }
             Section("隐私保护") {
-                status("隐私护盾", "可配置录屏遮罩与敏感聊天", "hand.raised")
                 status("聊天锁", "可按聊天启用 PIN / Face ID", "lock")
                 status("截图检测", security.preferences.screenshotAlerts ? "已开启 · 本机检测" : "已关闭", "camera.viewfinder")
+                status("录屏保护", security.preferences.effectiveScreenCaptureProtection ? "已开启" : "已关闭", "record.circle")
                 status("后台隐藏", security.preferences.hideInBackground ? "已开启" : "已关闭", "rectangle.on.rectangle.slash")
             }
             Section("当前限制") {
@@ -230,11 +256,6 @@ struct PrivacyShieldView: View {
                 Toggle(isOn: preference(\.hideInBackground)) {
                     settingLabel("后台隐藏", detail: "保护 App 切后台预览", symbol: "eye.slash")
                 }
-                NavigationLink {
-                    SensitiveChatsView(user: user)
-                } label: {
-                    settingLabel("敏感聊天保护", detail: "为指定聊天增加保护", symbol: "lock.bubble")
-                }
             } header: {
                 Text("隐私保护")
             } footer: {
@@ -243,7 +264,7 @@ struct PrivacyShieldView: View {
         }
         .navigationTitle("隐私护盾")
         .alert("保存失败", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
-            Button("好", role: .cancel) { errorMessage = nil }
+            Button("确认", role: .cancel) { errorMessage = nil }
         } message: { Text(errorMessage ?? "") }
     }
 
@@ -263,49 +284,7 @@ struct PrivacyShieldView: View {
 
     private func update(_ change: (inout PrivacyPreferences) -> Void) {
         do { try security.updatePreferences(for: user, context: context, change) }
-        catch { errorMessage = error.localizedDescription }
-    }
-}
-
-private struct SensitiveChatsView: View {
-    let user: User
-    @Environment(SecurityManager.self) private var security
-    @Environment(\.modelContext) private var context
-    @Query private var conversations: [Conversation]
-    @Query private var friends: [Friend]
-    @State private var errorMessage: String?
-
-    var body: some View {
-        Form {
-            Section {
-                let owned = conversations.filter { $0.ownerID == user.id }
-                if owned.isEmpty {
-                    ContentUnavailableView("还没有聊天", systemImage: "message")
-                }
-                ForEach(owned) { conversation in
-                    if let friend = friends.first(where: { $0.id == conversation.friendID }) {
-                        Toggle(security.friendDisplayName(friend, context: context), isOn: Binding(
-                            get: { conversation.requiresPrivacyShield == true },
-                            set: { value in
-                                let previous = conversation.requiresPrivacyShield
-                                conversation.requiresPrivacyShield = value
-                                do { try context.save() }
-                                catch {
-                                    conversation.requiresPrivacyShield = previous
-                                    errorMessage = LumaError.message(for: error)
-                                }
-                            }
-                        ))
-                    }
-                }
-            } footer: {
-                Text("开启后需再次解锁，并从本地搜索与收藏摘要中隐藏。通知预览控制待通知服务接入后生效。")
-            }
-        }
-        .navigationTitle("敏感聊天保护")
-        .alert("保存失败", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
-            Button("好", role: .cancel) { errorMessage = nil }
-        } message: { Text(errorMessage ?? "") }
+        catch { errorMessage = LumaError.message(for: error) }
     }
 }
 
@@ -337,10 +316,10 @@ struct DeviceManagerView: View {
                 device.deviceName = UIDevice.current.name
                 device.systemVersion = "\(UIDevice.current.systemName) \(UIDevice.current.systemVersion)"
                 device.lastActiveAt = .now
-                do { try context.save() } catch { errorMessage = error.localizedDescription }
+                do { try context.save() } catch { errorMessage = LumaError.message(for: error) }
             }
             .alert("设备记录保存失败", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
-                Button("好", role: .cancel) { errorMessage = nil }
+                Button("确认", role: .cancel) { errorMessage = nil }
             } message: { Text(errorMessage ?? "") }
     }
 }
@@ -366,10 +345,21 @@ private struct RegisteredDevicesView: View {
                 if loading {
                     ProgressView("正在读取设备")
                 } else if !connected {
-                    ContentUnavailableView("设备列表不可用", systemImage: "iphone.slash",
-                        description: Text("在线登录后可查看和撤销已登记设备。"))
+                    ContentUnavailableView {
+                        Label("设备列表不可用", systemImage: "iphone.slash")
+                    } description: {
+                        Text("在线登录后可查看和撤销已登记设备。")
+                    } actions: {
+                        NavigationLink("前往在线连接") { OnlineConnectionView(user: user) }
+                    }
                 } else if devices.allSatisfy({ $0.revokedAt != nil }) {
-                    ContentUnavailableView("暂无已登记设备", systemImage: "iphone")
+                    ContentUnavailableView {
+                        Label("暂无已登记设备", systemImage: "iphone")
+                    } description: {
+                        Text("刷新列表，查看新登记的设备。")
+                    } actions: {
+                        Button("刷新设备") { Task { await load() } }
+                    }
                 } else {
                     ForEach(devices.filter { $0.revokedAt == nil }) { device in
                         HStack {
@@ -380,7 +370,7 @@ private struct RegisteredDevicesView: View {
                             }
                             Spacer()
                             if device.id != currentID {
-                                Button("撤销", role: .destructive) { revoking = device }
+                                Button("撤销设备", role: .destructive) { revoking = device }
                                     .buttonStyle(.borderless)
                             }
                         }
@@ -418,7 +408,7 @@ private struct RegisteredDevicesView: View {
         .alert("设备操作失败", isPresented: Binding(
             get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } }
         )) {
-            Button("好", role: .cancel) { errorMessage = nil }
+            Button("确认", role: .cancel) { errorMessage = nil }
         } message: { Text(errorMessage ?? "") }
     }
 
@@ -466,14 +456,8 @@ struct UserProfileView: View {
                     save(); if errorMessage == nil { dismiss() }
                 }.disabled(!profileLoaded)
             }
-            Section("账号与安全") {
+            Section("账号") {
                 LabeledContent("UserID", value: user.userID)
-                NavigationLink { IdentitySettingsView(user: user) } label: {
-                    Label("安全验证", systemImage: "checkmark.shield")
-                }
-                NavigationLink { DeviceManagerView(user: user) } label: {
-                    Label("设备管理", systemImage: "iphone.gen3")
-                }
             }
         }
         .navigationTitle("我的资料")
@@ -482,7 +466,7 @@ struct UserProfileView: View {
                 let profile = try security.userProfile(user, context: context)
                 nickname = profile.nickname; bio = profile.bio ?? ""; avatar = profile.avatar
                 profileLoaded = true
-            } catch { errorMessage = error.localizedDescription }
+            } catch { errorMessage = LumaError.message(for: error) }
         }
         .onChange(of: selectedPhoto) { _, item in
             Task {
@@ -495,11 +479,11 @@ struct UserProfileView: View {
                     let renderer = UIGraphicsImageRenderer(size: size)
                     avatar = renderer.jpegData(withCompressionQuality: 0.75) { _ in image.draw(in: CGRect(origin: .zero, size: size)) }
                     save()
-                } catch { errorMessage = error.localizedDescription }
+                } catch { errorMessage = LumaError.message(for: error) }
             }
         }
         .alert("保存失败", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
-            Button("好", role: .cancel) { errorMessage = nil }
+            Button("确认", role: .cancel) { errorMessage = nil }
         } message: { Text(errorMessage ?? "") }
     }
     private func save() {
@@ -507,6 +491,7 @@ struct UserProfileView: View {
             try security.privateStore(context: context).saveProfile(
                 UserPrivateProfile(nickname: nickname, avatar: avatar,
                                    bio: bio.trimmingCharacters(in: .whitespacesAndNewlines)), for: user)
-        } catch { errorMessage = error.localizedDescription }
+            errorMessage = nil
+        } catch { errorMessage = LumaError.message(for: error) }
     }
 }

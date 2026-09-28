@@ -75,11 +75,11 @@ struct RootView: View {
             }
         }
         .alert("隐私提醒", isPresented: Binding(get: { privacyNotice != nil }, set: { if !$0 { privacyNotice = nil } })) {
-            Button("好", role: .cancel) { privacyNotice = nil }
+            Button("确认", role: .cancel) { privacyNotice = nil }
         } message: { Text(privacyNotice ?? "") }
-        .alert("启动或清理失败", isPresented: Binding(get: { security.startupError != nil }, set: { if !$0 { security.startupError = nil } })) {
-            Button("好", role: .cancel) { security.startupError = nil }
-        } message: { Text(security.startupError ?? "") }
+        .alert("暂时无法打开 Luma", isPresented: Binding(get: { security.startupError != nil }, set: { if !$0 { security.startupError = nil } })) {
+            Button("确认", role: .cancel) { security.startupError = nil }
+        } message: { Text("请重新打开应用。如果问题持续，请保留本机数据以便恢复。") }
     }
 
     private var shouldMask: Bool {

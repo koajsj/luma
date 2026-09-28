@@ -11,16 +11,13 @@ struct SettingsView: View {
                     NavigationLink { AccountSettingsView(user: user) } label: {
                         Label("账号", systemImage: "person.crop.circle")
                     }
-                    NavigationLink { PrivacySettingsView(user: user) } label: {
+                    NavigationLink { PrivacyCenterView(user: user) } label: {
                         Label("隐私与安全", systemImage: "hand.raised")
                     }
                     NavigationLink { ChatSettingsHomeView(user: user) } label: {
                         Label("聊天", systemImage: "bubble.left.and.bubble.right")
                     }
-                    NavigationLink { StorageSettingsHomeView(user: user) } label: {
-                        Label("存储", systemImage: "externaldrive")
-                    }
-                    NavigationLink { AboutSettingsView() } label: {
+                    NavigationLink { AboutLumaView() } label: {
                         Label("关于", systemImage: "info.circle")
                     }
                 }
@@ -37,6 +34,7 @@ private struct AccountSettingsView: View {
     @State private var showingDeleteAccount = false
     @State private var deletionPassword = ""
     @State private var errorMessage: String?
+    @State private var deletionError: String?
 
     var body: some View {
         Form {
@@ -57,13 +55,12 @@ private struct AccountSettingsView: View {
                 NavigationLink { UserIDDetailsView(userID: user.userID) } label: {
                     Label("我的 UserID", systemImage: "at")
                 }
-                NavigationLink { DeviceManagerView(user: user) } label: { Label("设备管理", systemImage: "iphone.gen3") }
                 NavigationLink { AccountAccessSettingsView(user: user) } label: { Label("登录与解锁", systemImage: "lock") }
             }
             Section("账号操作") {
                 Button("锁定应用") { security.lock() }
                 Button("退出登录", role: .destructive) {
-                    do { try security.logout() } catch { errorMessage = error.localizedDescription }
+                    do { try security.logout() } catch { errorMessage = LumaError.message(for: error) }
                 }
                 Button("删除本地账号", role: .destructive) { showingDeleteAccount = true }
             }
@@ -81,16 +78,19 @@ private struct AccountSettingsView: View {
                             try security.deleteAccount(password: deletionPassword, user: user, context: context)
                             deletionPassword = ""
                             showingDeleteAccount = false
-                        } catch { errorMessage = error.localizedDescription }
+                        } catch { deletionError = LumaError.message(for: error) }
                     }.disabled(deletionPassword.isEmpty)
                 }
-                .navigationTitle("删除账号")
+                .navigationTitle("删除本地账号")
                 .toolbar { Button("取消") { deletionPassword = ""; showingDeleteAccount = false } }
+                .alert("删除失败", isPresented: Binding(get: { deletionError != nil }, set: { if !$0 { deletionError = nil } })) {
+                    Button("确认", role: .cancel) { deletionError = nil }
+                } message: { Text(deletionError ?? "") }
             }
             .interactiveDismissDisabled()
         }
         .alert("设置失败", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
-            Button("好", role: .cancel) { errorMessage = nil }
+            Button("确认", role: .cancel) { errorMessage = nil }
         } message: { Text(errorMessage ?? "") }
     }
 }
@@ -111,63 +111,19 @@ private struct UserIDDetailsView: View {
     }
 }
 
-private struct PrivacySettingsView: View {
-    let user: User
-
-    var body: some View {
-        Form {
-            Section {
-                NavigationLink { PrivacyCenterView(user: user) } label: { Label("安全中心", systemImage: "checkmark.shield") }
-                NavigationLink { PrivacyShieldView(user: user) } label: { Label("隐私护盾", systemImage: "hand.raised") }
-                NavigationLink { PrivacyReportView(user: user) } label: { Label("安全报告", systemImage: "doc.text.magnifyingglass") }
-                NavigationLink { IdentitySettingsView(user: user) } label: { Label("身份验证", systemImage: "person.crop.circle.badge.checkmark") }
-                NavigationLink { PrivacyOptionsView(user: user) } label: { Label("隐私选项", systemImage: "slider.horizontal.3") }
-            }
-        }
-        .navigationTitle("隐私与安全")
-    }
-}
-
 private struct ChatSettingsHomeView: View {
     let user: User
 
     var body: some View {
         Form {
             Section {
-                NavigationLink { ChatPrivacySettingsView(user: user) } label: { Label("聊天设置", systemImage: "bubble.left.and.text.bubble.right") }
                 NavigationLink { ChatPrivacySettingsView(user: user, section: .receipts) } label: { Label("已读回执", systemImage: "checkmark.message") }
                 NavigationLink { ChatPrivacySettingsView(user: user, section: .retention) } label: { Label("自动销毁", systemImage: "timer") }
-                NavigationLink { ChatLockSettingsView(user: user) } label: { Label("聊天锁", systemImage: "lock.bubble") }
             }
+            Section { Text("单个聊天的锁定与敏感保护，请在该聊天的详情中设置。") }
+                .font(.footnote).foregroundStyle(.secondary)
         }
         .navigationTitle("聊天")
-    }
-}
-
-private struct StorageSettingsHomeView: View {
-    let user: User
-
-    var body: some View {
-        Form {
-            Section {
-                NavigationLink { StorageManagementView(user: user, mode: .overview) } label: { Label("数据管理", systemImage: "chart.bar") }
-                NavigationLink { StorageManagementView(user: user, mode: .backup) } label: { Label("备份与恢复", systemImage: "arrow.clockwise.icloud") }
-                NavigationLink { StorageManagementView(user: user, mode: .cache) } label: { Label("缓存管理", systemImage: "trash") }
-            }
-        }
-        .navigationTitle("存储")
-    }
-}
-
-private struct AboutSettingsView: View {
-    var body: some View {
-        Form {
-            Section {
-                NavigationLink { AboutLumaView() } label: { Label("关于 Luma", systemImage: "info.circle") }
-                NavigationLink { PrivacyExplanationView() } label: { Label("隐私说明", systemImage: "hand.raised") }
-            }
-        }
-        .navigationTitle("关于")
     }
 }
 
@@ -201,30 +157,30 @@ private struct AccountAccessSettingsView: View {
         .sheet(isPresented: $showingPassword) { PasswordEditor(user: user).interactiveDismissDisabled() }
         .sheet(isPresented: $showingPIN) { PINEditor().interactiveDismissDisabled() }
         .alert("设置失败", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
-            Button("好", role: .cancel) { errorMessage = nil }
+            Button("确认", role: .cancel) { errorMessage = nil }
         } message: { Text(errorMessage ?? "") }
     }
 }
 
 private enum ChatSettingsSection {
-    case all, receipts, retention
+    case receipts, retention
 }
 
 private struct ChatPrivacySettingsView: View {
     let user: User
-    var section: ChatSettingsSection = .all
+    var section: ChatSettingsSection
     @Environment(SecurityManager.self) private var security
     @Environment(\.modelContext) private var context
     @State private var errorMessage: String?
 
     var body: some View {
         Form {
-            if section != .retention {
+            if section == .receipts {
                 Section("消息状态") {
                     Toggle("已读回执", isOn: preference(\.readReceipts))
                 }
             }
-            if section != .receipts {
+            if section == .retention {
                 Section {
                     Picker("阅读后自动销毁", selection: Binding(
                         get: { security.preferences.autoDestroyHours },
@@ -241,16 +197,11 @@ private struct ChatPrivacySettingsView: View {
                 } header: { Text("消息保留") } footer: {
                     Text("计时仅影响本机消息记录，无法删除对方设备上已有的副本。")
                 }
-                if section == .all {
-                    Section("聊天保护") {
-                        NavigationLink("聊天锁") { ChatLockSettingsView(user: user) }
-                    }
-                }
             }
         }
-        .navigationTitle(section == .receipts ? "已读回执" : section == .retention ? "自动销毁" : "聊天设置")
+        .navigationTitle(section == .receipts ? "已读回执" : "自动销毁")
         .alert("保存失败", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
-            Button("好", role: .cancel) { errorMessage = nil }
+            Button("确认", role: .cancel) { errorMessage = nil }
         } message: { Text(errorMessage ?? "") }
     }
 
@@ -259,70 +210,6 @@ private struct ChatPrivacySettingsView: View {
             do { try security.updatePreferences(for: user, context: context) { $0[keyPath: keyPath] = value } }
             catch { errorMessage = LumaError.message(for: error) }
         })
-    }
-}
-
-private struct ChatLockSettingsView: View {
-    let user: User
-    @Environment(SecurityManager.self) private var security
-    @Environment(\.modelContext) private var context
-    @Query private var conversations: [Conversation]
-    @Query private var friends: [Friend]
-    @State private var errorMessage: String?
-
-    var body: some View {
-        Form {
-            Section {
-                let owned = conversations.filter { $0.ownerID == user.id }
-                if owned.isEmpty {
-                    ContentUnavailableView("还没有聊天", systemImage: "message")
-                }
-                ForEach(owned) { conversation in
-                    if let friend = friends.first(where: { $0.id == conversation.friendID }) {
-                        Toggle(security.friendDisplayName(friend, context: context), isOn: Binding(
-                            get: { conversation.requiresUnlock == true },
-                            set: { value in
-                                let previous = conversation.requiresUnlock
-                                conversation.requiresUnlock = value
-                                do { try context.save() }
-                                catch {
-                                    conversation.requiresUnlock = previous
-                                    errorMessage = LumaError.message(for: error)
-                                }
-                            }
-                        ))
-                    }
-                }
-            } footer: { Text("开启后进入该聊天需要再次验证 PIN 或 Face ID。") }
-        }
-        .navigationTitle("聊天锁")
-        .alert("保存失败", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
-            Button("好", role: .cancel) { errorMessage = nil }
-        } message: { Text(errorMessage ?? "") }
-    }
-}
-
-struct IdentitySettingsView: View {
-    let user: User
-    @Query private var friends: [Friend]
-    @Environment(SecurityManager.self) private var security
-    @Environment(\.modelContext) private var context
-
-    var body: some View {
-        List {
-            Section {
-                let candidates = friends.filter { $0.ownerID == user.id && $0.remoteUserID != nil }
-                if candidates.isEmpty {
-                    ContentUnavailableView("暂无可核对的在线好友", systemImage: "person.crop.circle.badge.questionmark")
-                }
-                ForEach(candidates) { friend in
-                    NavigationLink(security.friendDisplayName(friend, context: context)) { IdentityVerificationView(user: user, friend: friend) }
-                }
-            } footer: {
-                Text("与好友通过独立可信渠道比较安全码。身份密钥变化后需要重新核对。")
-            }
-        }
-        .navigationTitle("身份验证")
     }
 }
 
@@ -336,20 +223,6 @@ private struct AboutLumaView: View {
             }
         }
         .navigationTitle("关于 Luma")
-    }
-}
-
-private struct PrivacyExplanationView: View {
-    var body: some View {
-        Form {
-            Section("你的数据") {
-                Text("本地消息内容加密保存。在线服务仍可见传递消息所需的关系、时间及密文大小等信息。")
-            }
-            Section("隐私保护") {
-                Text("截图检测发生在截图之后，无法阻止截图。当前通信保护范围可在安全报告中查看。")
-            }
-        }
-        .navigationTitle("隐私说明")
     }
 }
 
@@ -376,11 +249,11 @@ private struct PasswordEditor: View {
                     guard newPassword.count >= 8 else { errorMessage = "新密码至少需要 8 位"; return }
                     guard newPassword == confirmation else { errorMessage = "两次输入的新密码不一致"; return }
                     do { try security.changePassword(old: oldPassword, new: newPassword, user: user, context: context); dismiss() }
-                    catch { errorMessage = error.localizedDescription }
+                    catch { errorMessage = LumaError.message(for: error) }
                 } }
             }
             .alert("无法修改", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
-                Button("好", role: .cancel) { errorMessage = nil }
+                Button("确认", role: .cancel) { errorMessage = nil }
             } message: { Text(errorMessage ?? "") }
         }
     }
@@ -407,11 +280,11 @@ private struct PINEditor: View {
                 ToolbarItem(placement: .topBarTrailing) { Button("保存") {
                     guard newPIN == confirmation else { errorMessage = "两次输入的新 PIN 不一致"; return }
                     do { try security.verifyPIN(oldPIN, context: context); try security.setPIN(newPIN, context: context); dismiss() }
-                    catch { errorMessage = error.localizedDescription }
+                    catch { errorMessage = LumaError.message(for: error) }
                 } }
             }
             .alert("无法修改", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
-                Button("好", role: .cancel) { errorMessage = nil }
+                Button("确认", role: .cancel) { errorMessage = nil }
             } message: { Text(errorMessage ?? "") }
         }
     }

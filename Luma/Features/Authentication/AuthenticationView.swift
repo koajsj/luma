@@ -39,7 +39,7 @@ struct AuthenticationView: View {
             }
             .navigationTitle(isRegistering ? "创建 Luma 账号" : "欢迎回来")
             .alert("无法继续", isPresented: Binding(get: { viewModel.errorMessage != nil }, set: { if !$0 { viewModel.errorMessage = nil } })) {
-                Button("好", role: .cancel) { viewModel.errorMessage = nil }
+                Button("确认", role: .cancel) { viewModel.errorMessage = nil }
             } message: { Text(viewModel.errorMessage ?? "") }
         }
     }
@@ -85,7 +85,7 @@ struct PINView: View {
             }
             .navigationTitle(isSetup ? "设置 PIN" : "解锁 Luma")
             .alert("无法解锁", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
-                Button("好", role: .cancel) { errorMessage = nil }
+                Button("确认", role: .cancel) { errorMessage = nil }
             } message: { Text(errorMessage ?? "") }
         }
     }
@@ -97,11 +97,11 @@ struct PINView: View {
                 try security.setPIN(pin, context: context)
             } else { try security.verifyPIN(pin, context: context) }
             pin = ""; confirmation = ""
-        } catch { pin = ""; errorMessage = error.localizedDescription }
+        } catch { pin = ""; errorMessage = LumaError.message(for: error) }
     }
 
     private func unlockWithFaceID() async {
         do { try await security.unlockWithBiometrics(context: context) }
-        catch { errorMessage = error.localizedDescription }
+        catch { errorMessage = LumaError.message(for: error) }
     }
 }

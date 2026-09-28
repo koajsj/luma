@@ -50,7 +50,13 @@ struct ChatListView: View {
                             .buttonStyle(.borderedProminent)
                     }
                 } else if visibleFriends.isEmpty {
-                    ContentUnavailableView.search(text: chatQuery)
+                    ContentUnavailableView {
+                        Label("没有找到聊天", systemImage: "magnifyingglass")
+                    } description: {
+                        Text("试试其他昵称或 UserID。")
+                    } actions: {
+                        Button("清除搜索") { chatQuery = "" }
+                    }
                 } else {
                     ForEach(visibleFriends) { friend in
                         NavigationLink {
@@ -132,7 +138,7 @@ struct ChatListView: View {
             .sheet(isPresented: $showingSearch) { NavigationStack { LocalSearchView(user: user) } }
             .sheet(isPresented: $showingFavorites) { NavigationStack { FavoriteMessagesView(user: user) } }
             .alert("操作失败", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
-                Button("好", role: .cancel) { errorMessage = nil }
+                Button("确认", role: .cancel) { errorMessage = nil }
             } message: { Text(errorMessage ?? "") }
         }
     }
@@ -189,6 +195,7 @@ struct ChatDetailView: View {
     @Query private var outgoingItems: [OutgoingMessageQueueItem]
     @Query private var pendingEvents: [V4PendingEvent]
     @State private var draft = ""
+    @FocusState private var composerFocused: Bool
     @State private var replyTo: Message?
     @State private var deleting: Message?
     @State private var confirmingClear = false
@@ -206,7 +213,7 @@ struct ChatDetailView: View {
     @State private var draftLoaded = false
     @State private var onlineMode = false
     @State private var sendingOnline = false
-    @State private var showingIdentityVerification = false
+    @State private var syncingOnline = false
     @State private var selectedAttachmentPhoto: PhotosPickerItem?
     @State private var showingPhotoPicker = false
     @State private var importingAttachment: MessageType = .file
@@ -259,12 +266,9 @@ struct ChatDetailView: View {
                                 Label(onlineMode ? "切换到本地聊天" : "切换到在线密文聊天",
                                       systemImage: onlineMode ? "iphone" : "network.badge.shield.half.filled")
                             }
-                            Button { showingIdentityVerification = true } label: {
-                                Label("安全验证", systemImage: "person.crop.circle.badge.checkmark")
-                            }
                             Button { Task { await syncOnline() } } label: {
                                 Label("同步线上消息", systemImage: "arrow.clockwise")
-                            }
+                            }.disabled(syncingOnline)
                         }
                     } label: { Image(systemName: "info.circle") }
                 }
@@ -312,14 +316,13 @@ struct ChatDetailView: View {
             }
         }
         .sheet(item: $attachmentPreview) { AttachmentPreviewView(preview: $0) }
-        .sheet(isPresented: $showingIdentityVerification) {
-            NavigationStack { IdentityVerificationView(user: user, friend: friend) }
-        }
         .sheet(isPresented: $showingInfo, onDismiss: {
             if clearRequested { clearRequested = false; confirmingClear = true }
         }) { ChatInfoView(user: user, friend: friend, conversation: conversation,
                          typingStatus: $typingStatus, onClear: { clearRequested = true }) }
-        .sheet(isPresented: $showingSecurity) { ChatSecurityView(user: user, friend: friend, onlineMode: onlineMode) }
+        .sheet(isPresented: $showingSecurity) {
+            ChatSecurityView(user: user, friend: friend, conversation: conversation, onlineMode: onlineMode)
+        }
         .sheet(item: $editing) { message in
             NavigationStack {
                 Form { TextField("编辑消息", text: $editText, axis: .vertical).lineLimit(3...8) }
@@ -358,18 +361,20 @@ struct ChatDetailView: View {
             }
         }
         .confirmationDialog("删除消息", isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } })) {
-            Button("删除自己", role: .destructive) { delete(forEveryone: false) }
+            Button("仅从本机删除", role: .destructive) { delete(forEveryone: false) }
             if deleting?.isMine == true {
-                Button([3, 4].contains(deleting?.transportEncryptionVersion ?? 0) ? "通知其他设备删除" : "删除双方（仅本地）",
+                Button([3, 4].contains(deleting?.transportEncryptionVersion ?? 0) ? "通知其他设备删除" : "在本机标记为已删除",
                        role: .destructive) { delete(forEveryone: true) }
             }
+            Button("取消", role: .cancel) { deleting = nil }
         } message: { Text([3, 4].contains(deleting?.transportEncryptionVersion ?? 0) ?
                           "服务器将发送删除事件；已下载副本不能保证物理擦除。" : "当前仅清理此设备的数据，不会影响其他设备。") }
         .confirmationDialog("清空此设备上的聊天记录？", isPresented: $confirmingClear) {
-            Button("清空本机记录", role: .destructive) { clearLocalChat() }
+            Button("清空聊天记录", role: .destructive) { clearLocalChat() }
+            Button("取消", role: .cancel) { }
         } message: { Text("不会撤回其他设备已收到的消息。此操作无法撤销。") }
         .alert("提示", isPresented: Binding(get: { featureNote != nil }, set: { if !$0 { featureNote = nil } })) {
-            Button("好", role: .cancel) { featureNote = nil }
+            Button("确认", role: .cancel) { featureNote = nil }
         } message: { Text(featureNote ?? "") }
         .onAppear {
             updateVisiblePrivacyShield()
@@ -448,7 +453,7 @@ struct ChatDetailView: View {
             Button { showingSecurity = true } label: {
                 HStack(spacing: 6) {
                     Image(systemName: "lock.shield")
-                    Text(friend.sessionStatus == "identityKeyChanged" ? "身份密钥已变化 · 需要重新验证" : "隐私保护已开启")
+                    Text("隐私保护已开启")
                 }
             }
             .font(.caption)
@@ -456,11 +461,29 @@ struct ChatDetailView: View {
             .padding(.vertical, 8)
             .accessibilityHint("查看此聊天的安全详情")
 
+            if friend.sessionStatus == "identityKeyChanged" {
+                Label("好友身份已变化，请前往好友资料重新核对", systemImage: "exclamationmark.shield")
+                    .font(.footnote)
+                    .foregroundStyle(.orange)
+                    .padding(.horizontal)
+            }
+
+            if syncingOnline {
+                ProgressView("正在同步消息")
+                    .font(.footnote)
+                    .padding(.horizontal)
+            }
+
             ScrollViewReader { proxy in ScrollView {
                 LazyVStack(spacing: 12) {
                     if messages.isEmpty {
-                        ContentUnavailableView("还没有消息", systemImage: "bubble.left.and.bubble.right",
-                            description: Text("发送一条消息，开始聊天。"))
+                        ContentUnavailableView {
+                            Label("还没有消息", systemImage: "bubble.left.and.bubble.right")
+                        } description: {
+                            Text("发送一条消息，开始聊天。")
+                        } actions: {
+                            Button("输入消息") { composerFocused = true }
+                        }
                             .padding(.top, 72)
                     }
                     ForEach(messages) { message in
@@ -544,6 +567,7 @@ struct ChatDetailView: View {
                 Button { showingActions = true } label: { Image(systemName: "plus.circle.fill").font(.title2) }
                     .accessibilityLabel("添加内容")
                 TextField("信息", text: $draft, axis: .vertical)
+                    .focused($composerFocused)
                     .lineLimit(1...5)
                     .padding(.horizontal, 12).padding(.vertical, 8)
                     .background(.quaternary, in: RoundedRectangle(cornerRadius: 18))
@@ -594,7 +618,9 @@ struct ChatDetailView: View {
     }
 
     private func syncOnline() async {
-        guard onlineMode, canViewChat else { return }
+        guard onlineMode, canViewChat, !syncingOnline else { return }
+        syncingOnline = true
+        defer { syncingOnline = false }
         do { _ = try await viewModel.syncOnline(user: user) }
         catch { featureNote = LumaError.message(for: error); onlineMode = false }
     }
@@ -842,7 +868,7 @@ private struct AttachmentPreviewView: View {
         }
         .onDisappear { player?.stop(); player = nil; imageZoomed = false }
         .alert("附件", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
-            Button("好", role: .cancel) { errorMessage = nil }
+            Button("确认", role: .cancel) { errorMessage = nil }
         } message: { Text(errorMessage ?? "") }
     }
 }
@@ -902,10 +928,7 @@ private struct ChatInfoView: View {
                         }))
                     }
                     Section {
-                        Button("清空此设备聊天记录", role: .destructive) { onClear(); dismiss() }
-                        NavigationLink { FriendProfileView(friend: friend) } label: {
-                            Text("删除好友与本地聊天").foregroundStyle(.red)
-                        }
+                        Button("清空聊天记录", role: .destructive) { onClear(); dismiss() }
                     } footer: {
                         Text("清空仅作用于本机，不会撤回其他设备已收到的消息。")
                     }
@@ -917,7 +940,7 @@ private struct ChatInfoView: View {
             .navigationTitle("聊天详情")
             .toolbar { Button("完成") { dismiss() } }
             .alert("保存失败", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
-                Button("好", role: .cancel) { errorMessage = nil }
+                Button("确认", role: .cancel) { errorMessage = nil }
             } message: { Text(errorMessage ?? "") }
         }
     }
@@ -932,6 +955,7 @@ private struct ChatAttachmentsView: View {
     let conversation: Conversation
     @Environment(\.modelContext) private var context
     @Environment(SecurityManager.self) private var security
+    @Environment(\.dismiss) private var dismiss
     @Query(sort: \Message.timestamp, order: .reverse) private var allMessages: [Message]
     @State private var preview: AttachmentPreview?
     @State private var loadingID: UUID?
@@ -944,7 +968,13 @@ private struct ChatAttachmentsView: View {
     var body: some View {
         List {
             if attachments.isEmpty {
-                ContentUnavailableView("还没有媒体或文件", systemImage: "photo.on.rectangle")
+                ContentUnavailableView {
+                    Label("还没有媒体或文件", systemImage: "photo.on.rectangle")
+                } description: {
+                    Text("此聊天的图片、语音和文件会显示在这里。")
+                } actions: {
+                    Button("返回聊天") { dismiss() }
+                }
             }
             ForEach(attachments) { message in
                 Button {
@@ -980,7 +1010,7 @@ private struct ChatAttachmentsView: View {
         .navigationTitle("媒体与文件")
         .sheet(item: $preview) { AttachmentPreviewView(preview: $0) }
         .alert("附件无法打开", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
-            Button("好", role: .cancel) { errorMessage = nil }
+            Button("确认", role: .cancel) { errorMessage = nil }
         } message: { Text(errorMessage ?? "") }
     }
 }
@@ -988,6 +1018,7 @@ private struct ChatAttachmentsView: View {
 private struct ChatSecurityView: View {
     let user: User
     let friend: Friend
+    let conversation: Conversation?
     let onlineMode: Bool
     @Environment(SecurityManager.self) private var security
     @Environment(\.modelContext) private var context
@@ -998,45 +1029,36 @@ private struct ChatSecurityView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("本地保护") {
-                    LabeledContent("本地加密", value: "已开启 · AES-GCM v1")
-                    LabeledContent("Master Key", value: "256 位 · Keychain")
-                    LabeledContent("Keychain", value: security.keychainStatus())
-                    LabeledContent("身份密钥", value: security.identityKeyStatus(for: user))
-                    LabeledContent("设备密钥", value: security.deviceKeyStatus(for: user, context: context))
+                Section("当前聊天") {
+                    LabeledContent("消息保护", value: onlineMode ? "在线密文传输基础" : "本机加密保存")
+                    LabeledContent("聊天锁", value: conversation?.requiresUnlock == true ? "已开启" : "未开启")
+                    LabeledContent("敏感聊天保护", value: conversation?.requiresPrivacyShield == true ? "已开启" : "未开启")
                 }
-                if friend.sessionStatus == "identityKeyChanged" {
-                    Section("身份警告") {
-                        Label("身份密钥已变化，需要重新验证", systemImage: "exclamationmark.shield")
-                        Text("在聊天信息菜单中核对好友身份指纹。核对前暂停在线发送和旧会话使用。")
-                            .font(.footnote).foregroundStyle(.secondary)
-                    }
-                }
-                Section("会话 · 本机模拟") {
-                    LabeledContent("Session", value: friend.sessionStatus == "identityKeyChanged" ||
+                Section("本机模拟会话") {
+                    LabeledContent("状态", value: friend.sessionStatus == "identityKeyChanged" ||
                                    friend.sessionStatus == "identityReverified" ? "旧会话已暂停" :
                                    security.localSessionStatus(for: user, friend: friend, context: context))
                         .id(statusRefresh)
-                    if security.localSessionStatus(for: user, friend: friend, context: context) == "未建立" ||
-                        friend.sessionStatus == "identityReverified" {
-                        Button(friend.sessionStatus == "identityReverified" ? "核验后重建本机模拟会话" : "建立本机模拟会话") {
+                    if friend.sessionStatus != "identityKeyChanged" &&
+                        (security.localSessionStatus(for: user, friend: friend, context: context) == "未建立" ||
+                         friend.sessionStatus == "identityReverified") {
+                        Button("建立本机模拟会话") {
                             do { try security.createLocalSession(for: user, friend: friend, context: context); statusRefresh.toggle() }
                             catch { errorMessage = LumaError.message(for: error) }
                         }
                     }
-                    LabeledContent("协议", value: "v2 会话加密基础")
-                    LabeledContent("端到端通信", value: onlineMode ? "v3 设备信封基础 · 未审计" : "本地模式未连接服务器")
                 }
-                Section {
-                    Text(onlineMode ?
-                        "在线文字对每个目标设备分别加密；身份指纹需要线下核对。尚无完整 Double Ratchet 或独立安全审计。" :
-                        "本地聊天继续使用 v1 加密。v2 是本机模拟会话；未启用线上端到端通信。")
+                Section("好友身份") {
+                    LabeledContent("验证状态", value: friend.sessionStatus == "identityKeyChanged" ? "身份已变化 · 需要重新验证" :
+                                   friend.identityFingerprint == nil ? "尚未核对" : "身份已记录 · 尚需人工核对")
                 }
+                Section { Text("核对安全码请前往好友资料。整体保护与技术说明位于设置的隐私与安全页面。") }
+                    .font(.footnote).foregroundStyle(.secondary)
             }
-            .navigationTitle("安全详情")
+            .navigationTitle("当前聊天安全")
             .toolbar { Button("完成") { dismiss() } }
             .alert("建立会话失败", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
-                Button("好", role: .cancel) { errorMessage = nil }
+                Button("确认", role: .cancel) { errorMessage = nil }
             } message: { Text(errorMessage ?? "") }
         }
     }
@@ -1062,7 +1084,13 @@ private struct LocalSearchView: View {
             } else if isSearching {
                 ProgressView("正在搜索")
             } else if results.isEmpty {
-                ContentUnavailableView.search(text: query)
+                ContentUnavailableView {
+                    Label("没有找到结果", systemImage: "magnifyingglass")
+                } description: {
+                    Text("试试其他关键词。受保护的聊天不会出现在结果中。")
+                } actions: {
+                    Button("清除搜索") { query = ""; results = [] }
+                }
             } else {
                 ForEach(results) { result in
                     if let friend = friend(for: result) {
@@ -1084,7 +1112,7 @@ private struct LocalSearchView: View {
         .onSubmit(of: .search) { performSearch() }
         .navigationTitle(conversationID == nil ? "本地搜索" : "搜索聊天")
         .alert("搜索失败", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
-            Button("好", role: .cancel) { errorMessage = nil }
+            Button("确认", role: .cancel) { errorMessage = nil }
         } message: { Text(errorMessage ?? "") }
     }
 
@@ -1096,12 +1124,17 @@ private struct LocalSearchView: View {
     }
 
     private func performSearch() {
+        let submittedQuery = query
         isSearching = true
-        defer { isSearching = false }
-        do {
-            let found = try ChatViewModel(context: context, security: security).search(query, for: user)
-            results = conversationID.map { id in found.filter { $0.conversationID == id } } ?? found
-        } catch { errorMessage = LumaError.message(for: error) }
+        Task { @MainActor in
+            await Task.yield()
+            guard query == submittedQuery else { isSearching = false; return }
+            defer { isSearching = false }
+            do {
+                let found = try ChatViewModel(context: context, security: security).search(submittedQuery, for: user)
+                results = conversationID.map { id in found.filter { $0.conversationID == id } } ?? found
+            } catch { errorMessage = LumaError.message(for: error) }
+        }
     }
 }
 
@@ -1109,6 +1142,7 @@ private struct FavoriteMessagesView: View {
     let user: User
     @Environment(\.modelContext) private var context
     @Environment(SecurityManager.self) private var security
+    @Environment(\.dismiss) private var dismiss
     @Query private var friends: [Friend]
     @Query private var conversations: [Conversation]
     @Query(sort: \Message.timestamp, order: .reverse) private var messages: [Message]
@@ -1121,7 +1155,15 @@ private struct FavoriteMessagesView: View {
     }
     var body: some View {
         List {
-            if favorites.isEmpty { ContentUnavailableView("没有收藏消息", systemImage: "star") }
+            if favorites.isEmpty {
+                ContentUnavailableView {
+                    Label("还没有收藏消息", systemImage: "star")
+                } description: {
+                    Text("长按消息即可收藏。受保护聊天的收藏不会在此显示。")
+                } actions: {
+                    Button("返回聊天") { dismiss() }
+                }
+            }
             ForEach(favorites) { message in
                 if let conversation = conversations.first(where: { $0.id == message.conversationID }),
                    let friend = friends.first(where: { $0.id == conversation.friendID }) {

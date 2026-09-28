@@ -112,7 +112,7 @@ struct IdentityVerificationView: View {
         }
         .alert("安全验证", isPresented: Binding(get: { errorMessage != nil },
             set: { if !$0 { errorMessage = nil } })) {
-                Button("好", role: .cancel) { errorMessage = nil }
+                Button("确认", role: .cancel) { errorMessage = nil }
             } message: { Text(errorMessage ?? "") }
     }
 

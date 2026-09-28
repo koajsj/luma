@@ -22,6 +22,6 @@ final class AuthenticationViewModel {
             password = ""
             confirmation = ""
             errorMessage = nil
-        } catch { errorMessage = error.localizedDescription }
+        } catch { errorMessage = LumaError.message(for: error) }
     }
 }

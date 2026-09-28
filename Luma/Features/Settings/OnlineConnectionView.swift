@@ -28,7 +28,7 @@ struct OnlineConnectionView: View {
                 if let registration {
                     LabeledContent("服务器", value: registration.baseURL.absoluteString)
                     LabeledContent("设备", value: registration.backendDeviceID.uuidString)
-                    LabeledContent("状态", value: hasTokens ? "已登录 · 可使用 v3 文字模式" : "需要设备登录")
+                    LabeledContent("状态", value: hasTokens ? "已登录 · 可在聊天中选择在线模式" : "需要设备登录")
                     if !hasTokens { Button("设备签名登录") { run { try await login() } } }
                     else { Button("退出服务器会话") { run { try await signOut() } } }
                 } else {
@@ -53,7 +53,7 @@ struct OnlineConnectionView: View {
                             }
                             Spacer()
                             if device.id == registration?.backendDeviceID { Text("当前设备").foregroundStyle(.secondary) }
-                            else { Button("撤销", role: .destructive) { revokingDevice = device } }
+                            else { Button("撤销设备", role: .destructive) { revokingDevice = device } }
                         }
                     }
                 }
@@ -135,7 +135,7 @@ struct OnlineConnectionView: View {
             }
         }
         .alert("在线操作失败", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
-            Button("好", role: .cancel) { errorMessage = nil }
+            Button("确认", role: .cancel) { errorMessage = nil }
         } message: { Text(errorMessage ?? "") }
     }
 
