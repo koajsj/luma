@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.local.example
+*.pem
+*.key
+*.p8
+*.p12
+*.crt
+*.log
+*.sqlite*
+*.db
+local-data/
+local-certs/

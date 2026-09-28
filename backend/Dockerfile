@@ -15,5 +15,8 @@ RUN chmod 0755 /app /app/luma \
     && find /app/migrations -type f -exec chmod 0644 {} + \
     && chown -R root:root /app/luma /app/migrations
 USER luma
+# Fail the image build if the runtime user cannot read any migration.
+RUN set -eu; test -x /app/luma; test -r /app/migrations/001_init.sql; \
+    for file in /app/migrations/*.sql; do test -r "$file"; done
 EXPOSE 8080
 CMD ["/app/luma"]
