@@ -11,12 +11,12 @@ services:
       # Only the private Docker network can reach this HTTP listener; Caddy terminates public TLS.
       LUMA_ALLOW_INSECURE_LOCAL: "true"
       DATABASE_URL: "postgres://luma:${POSTGRES_PASSWORD}@postgres:5432/luma?sslmode=disable"
-      REDIS_URL: "redis://redis:6379/0"
+      REDIS_URL: "redis://:${REDIS_PASSWORD:?Set REDIS_PASSWORD}@redis:6379/0"
       LUMA_USERID_HMAC_SECRET: ${LUMA_USERID_HMAC_SECRET:?Set a persistent 32-byte hex UserID HMAC secret}
       LOCAL_STORAGE_DIR: /app/storage
       MIGRATIONS_DIR: /app/migrations
     volumes:
-      - ${LUMA_STORAGE_DIR:-/opt/luma/data/storage}:/app/storage
+      - /opt/luma/data/storage:/app/storage
     depends_on:
       postgres: {condition: service_healthy}
       redis: {condition: service_healthy}
@@ -36,7 +36,7 @@ services:
       POSTGRES_USER: luma
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the private env file}
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - /opt/luma/data/postgres:/var/lib/postgresql/data
     networks: [private]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U luma -d luma"]
@@ -47,7 +47,12 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    environment:
+      REDISCLI_AUTH: ${REDIS_PASSWORD:?Set REDIS_PASSWORD}
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    volumes:
+      - /opt/luma/data/redis:/data
+      - /opt/luma/config/redis.conf:/usr/local/etc/redis/redis.conf:ro
     networks: [private]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -63,8 +68,7 @@ services:
       - "443:443"
       - "443:443/udp"
     environment:
-      LUMA_DOMAIN: ${LUMA_DOMAIN:?Set LUMA_DOMAIN in the private env file}
-      ACME_EMAIL: ${ACME_EMAIL:?Set ACME_EMAIL in the private env file}
+      LUMA_SITE: ${LUMA_SITE:?Set LUMA_SITE in the private env file}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
@@ -79,6 +83,5 @@ networks:
   edge:
 
 volumes:
-  pgdata:
   caddy_data:
   caddy_config:

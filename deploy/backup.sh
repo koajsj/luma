@@ -1,24 +1,30 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 umask 077
-
-APP_DIR=/opt/luma/app
-ENV_FILE=/opt/luma/config/.env
-COMPOSE_FILE="$APP_DIR/deploy/docker-compose.yml"
-STORAGE_DIR=/opt/luma/data/storage
-BACKUP_DIR=/opt/luma/backups
-[[ -f "$ENV_FILE" && -d "$APP_DIR/.git" && -d "$STORAGE_DIR" ]] || { echo '部署目录不完整。' >&2; exit 1; }
-[[ $(sed -n 's/^LUMA_STORAGE_DIR=//p' "$ENV_FILE" | head -1) == "$STORAGE_DIR" ]] || {
-    echo '存储目录与备份脚本不一致，停止备份。' >&2; exit 1;
-}
+source "$(dirname "$0")/lib.sh"
+require_install
+lock_operation
+[[ -d "$STORAGE_DIR" ]] || die '密文目录不存在。'
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 target="$BACKUP_DIR/$stamp.partial"
 complete="$BACKUP_DIR/$stamp"
+[[ ! -e "$target" && ! -e "$complete" ]] || die '本秒已有备份，请稍后重试。'
 mkdir -m 0700 "$target"
-sudo docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" exec -T postgres \
-    pg_dump -U luma -d luma -Fc > "$target/postgres.dump"
-sudo tar -C /opt/luma/data -czf "$target/storage.tar.gz" storage
-sudo chown "$(id -u):$(id -g)" "$target/storage.tar.gz"
-chmod 600 "$target/postgres.dump" "$target/storage.tar.gz"
+restart_after_failure() {
+    rm -rf "$target"
+    compose up -d --wait >/dev/null || printf '备份失败后服务重启也失败，请检查 luma status。\n' >&2
+}
+trap restart_after_failure ERR
+compose stop backend caddy
+compose exec -T postgres pg_dump -U luma -d luma -Fc > "$target/postgres.dump"
+root tar -C /opt/luma/data --exclude='storage/ciphertext/.upload-*' -czf "$target/storage.tar.gz" storage
+root chown "$(id -u):$(id -g)" "$target/storage.tar.gz"
+git -C "$APP_DIR" rev-parse HEAD > "$target/VERSION"
+printf '%s' "$(env_value LUMA_USERID_HMAC_SECRET)" | sha256sum | awk '{print $1}' > "$target/KEY_ID"
+(cd "$target" && sha256sum postgres.dump storage.tar.gz VERSION KEY_ID > SHA256SUMS)
+chmod 600 "$target"/*
 mv "$target" "$complete"
-printf '备份完成：%s\n请将备份安全复制到 VPS 之外；不要提交到 Git。\n' "$complete"
+compose up -d --wait >/dev/null
+trap - ERR
+printf '备份完成：%s\n' "$complete"
+printf '包含数据库、密文文件、代码版本与校验；不包含私有 .env。迁移服务器还需安全转移原 .env。\n'

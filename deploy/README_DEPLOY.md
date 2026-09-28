@@ -1,87 +1,63 @@
-# Luma Backend：Ubuntu VPS 部署
+# Luma 自托管部署与维护
 
-此方案把后端、PostgreSQL、Redis 和 Caddy 部署到一台 Ubuntu 22.04/24.04 VPS。公网只开放 Caddy 的 80/443；后端、数据库和 Redis 只在 Docker 私有网络内通信。Caddy 自动申请 HTTPS 证书并代理 WebSocket。上传文件由客户端先加密，再写入 VPS 的 `/opt/luma/data/storage/ciphertext`。**服务端仍能看到账号和通信元数据；这份部署配置不代表完成 E2EE 安全验收。**
+> 状态：部署脚本已提供。生产 VPS 的首次安装、HTTPS、WebSocket、文件上传和恢复仍需在实际 Ubuntu 服务器上验收。本指南不代表 v4 E2EE 或生产安全审计已经完成。
 
 ## 准备
 
-1. 一台可使用 `sudo` 的 Ubuntu 22.04/24.04 VPS，建议至少 2 GiB 内存、足够的持久磁盘和已配置的 SSH 密钥。
-2. 一个域名，例如 `api.example.com`。在域名服务商处添加 A 记录指向 VPS 公网 IPv4；如配置 AAAA，IPv6 也必须指向此 VPS。等待 DNS 生效。
-3. 云平台防火墙放行 TCP 22、80、443；需要 HTTP/3 时再放行 UDP 443。不要对公网开放 8080、5432、6379。
-4. GitHub 仓库 `https://github.com/koajsj/luma.git` 可访问。私有仓库需预先给服务器配置只读 Git 凭据；脚本不会管理 GitHub 凭据。
+- Ubuntu 22.04 或 24.04 VPS；建议至少 2 GiB 内存和持久磁盘。使用有 sudo 权限的账号登录。
+- 云防火墙只开放 SSH 22、HTTP 80、HTTPS 443；需要 HTTP/3 时可另开放 UDP 443。PostgreSQL、Redis 和后端 8080 **不开放公网端口**。
+- 可选域名：先将 A 记录指向 VPS 公网 IPv4；若有 AAAA，IPv6 也必须指向这台 VPS。Caddy 会自动申请和续期 HTTPS 证书，不要求邮箱。
+- GitHub 仓库当前必须可从 VPS 访问。安装脚本会安装 Git、Docker Engine、Compose、curl 和 OpenSSL；发现冲突的 Docker 套件时停止，不会清理现有容器。
 
-## 首次部署
+## 一条命令首次安装
 
-在自己的电脑上用 SSH 登录 VPS：
-
-```bash
-ssh ubuntu@YOUR_VPS_IP
-```
-
-在 VPS 上执行：
+SSH 登录 VPS 后执行：
 
 ```bash
-git clone https://github.com/koajsj/luma.git luma-setup
-cd luma-setup
-bash deploy/deploy.sh
+curl -fsSL https://raw.githubusercontent.com/koajsj/luma/main/deploy/install.sh | bash
 ```
 
-首次运行会检查 Ubuntu、安装 Git/Docker/Compose，把 `main` 克隆到 `/opt/luma/app`，创建 `/opt/luma/data/storage`、`/opt/luma/backups` 和权限为 600 的 `/opt/luma/config/.env`。交互输入 API 域名和证书通知邮箱；数据库密码和 UserID 索引 HMAC 密钥分别由 `openssl` 随机生成，不输出到终端。无人值守时可先设置 `LUMA_DOMAIN` 与 `ACME_EMAIL` 环境变量。已有 `.env` 不会被覆盖。示例字段见 [.env.example](.env.example)；不要把真实 `.env` 放进仓库。更新和恢复时必须沿用原 HMAC 密钥；密钥不匹配会阻止服务启动。
+脚本仅询问是否使用域名；选择使用域名时再输入域名。也可预先设置 `LUMA_DOMAIN=api.example.com`。不配置域名则进入 **IP 测试模式**，使用 `http://VPS_IP`；此模式没有 TLS，**不得用于真实用户、设备凭据或互联网公开服务**。正式使用前执行 `luma domain change`。
 
-Docker 使用[官方 Ubuntu apt 仓库](https://docs.docker.com/engine/install/ubuntu/)安装；若服务器已有冲突的 Docker 套件，脚本会停止，以免影响其他容器。
+脚本克隆 main 到 `/opt/luma/app`，创建 `/opt/luma/data/postgres`、`redis`、`storage` 和 `/opt/luma/backups`，生成权限为 600 的 `/opt/luma/config/.env`。数据库、Redis 和 UserID HMAC 密钥由系统随机数生成，**不会输出到终端或提交到 Git**。`LUMA_JWT_SECRET` 仅为未来 JWT 预留；当前后端使用数据库支持的不透明 Token，不能把此变量描述为当前认证密钥。
 
-脚本运行 `docker compose up -d --build --wait`。后端连接数据库后会按顺序执行 `backend/migrations`，再提供 `/health`。DNS 与 80/443 可用后，检查：
+服务由 Docker Compose 启动：PostgreSQL、Redis、Go Backend、Caddy。后端启动时自动运行版本化 PostgreSQL migration；Caddy 代理普通 HTTP 和 WebSocket。Redis 仅保存可重建的短期状态，不写持久化快照。客户端先加密附件，再上传到 `/opt/luma/data/storage/ciphertext`。服务器仍可见账号、设备、时间、大小等元数据。
 
-```bash
-curl -fsS https://api.example.com/health
-sudo docker compose --env-file /opt/luma/config/.env -f /opt/luma/app/deploy/docker-compose.yml ps
-```
+域名模式健康地址为 `https://你的域名/health`；IP 测试模式为 `http://VPS_IP/health`。正常结果为 `{"status":"ok"}`。WebSocket 地址为相同域名下的 `wss://你的域名/v1/ws`，需要有效设备认证；未经认证的直接访问被拒绝是预期行为。
 
-正常健康接口返回 `{"status":"ok"}`。WebSocket 地址为 `wss://api.example.com/v1/ws`，需要有效设备认证，不能用无凭据的浏览器访问来判断故障。iOS 的在线模式在设置页输入 `https://api.example.com`；本地模式不受影响。开发环境可继续使用 Xcode 的 `LUMA_DEV_API_URL`，客户端没有硬编码生产地址。
+## 日常管理
 
-## 日常维护
+安装完成后可执行：
 
-更新前自动备份，然后快进拉取 `main`、重新构建并等待健康：
+| 命令 | 用途 |
+| --- | --- |
+| `luma status` | 查看容器和 HTTP 健康状态 |
+| `luma logs` | 查看最近 100 行后端日志；`luma logs caddy` 查看代理日志 |
+| `luma update` | 先备份，拉取 main，重建并检查健康；失败时恢复旧代码、数据库和文件 |
+| `luma backup` | 备份 PostgreSQL、密文目录、代码版本和 SHA-256 校验清单 |
+| `luma restore /opt/luma/backups/时间戳` | 校验后交互确认，替换数据库和密文目录 |
+| `luma domain change [新域名]` | 修改域名、启动 Caddy、检查 HTTPS；失败时恢复旧配置 |
+| `luma rollback [备份目录]` | 确认后先备份当前版本，再恢复较早的代码与对应数据 |
 
-```bash
-bash /opt/luma/app/deploy/update.sh
-```
+备份存在 `/opt/luma/backups`，不自动删除。请监控磁盘，并定期将备份加密复制到 VPS 之外。备份的 `KEY_ID` 是 HMAC 密钥的 SHA-256 标识，不含密钥本身，用来阻止错误密钥恢复。备份期间脚本会短暂停止后端与 Caddy，以固定数据库和密文目录；数据库与文件系统仍不是跨系统原子事务，故备份前应等待大文件上传完成。回滚使用备份的 PostgreSQL 数据覆盖当前数据库，**备份之后产生的数据会丢失**；更新前与手动回滚前都会先保存当前备份。
 
-手动备份数据库与密文目录：
+恢复要求备份的 `VERSION` 是当前 main 的祖先提交；若不同，脚本先切回备份对应代码，再恢复数据库与密文目录。不能只回退容器而保留更新后的数据库 schema。恢复使用 `SHA256SUMS` 检查数据完整性；该校验不提供真实性保证，只从可信来源导入备份。恢复前将当前备份另外复制到安全位置，确认操作会替换当前数据。
 
-```bash
-bash /opt/luma/app/deploy/backup.sh
-```
+## 更换服务器
 
-备份写入 `/opt/luma/backups/<UTC时间>/`，包含 `postgres.dump` 和 `storage.tar.gz`，**不包含** `.env` 或 HMAC 密钥。两份数据文件必须一起保管，建议加密后复制到 VPS 之外；运维需在独立的密钥管理系统中保管原 HMAC 密钥，以供恢复时重新注入环境。当前备份不是数据库与文件系统的原子快照，重要恢复前应暂停写入并再备份一次。备份不会自动清理，需监控磁盘。不要提交备份到 Git。
+1. 旧 VPS 上执行 `luma backup`，安全保存完整备份目录。
+2. 新 VPS 运行安装命令，使用新的数据库和 Redis 密码。
+3. 将备份目录复制到新 VPS 的 `/opt/luma/backups`。**另行安全转移**旧 VPS 的 `/opt/luma/config/.env`，在新 VPS 上暂存为 `/opt/luma/config/old.env`，权限设为 600。备份不包含它；原 UserID HMAC 密钥与数据库必须成对保留。不要发在聊天、工单或 Git 中。
+4. 运行 `luma restore /opt/luma/backups/时间戳 /opt/luma/config/old.env`。脚本只导入原 UserID HMAC 密钥，保留新服务器自动生成的数据库和 Redis 密码，并切回相容的备份代码版本。核对健康、账号、消息和附件后，安全移除暂存的旧配置。旧服务器确认停用后再切换 DNS，避免双端同时写入。
 
-查看状态和日志（日志不要复制到公开渠道）：
+若新 VPS 的本地仓库没有备份对应提交，或备份提交不是当前 main 的祖先，恢复会停止，不会猜测 schema 兼容性。恢复完成后可按顺序执行 `luma update`。
 
-```bash
-sudo docker compose --env-file /opt/luma/config/.env -f /opt/luma/app/deploy/docker-compose.yml ps
-sudo docker compose --env-file /opt/luma/config/.env -f /opt/luma/app/deploy/docker-compose.yml logs --tail=100 backend caddy
-```
+## 常见问题与安全边界
 
-## 恢复
-
-先在隔离环境演练，再对真实 VPS 操作。确认备份可信且版本兼容，保留当前数据的另一份离线副本；数据库迁移没有自动回滚。
-
-```bash
-COMPOSE=/opt/luma/app/deploy/docker-compose.yml
-ENV=/opt/luma/config/.env
-BACKUP=/opt/luma/backups/YYYYMMDDTHHMMSSZ
-sudo docker compose --env-file "$ENV" -f "$COMPOSE" stop backend
-sudo docker compose --env-file "$ENV" -f "$COMPOSE" exec -T postgres pg_restore -U luma -d luma --clean --if-exists --no-owner < "$BACKUP/postgres.dump"
-sudo tar -C /opt/luma/data -xzf "$BACKUP/storage.tar.gz"
-sudo chown -R 10001:10001 /opt/luma/data/storage
-sudo docker compose --env-file "$ENV" -f "$COMPOSE" up -d --wait
-curl -fsS https://api.example.com/health
-```
-
-恢复会替换同路径文件并可能保留备份后新增的密文文件。请在隔离环境核对数据库、附件与账号后再开放服务；不要盲目恢复到比备份更旧的代码版本。
-
-## 常见故障
-
-- `HTTPS 健康检查失败`：核对 DNS、云防火墙 80/443、Caddy 日志与证书申请限制。不要绕过证书校验。
-- `backend unhealthy`：查看后端日志与 PostgreSQL/Redis 状态；迁移失败时不要重复手改数据库，先备份并检查具体迁移。
-- `permission denied`：检查 `/opt/luma/data/storage` 是否由 UID 10001 拥有；不要把目录改成全员可写。
-- 数据库密码、域名变更：编辑 `/opt/luma/config/.env`，保持权限 600。**已有 PostgreSQL 数据卷不会因为修改 `POSTGRES_PASSWORD` 而自动改密码**，应按数据库维护流程单独变更。
+- HTTPS 失败：检查 DNS、80/443、Caddy 日志和证书申请限制。不要关闭 TLS 校验。
+- Backend 不健康：检查 PostgreSQL、Redis、migration 日志。不要在缺少数据库备份时手工修改 schema。
+- 存储权限失败：密文目录应由容器 UID 10001 持有。不要改成全员可写。
+- `.env` 不进入 Git，且必须保持 600；更新和恢复时不要重置 UserID HMAC 密钥。Docker 管理员可读取容器环境与密文数据，应限制服务器 root 和 Docker 权限。
+- 如曾使用旧版 `luma_pgdata` 命名卷，脚本发现新 PostgreSQL 目录为空时会停止，避免启动空数据库。先对旧卷做独立备份并迁移数据；不要直接删除旧卷。
+- 部署日志不得主动输出 Token、私钥、消息正文或附件内容；不要把实际日志贴到公开渠道。
+- 当前没有 APNs 正式推送、生产双真机验收或独立安全审计。应用安全状态仍以客户端可验证的实际能力为准。

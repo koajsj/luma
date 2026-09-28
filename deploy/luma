@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+APP_DIR=/opt/luma/app
+source "$APP_DIR/deploy/lib.sh"
+require_install
+case ${1:-} in
+    status)
+        compose ps
+        if health >/dev/null 2>&1; then printf 'HTTP 健康检查：正常\n'; else printf 'HTTP 健康检查：失败\n' >&2; exit 1; fi
+        ;;
+    logs) shift; compose logs --tail=100 "${@:-backend}" ;;
+    update|backup|restore|rollback)
+        action=$1; shift
+        exec bash "$APP_DIR/deploy/$action.sh" "$@"
+        ;;
+    domain)
+        [[ ${2:-} == change ]] || die '用法：luma domain change [新域名]'
+        shift 2
+        exec bash "$APP_DIR/deploy/domain.sh" "$@"
+        ;;
+    *) die '用法：luma {status|logs|update|backup|restore|domain change|rollback}' ;;
+esac

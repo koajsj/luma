@@ -1,81 +1,95 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-
-APP_DIR=/opt/luma/app
-ENV_FILE=/opt/luma/config/.env
-COMPOSE_FILE="$APP_DIR/deploy/docker-compose.yml"
-REPO_URL=${LUMA_REPO_URL:-https://github.com/koajsj/luma.git}
-
-fail() { printf '部署失败：%s\n' "$*" >&2; exit 1; }
-trap 'printf "部署中断（第 %s 行）。查看服务：sudo docker compose --env-file %s -f %s logs --tail=100\n" "$LINENO" "$ENV_FILE" "$COMPOSE_FILE" >&2' ERR
-
-[[ -f /etc/os-release ]] || fail '仅支持 Ubuntu 22.04/24.04。'
+umask 077
+source "$(dirname "$0")/lib.sh"
+[[ -f /etc/os-release ]] || die '仅支持 Ubuntu 22.04/24.04。'
 # shellcheck disable=SC1091
 source /etc/os-release
-[[ ${ID:-} == ubuntu && ( ${VERSION_ID:-} == 22.04 || ${VERSION_ID:-} == 24.04 ) ]] || fail '仅支持 Ubuntu 22.04/24.04。'
-[[ $(id -u) -ne 0 ]] || fail '请以普通 sudo 用户运行，不要直接以 root 运行。'
-command -v sudo >/dev/null || fail '需要 sudo 权限。'
-sudo -v || fail '当前用户没有 sudo 权限。'
-
-sudo apt-get update -qq
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git curl ca-certificates openssl >/dev/null
-if ! command -v docker >/dev/null || ! sudo docker compose version >/dev/null 2>&1; then
-    printf '安装 Docker Engine 与 Compose 插件…\n'
+[[ ${ID:-} == ubuntu && ( ${VERSION_ID:-} == 22.04 || ${VERSION_ID:-} == 24.04 ) ]] || die '仅支持 Ubuntu 22.04/24.04。'
+if [[ $(id -u) != 0 ]]; then sudo -v || die '需要 sudo 权限。'; fi
+command -v python3 >/dev/null || die '缺少 Python 3；请重新运行 install.sh。'
+[[ -d "$APP_DIR/.git" ]] || die '先运行 install.sh 拉取仓库。'
+[[ $(git -C "$APP_DIR" remote get-url origin) == https://github.com/koajsj/luma.git ]] || die 'origin 与官方仓库不符。'
+require_clean_main
+root install -d -m 0700 -o "$(id -u)" -g "$(id -g)" /opt/luma/config "$BACKUP_DIR"
+root install -d -m 0755 /opt/luma/data
+lock_operation
+if [[ ! -d /opt/luma/data/postgres ]]; then root install -d -m 0700 /opt/luma/data/postgres; fi
+if [[ ! -d /opt/luma/data/redis ]]; then
+    root install -d -m 0700 -o 999 -g 999 /opt/luma/data/redis
+fi
+root install -d -m 0700 -o 10001 -g 10001 "$STORAGE_DIR"
+if [[ ! -f "$ENV_FILE" ]]; then
+    mode=ip
+    domain=''
+    if [[ -n ${LUMA_DOMAIN:-} ]]; then
+        mode=domain
+        domain=$LUMA_DOMAIN
+    elif ( : </dev/tty ) 2>/dev/null; then
+        printf '是否配置域名并自动启用 HTTPS？[y/N] ' > /dev/tty
+        read -r answer < /dev/tty || answer=n
+        if [[ $answer == y || $answer == Y ]]; then
+            printf '请输入已指向此 VPS 的域名：' > /dev/tty
+            read -r domain < /dev/tty || die '读取域名失败。'
+            mode=domain
+        fi
+    fi
+    if [[ $mode == domain ]]; then
+        [[ $domain =~ ^[a-zA-Z0-9-]+(\.[a-zA-Z0-9-]+)+$ ]] || die '域名格式不正确。'
+        site=$domain
+    else
+        site=:80
+    fi
+    password=$(openssl rand -hex 32)
+    redis_password=$(openssl rand -hex 32)
+    jwt_secret=$(openssl rand -hex 32)
+    user_id_secret=$(openssl rand -hex 32)
+    printf 'LUMA_MODE=%s\nLUMA_DOMAIN=%s\nLUMA_SITE=%s\nPOSTGRES_PASSWORD=%s\nREDIS_PASSWORD=%s\nLUMA_JWT_SECRET=%s\nLUMA_USERID_HMAC_SECRET=%s\nLUMA_STORAGE_DIR=%s\n' \
+        "$mode" "$domain" "$site" "$password" "$redis_password" "$jwt_secret" "$user_id_secret" "$STORAGE_DIR" > "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+fi
+require_install
+[[ $(env_value LUMA_STORAGE_DIR) == "$STORAGE_DIR" ]] || die '存储目录与部署配置不一致。'
+grep -Eq '^LUMA_USERID_HMAC_SECRET=[0-9a-fA-F]{64}$' "$ENV_FILE" || die 'UserID HMAC 密钥无效；不可重新生成已有数据库的密钥。'
+for key in POSTGRES_PASSWORD REDIS_PASSWORD LUMA_JWT_SECRET; do
+    grep -Eq "^$key=[0-9a-fA-F]{64}$" "$ENV_FILE" || die "$key 缺失或无效。"
+done
+redis_password=$(env_value REDIS_PASSWORD)
+redis_config=$(mktemp)
+printf 'save ""\nappendonly no\ndir /data\nrequirepass %s\n' "$redis_password" > "$redis_config"
+redis_changed=0
+if [[ -f /opt/luma/config/redis.conf ]] && ! root cmp -s "$redis_config" /opt/luma/config/redis.conf; then
+    redis_changed=1
+fi
+root install -m 0400 -o 999 -g 999 "$redis_config" /opt/luma/config/redis.conf
+rm -f "$redis_config"
+if ! command -v docker >/dev/null || ! root docker compose version >/dev/null 2>&1; then
     for package in docker.io docker-compose docker-compose-v2 podman-docker containerd runc; do
         if dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q 'install ok installed'; then
-            fail '发现其他 Docker 套件；为避免影响现有容器，请先按 Docker 官方文档迁移到 Engine + Compose 插件。'
+            die '发现冲突的容器套件。为保护现有容器，请先人工迁移到 Docker Engine + Compose。'
         fi
     done
-    sudo install -m 0755 -d /etc/apt/keyrings
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo tee /etc/apt/keyrings/docker.asc >/dev/null
-    sudo chmod a+r /etc/apt/keyrings/docker.asc
+    root install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | root tee /etc/apt/keyrings/docker.asc >/dev/null
+    root chmod a+r /etc/apt/keyrings/docker.asc
     arch=$(dpkg --print-architecture)
     codename=${VERSION_CODENAME:?}
-    printf 'Types: deb\nURIs: https://download.docker.com/linux/ubuntu\nSuites: %s\nComponents: stable\nArchitectures: %s\nSigned-By: /etc/apt/keyrings/docker.asc\n' \
-        "$codename" "$arch" | sudo tee /etc/apt/sources.list.d/docker.sources >/dev/null
-    sudo apt-get update -qq
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin >/dev/null
+    printf 'Types: deb\nURIs: https://download.docker.com/linux/ubuntu\nSuites: %s\nComponents: stable\nArchitectures: %s\nSigned-By: /etc/apt/keyrings/docker.asc\n' "$codename" "$arch" |
+        root tee /etc/apt/sources.list.d/docker.sources >/dev/null
+    root apt-get update -qq
+    root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin >/dev/null
 fi
-sudo systemctl enable --now docker >/dev/null
-sudo docker compose version >/dev/null || fail 'Docker Compose 插件不可用。'
-
-sudo install -d -m 0755 /opt/luma
-sudo install -d -m 0755 -o "$(id -u)" -g "$(id -g)" "$APP_DIR"
-sudo install -d -m 0700 -o "$(id -u)" -g "$(id -g)" /opt/luma/config /opt/luma/backups
-sudo install -d -m 0700 -o 10001 -g 10001 /opt/luma/data/storage
-if [[ ! -d "$APP_DIR/.git" ]]; then
-    [[ -z $(ls -A "$APP_DIR") ]] || fail "$APP_DIR 已有文件且不是 Git 仓库，请人工检查。"
-    git clone --branch main --single-branch "$REPO_URL" "$APP_DIR"
+root systemctl enable --now docker >/dev/null
+if root docker volume inspect luma_pgdata >/dev/null 2>&1 &&
+   [[ -z $(root find /opt/luma/data/postgres -mindepth 1 -maxdepth 1 -print -quit) ]]; then
+    die '检测到旧版 PostgreSQL Docker volume，而新数据目录为空。已停止以防启动空数据库；先备份并迁移旧 volume。'
 fi
-[[ $(git -C "$APP_DIR" remote get-url origin) == "$REPO_URL" ]] || fail "$APP_DIR 的 origin 与预期 GitHub 仓库不同。"
-[[ $(git -C "$APP_DIR" branch --show-current) == main ]] || fail "$APP_DIR 必须位于 main 分支。"
-[[ -z $(git -C "$APP_DIR" status --porcelain) ]] || fail "$APP_DIR 有本地改动；请人工检查后再部署。"
-[[ -f "$COMPOSE_FILE" ]] || fail '仓库缺少 deploy/docker-compose.yml；请先推送部署文件。'
-
-if [[ ! -f "$ENV_FILE" ]]; then
-    domain=${LUMA_DOMAIN:-}
-    email=${ACME_EMAIL:-}
-    if [[ -z "$domain" && -t 0 ]]; then read -r -p 'API 域名（如 api.example.com）：' domain; fi
-    if [[ -z "$email" && -t 0 ]]; then read -r -p '证书通知邮箱：' email; fi
-    [[ $domain =~ ^[a-zA-Z0-9-]+(\.[a-zA-Z0-9-]+)+$ ]] || fail '请设置合法 LUMA_DOMAIN，并先将域名 A/AAAA 记录指向此 VPS。'
-    [[ $email =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]] || fail '请设置合法 ACME_EMAIL。'
-    password=$(openssl rand -hex 32)
-    user_id_secret=$(openssl rand -hex 32)
-    umask 077
-    printf 'LUMA_DOMAIN=%s\nACME_EMAIL=%s\nPOSTGRES_PASSWORD=%s\nLUMA_USERID_HMAC_SECRET=%s\nLUMA_STORAGE_DIR=/opt/luma/data/storage\n' \
-        "$domain" "$email" "$password" "$user_id_secret" > "$ENV_FILE"
-    printf '已生成私有配置 %s；数据库口令未输出。\n' "$ENV_FILE"
-fi
-[[ $(stat -c %a "$ENV_FILE") == 600 ]] || fail "$ENV_FILE 权限必须为 600。"
-grep -Eq '^LUMA_USERID_HMAC_SECRET=[0-9a-fA-F]{64}$' "$ENV_FILE" || fail '配置缺少有效 LUMA_USERID_HMAC_SECRET；请生成一次并在更新、恢复时沿用同一个值。'
-sudo docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" config --quiet
-sudo docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d --build --wait
-
-domain=$(sed -n 's/^LUMA_DOMAIN=//p' "$ENV_FILE" | head -1)
-[[ -n "$domain" ]] || fail '配置缺少 LUMA_DOMAIN。'
-printf '容器已启动。后端启动时自动执行 PostgreSQL migration。检查 HTTPS：\n'
-if curl --retry 12 --retry-delay 5 --retry-connrefused -fsS "https://$domain/health"; then
-    printf '\n部署完成：https://%s/health\nWebSocket：wss://%s/v1/ws（需设备认证）\n' "$domain" "$domain"
-else
-    fail '容器已启动但 HTTPS 健康检查失败。检查 DNS、80/443 端口与 Caddy 日志。'
+compose config --quiet
+if [[ $redis_changed == 1 && -n $(compose ps -q redis) ]]; then compose restart redis; fi
+compose up -d --build --wait
+health >/dev/null || die '容器启动后健康检查失败，请检查 DNS、端口和 Caddy 日志。'
+root install -m 0755 "$APP_DIR/deploy/luma" /usr/local/bin/luma
+printf '部署完成：%s\n管理命令：luma status | logs | update | backup | restore | domain change | rollback\n' "$(show_address)"
+if [[ $(env_value LUMA_MODE) == ip ]]; then
+    printf 'IP 测试模式仅使用 HTTP，不适合真实用户或设备凭据。配置域名后运行 luma domain change。\n'
 fi
