@@ -90,10 +90,10 @@ func main() {
 	presenceSvc := presence.Service{DB: db, Redis: cache, Notify: hub}
 	mux := http.NewServeMux()
 	public := func(pattern string, h http.HandlerFunc, max int) {
-		mux.Handle(pattern, middleware.Limit(cache, pattern, max, time.Minute, h))
+		mux.Handle(pattern, middleware.Limit(cache, pattern, max, time.Minute, cfg.TrustedProxyIP, h))
 	}
 	private := func(pattern string, h http.HandlerFunc, max int) {
-		mux.Handle(pattern, authSvc.Require(middleware.Limit(cache, pattern, max, time.Minute, h)))
+		mux.Handle(pattern, authSvc.Require(middleware.Limit(cache, pattern, max, time.Minute, cfg.TrustedProxyIP, h)))
 	}
 	public("POST /v1/auth/register/challenge", authSvc.Challenge, 10)
 	public("POST /v1/auth/register", authSvc.Register, 5)
@@ -141,8 +141,17 @@ func main() {
 	private("DELETE /v1/files/{id}", files.Delete, 30)
 	private("PUT /v1/presence/heartbeat", presenceSvc.Heartbeat, 120)
 	private("GET /v1/presence/{userID}", presenceSvc.Get, 60)
-	mux.Handle("GET /v1/ws", authSvc.Require(middleware.Limit(cache, "GET /v1/ws", 30, time.Minute, http.HandlerFunc(hub.Serve))))
+	mux.Handle("GET /v1/ws", authSvc.Require(middleware.Limit(cache, "GET /v1/ws", 30, time.Minute, cfg.TrustedProxyIP, http.HandlerFunc(hub.Serve))))
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		middleware.JSON(w, 200, map[string]string{"status": "ok"})
+	})
+	mux.HandleFunc("GET /ready", func(w http.ResponseWriter, r *http.Request) {
+		checkCtx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer cancel()
+		if db.Ping(checkCtx) != nil || cache.Ping(checkCtx).Err() != nil || files.CheckStorage(checkCtx) != nil {
+			middleware.JSON(w, http.StatusServiceUnavailable, map[string]string{"status": "unavailable"})
+			return
+		}
 		middleware.JSON(w, 200, map[string]string{"status": "ok"})
 	})
 	server := &http.Server{Addr: cfg.Addr, Handler: middleware.RequestID(mux), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}

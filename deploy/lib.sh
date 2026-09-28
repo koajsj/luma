@@ -29,9 +29,9 @@ health() {
     mode=$(env_value LUMA_MODE)
     domain=$(env_value LUMA_DOMAIN)
     if [[ $mode == domain ]]; then
-        curl --retry 12 --retry-delay 5 --retry-connrefused -fsS --max-time 10 "https://$domain/health"
+        curl --retry 12 --retry-delay 5 --retry-connrefused --retry-all-errors -fsS --max-time 10 "https://$domain/ready"
     else
-        curl --retry 12 --retry-delay 5 --retry-connrefused -fsS --max-time 10 http://127.0.0.1/health
+        curl --retry 12 --retry-delay 5 --retry-connrefused --retry-all-errors -fsS --max-time 10 http://127.0.0.1/ready
     fi
 }
 show_address() {

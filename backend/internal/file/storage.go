@@ -36,8 +36,32 @@ func (s S3Storage) Open(ctx context.Context, key string) (io.ReadCloser, error) 
 func (s S3Storage) Delete(ctx context.Context, key string) error {
 	return s.Client.RemoveObject(ctx, s.Bucket, key, minio.RemoveObjectOptions{})
 }
+func (s S3Storage) Check(ctx context.Context) error {
+	ok, err := s.Client.BucketExists(ctx, s.Bucket)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errors.New("object storage unavailable")
+	}
+	return nil
+}
 
 type LocalStorage struct{ Root string }
+
+func (s LocalStorage) Check(_ context.Context) error {
+	f, err := os.CreateTemp(filepath.Join(s.Root, "ciphertext"), ".ready-*")
+	if err != nil {
+		return err
+	}
+	path := f.Name()
+	closeErr := f.Close()
+	removeErr := os.Remove(path)
+	if closeErr != nil {
+		return closeErr
+	}
+	return removeErr
+}
 
 func NewLocalStorage(root string) (LocalStorage, error) {
 	if !filepath.IsAbs(root) {

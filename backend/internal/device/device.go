@@ -172,7 +172,7 @@ func (s Service) Bundle(w http.ResponseWriter, r *http.Request) {
 	target := r.PathValue("id")
 	me := middleware.Current(r).UserID
 	var allowed bool
-	e := s.DB.QueryRow(r.Context(), "SELECT $1::uuid=$2::uuid OR EXISTS(SELECT 1 FROM friendships WHERE user_a=LEAST($1::uuid,$2::uuid) AND user_b=GREATEST($1::uuid,$2::uuid))", me, target).Scan(&allowed)
+	e := s.DB.QueryRow(r.Context(), "SELECT ($1::uuid=$2::uuid OR EXISTS(SELECT 1 FROM friendships WHERE user_a=LEAST($1::uuid,$2::uuid) AND user_b=GREATEST($1::uuid,$2::uuid))) AND NOT EXISTS(SELECT 1 FROM blocks WHERE (blocker=$1 AND blocked=$2) OR (blocker=$2 AND blocked=$1))", me, target).Scan(&allowed)
 	if e != nil || !allowed {
 		middleware.Fail(w, r, 403, "forbidden")
 		return

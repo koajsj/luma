@@ -8,6 +8,7 @@ services:
     restart: unless-stopped
     environment:
       LUMA_ADDR: ":8080"
+      LUMA_TRUSTED_PROXY_IP: "172.31.251.2"
       # Only the private Docker network can reach this HTTP listener; Caddy terminates public TLS.
       LUMA_ALLOW_INSECURE_LOCAL: "true"
       DATABASE_URL: "postgres://luma:${POSTGRES_PASSWORD}@postgres:5432/luma?sslmode=disable"
@@ -22,9 +23,9 @@ services:
       redis: {condition: service_healthy}
     networks: [private]
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/health"]
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/ready"]
       interval: 10s
-      timeout: 3s
+      timeout: 5s
       retries: 12
       start_period: 30s
 
@@ -75,11 +76,17 @@ services:
       - caddy_config:/config
     depends_on:
       backend: {condition: service_healthy}
-    networks: [private, edge]
+    networks:
+      private:
+        ipv4_address: 172.31.251.2
+      edge:
 
 networks:
   private:
     internal: true
+    ipam:
+      config:
+        - subnet: 172.31.251.0/24
   edge:
 
 volumes:

@@ -11,6 +11,8 @@ Luma 是基于 SwiftUI、SwiftData 和 Apple 原生安全框架的一对一隐�
 - 后端代码、环境变量及启动方式见 [backend/README.md](backend/README.md)，实际 API 以 [OpenAPI](backend/openapi/openapi.yaml) 为准。
 - [VPS 部署指南](deploy/README_DEPLOY.md)提供 Docker Compose 配置；当前仓库不代表已有生产部署或 HTTPS 域名已完成验收。
 
+RC1.2 后端与部署加固涵盖 Block 权限、PreKey 可用设备筛选、Reaction 重试幂等、WebSocket 写超时、可信代理限流、就绪检查及恢复脚本补偿。Docker 镜像中的迁移文件已设为非 root 用户可读。生产 VPS 的部署、回滚和域名切换仍需实际环境验收。
+
 ## 当前能力
 
 | 领域 | 已实现范围 | 未完成的验收或限制 |

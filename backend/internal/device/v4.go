@@ -168,9 +168,9 @@ func (s Service) V4Bundle(w http.ResponseWriter, r *http.Request) {
 		selectedDevice = parsed.String()
 	}
 	var allowed bool
-	if s.DB.QueryRow(r.Context(), `SELECT $1::uuid=$2::uuid OR (
+	if s.DB.QueryRow(r.Context(), `SELECT ($1::uuid=$2::uuid OR
 		EXISTS(SELECT 1 FROM friendships WHERE user_a=LEAST($1::uuid,$2::uuid) AND user_b=GREATEST($1::uuid,$2::uuid))
-		AND NOT EXISTS(SELECT 1 FROM blocks WHERE (blocker=$1 AND blocked=$2) OR (blocker=$2 AND blocked=$1)))`, me, target).Scan(&allowed) != nil || !allowed {
+		) AND NOT EXISTS(SELECT 1 FROM blocks WHERE (blocker=$1 AND blocked=$2) OR (blocker=$2 AND blocked=$1))`, me, target).Scan(&allowed) != nil || !allowed {
 		middleware.Fail(w, r, 403, "forbidden")
 		return
 	}
@@ -219,11 +219,15 @@ func (s Service) V4Bundle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rows.Close()
-	if (!includeRevoked && len(entries) != active) || (includeRevoked && len(entries) != 1) {
+	if (includeRevoked && len(entries) != 1) || (!includeRevoked && len(entries) == 0) {
 		middleware.Fail(w, r, 409, "v4_not_ready_on_all_devices")
 		return
 	}
 	out := []map[string]any{}
+	skipped := active - len(entries)
+	if includeRevoked {
+		skipped = 0
+	}
 	encode := base64.RawURLEncoding.EncodeToString
 	for _, x := range entries {
 		var one []byte
@@ -234,8 +238,8 @@ func (s Service) V4Bundle(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if errors.Is(err, pgx.ErrNoRows) {
-				middleware.Fail(w, r, 409, "v4_prekeys_exhausted")
-				return
+				skipped++
+				continue
 			}
 		}
 		out = append(out, map[string]any{"accountIdentityPublicKey": encode(identity), "deviceID": x.id,
@@ -244,9 +248,16 @@ func (s Service) V4Bundle(w http.ResponseWriter, r *http.Request) {
 			"signedPreKeyPublicKey": encode(x.prekey), "signedPreKeySignature": encode(x.proof),
 			"oneTimePreKeyPublicKey": encode(one)})
 	}
+	if len(out) == 0 {
+		middleware.Fail(w, r, 409, "v4_prekeys_exhausted")
+		return
+	}
 	if tx.Commit(r.Context()) != nil {
 		middleware.Fail(w, r, 503, "storage_unavailable")
 		return
+	}
+	if skipped > 0 {
+		w.Header().Set("X-Luma-Skipped-Devices", strconv.Itoa(skipped))
 	}
 	middleware.JSON(w, 200, out)
 }

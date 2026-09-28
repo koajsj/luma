@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -20,6 +21,14 @@ import (
 type Service struct {
 	DB      *pgxpool.Pool
 	Storage Storage
+}
+
+func (s Service) CheckStorage(ctx context.Context) error {
+	checker, ok := s.Storage.(interface{ Check(context.Context) error })
+	if !ok {
+		return errors.New("object storage unavailable")
+	}
+	return checker.Check(ctx)
 }
 
 func New(c config.Config, db *pgxpool.Pool) (Service, error) {

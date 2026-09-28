@@ -19,6 +19,11 @@ type Notifier interface {
 
 // Append serializes sequence allocation on the device row inside the caller's transaction.
 func Append(ctx context.Context, tx pgx.Tx, device, eventType string, payload []byte, routing any) (int64, error) {
+	return AppendWithEventID(ctx, tx, uuid.NewString(), device, eventType, payload, routing)
+}
+
+// AppendWithEventID lets callers use a stable ID for retryable events.
+func AppendWithEventID(ctx context.Context, tx pgx.Tx, eventID, device, eventType string, payload []byte, routing any) (int64, error) {
 	if payload == nil {
 		payload = []byte{}
 	}
@@ -31,7 +36,7 @@ func Append(ctx context.Context, tx pgx.Tx, device, eventType string, payload []
 	if e != nil {
 		return 0, e
 	}
-	_, e = tx.Exec(ctx, "INSERT INTO sync_events(event_id,target_device_id,device_seq,type,payload_ciphertext,routing) VALUES($1,$2,$3,$4,$5,$6)", uuid.NewString(), device, seq, eventType, payload, body)
+	_, e = tx.Exec(ctx, "INSERT INTO sync_events(event_id,target_device_id,device_seq,type,payload_ciphertext,routing) VALUES($1,$2,$3,$4,$5,$6)", eventID, device, seq, eventType, payload, body)
 	return seq, e
 }
 func (s Service) Events(w http.ResponseWriter, r *http.Request) {

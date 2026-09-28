@@ -63,4 +63,4 @@ Release Candidate 增量：本地 Mock 事件经 `EventVerifier` 检查操作者
 
 v4 控制事件现在集中由 `V4EventVerifier` 核对路由设备、目标设备、会话、加密版本、消息索引，再在 Ratchet 解密后核对事件 ID、操作者、类型及 revision。签名验证仍是未来扩展点；当前真实性依赖已固定身份的会话密钥与 AES-GCM 认证。状态写入或验证失败时不得确认游标。Keychain Crypto Transaction 状态可在重启后按已提交本地游标重放；`failed` 记录保留原请求供恢复，不自动跳过失败事件。
 
-Final Hardening：会话状态另有 Keychain 单调版本高水位；候选 Ratchet 状态若落后，待提交记录会保留并停止同步，不能用旧链覆盖新链。`GET /v1/devices/{id}/v4-prekeys/status` 仅供已认证的本设备查询剩余一次性公钥数量，客户端低库存时幂等补充。默认领取公钥束在库存耗尽时整体失败，避免静默降级。此流程不改变 v4 信封格式或事件格式。
+Final Hardening：会话状态另有 Keychain 单调版本高水位；候选 Ratchet 状态若落后，待提交记录会保留并停止同步，不能用旧链覆盖新链。`GET /v1/devices/{id}/v4-prekeys/status` 仅供已认证的本设备查询剩余一次性公钥数量，客户端低库存时幂等补充。默认领取公钥束会跳过未就绪或一次性 PreKey 耗尽的设备，并在响应头标明跳过数量；没有可用设备时返回 409，不会降级为缺少一次性 PreKey 的握手。发送端仍须满足消息路由的全部活动目标设备校验，部分 Bundle 不代表消息可发送。此流程不改变 v4 信封格式或事件格式。

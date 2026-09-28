@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -395,12 +396,26 @@ func (s Service) Reaction(w http.ResponseWriter, r *http.Request) {
 		middleware.Fail(w, r, 400, "invalid_envelopes")
 		return
 	}
+	sort.Slice(in.RecipientEnvelopes, func(i, j int) bool {
+		return in.RecipientEnvelopes[i].RecipientDeviceID < in.RecipientEnvelopes[j].RecipientDeviceID
+	})
+	requestBody, _ := json.Marshal(in)
+	requestHash := sha256.Sum256(append([]byte(middleware.Current(r).DeviceID+":"), requestBody...))
+	eventID := func(deviceID string) string {
+		h := sha256.Sum256(append(requestHash[:], []byte(deviceID)...))
+		id, _ := uuid.FromBytes(h[:16])
+		return id.String()
+	}
 	tx, e := s.DB.Begin(r.Context())
 	if e != nil {
 		middleware.Fail(w, r, 503, "storage_unavailable")
 		return
 	}
 	defer tx.Rollback(r.Context())
+	if _, e = tx.Exec(r.Context(), "SELECT pg_advisory_xact_lock($1)", int64(binary.BigEndian.Uint64(requestHash[:8]))); e != nil {
+		middleware.Fail(w, r, 503, "storage_unavailable")
+		return
+	}
 	var cid string
 	var version int
 	e = tx.QueryRow(r.Context(), "SELECT conversation_id,encryption_version FROM messages WHERE id=$1 AND deleted_at IS NULL", in.MessageID).Scan(&cid, &version)
@@ -417,9 +432,19 @@ func (s Service) Reaction(w http.ResponseWriter, r *http.Request) {
 		middleware.Fail(w, r, 403, "forbidden")
 		return
 	}
+	var seen bool
+	e = tx.QueryRow(r.Context(), "SELECT EXISTS(SELECT 1 FROM sync_events WHERE event_id=$1 AND target_device_id=$2 AND type='reaction.added')", eventID(in.RecipientEnvelopes[0].RecipientDeviceID), in.RecipientEnvelopes[0].RecipientDeviceID).Scan(&seen)
+	if e != nil {
+		middleware.Fail(w, r, 503, "storage_unavailable")
+		return
+	}
+	if seen {
+		w.WriteHeader(202)
+		return
+	}
 	seqs := map[string]int64{}
 	for _, env := range in.RecipientEnvelopes {
-		seqs[env.RecipientDeviceID], e = sync.Append(r.Context(), tx, env.RecipientDeviceID, "reaction.added", actual[env.RecipientDeviceID], map[string]any{"messageID": in.MessageID, "senderUserID": middleware.Current(r).UserID, "senderDeviceID": middleware.Current(r).DeviceID, "encryptionVersion": version})
+		seqs[env.RecipientDeviceID], e = sync.AppendWithEventID(r.Context(), tx, eventID(env.RecipientDeviceID), env.RecipientDeviceID, "reaction.added", actual[env.RecipientDeviceID], map[string]any{"messageID": in.MessageID, "senderUserID": middleware.Current(r).UserID, "senderDeviceID": middleware.Current(r).DeviceID, "encryptionVersion": version})
 		if e != nil {
 			break
 		}

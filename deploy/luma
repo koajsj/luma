@@ -6,7 +6,7 @@ require_install
 case ${1:-} in
     status)
         compose ps
-        if health >/dev/null 2>&1; then printf 'HTTP 健康检查：正常\n'; else printf 'HTTP 健康检查：失败\n' >&2; exit 1; fi
+        if health >/dev/null 2>&1; then printf '服务就绪检查：正常\n'; else printf '服务就绪检查：失败\n' >&2; exit 1; fi
         ;;
     logs) shift; compose logs --tail=100 "${@:-backend}" ;;
     update|backup|restore|rollback)

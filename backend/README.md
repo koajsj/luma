@@ -32,7 +32,7 @@ Presence 心跳与输入提示保存在 Redis TTL；在线状态只向已确认�
 
 `GET /v1/friends` 返回已确认好友的路由 UUID；`GET /v1/users/{id}/prekey-bundle?claim=false` 仅查看已签名公钥束，不领取一次性预密钥。默认查询仍原子领取。
 
-v4 公开密钥目录使用 `PUT /v1/devices/{id}/v4-prekeys` 与 `GET /v1/users/{id}/v4-prekey-bundle`；后者 `claim=false` 只查看，默认事务领取一次性公钥。客户端在登记后上传账号身份签名绑定的设备 v4 公钥。服务端只保存公钥与密文信封，不持有 v4 私钥或 Ratchet 状态。完整字段见 [OpenAPI](openapi/openapi.yaml)。两个独立模拟器已通过本地后端联调；实体设备及独立安全审计尚未完成。
+v4 公开密钥目录使用 `PUT /v1/devices/{id}/v4-prekeys` 与 `GET /v1/users/{id}/v4-prekey-bundle`；后者 `claim=false` 只查看，默认事务领取一次性公钥。未就绪或 PreKey 耗尽的设备会跳过并计入 `X-Luma-Skipped-Devices`；没有可用设备返回 409，部分 Bundle 仍可能因发送端必须覆盖全部活动设备而无法发送。客户端在登记后上传账号身份签名绑定的设备 v4 公钥。服务端只保存公钥与密文信封，不持有 v4 私钥或 Ratchet 状态。完整字段见 [OpenAPI](openapi/openapi.yaml)。两个独立模拟器已通过本地后端联调；实体设备及独立安全审计尚未完成。
 
 v4 编辑、删除、已读和 Emoji 操作走 `POST /v1/messages/v4/events`。服务端核对设备、会话、目标设备和 revision，并原子写入逐设备密文同步事件；客户端再用 Ratchet 验证操作者和内容。旧控制接口拒绝 v4 原消息。服务端可见事件类型、路由、时间和大小，不能验证密文内的操作内容。两个独立模拟器的控制事件闭环已通过；实体设备与故障注入联调仍未完成。
 # 设备撤销增量

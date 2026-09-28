@@ -25,8 +25,7 @@ if [[ ${LUMA_ROLLBACK_CONFIRMED:-} != 1 ]]; then
 fi
 printf '将回滚到 %s。先创建当前版本的安全备份。\n' "$old"
 bash "$APP_DIR/deploy/backup.sh"
-git -C "$APP_DIR" reset --hard "$old"
 LUMA_RESTORE_CONFIRMED=1 bash "$APP_DIR/deploy/restore.sh" "$backup" ||
-    die "回滚恢复失败；保留了 $backup 及回滚前备份，请人工处理。"
+    die "回滚恢复失败；请检查服务状态及回滚前备份。目标备份保留在 $backup。"
 root install -m 0755 "$APP_DIR/deploy/luma" /usr/local/bin/luma
 printf '回滚完成：%s → %s\n' "$current" "$old"

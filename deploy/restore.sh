@@ -34,8 +34,55 @@ if [[ ${LUMA_RESTORE_CONFIRMED:-} != 1 ]]; then
     read -r answer < /dev/tty
     [[ $answer == RESTORE ]] || die '已取消恢复。'
 fi
-stage=$(mktemp -d /opt/luma/data/.restore.XXXXXX)
-trap 'root rm -rf "$stage"' EXIT
+stage=$(root mktemp -d /opt/luma/data/.restore.XXXXXX)
+config_previous=''
+config_tmp=''
+previous_db=''
+services_stopped=0
+db_changed=0
+storage_changed=0
+config_swapped=0
+restore_cleanup() {
+    local result=$? recovery_failed=0
+    trap - EXIT
+    if (( result != 0 )); then
+        set +e
+        if (( config_swapped )); then
+            cp "$config_previous" "$ENV_FILE" && chmod 600 "$ENV_FILE" || recovery_failed=1
+        fi
+        if [[ $version != "$current" ]]; then
+            git -C "$APP_DIR" reset --hard "$current" || recovery_failed=1
+        fi
+        if (( db_changed )) && [[ -n $previous_db ]]; then
+            compose exec -T postgres dropdb -U luma --if-exists luma &&
+                compose exec -T postgres createdb -U luma -O luma luma &&
+                compose exec -T postgres pg_restore -U luma -d luma --no-owner < "$previous_db" || recovery_failed=1
+        fi
+        if (( storage_changed )) && root test -d /opt/luma/data/.storage-before-restore; then
+            root rm -rf "$STORAGE_DIR" &&
+                root mv /opt/luma/data/.storage-before-restore "$STORAGE_DIR" || recovery_failed=1
+        fi
+        if (( services_stopped && recovery_failed == 0 )); then
+            compose up -d --build --wait && health >/dev/null || recovery_failed=1
+        fi
+        if (( recovery_failed )); then
+            compose stop backend caddy || true
+            printf '恢复补偿失败，已停止对外服务；请检查数据库、密文目录和备份。\n' >&2
+            [[ -z $previous_db ]] || printf '原数据库临时快照保留在 %s。\n' "$previous_db" >&2
+            [[ -z $config_previous ]] || printf '原配置副本保留在 %s。\n' "$config_previous" >&2
+        else
+            printf '恢复失败；旧配置、代码、数据库和密文目录已恢复。\n' >&2
+        fi
+    fi
+    root rm -rf "$stage"
+    [[ -z $config_tmp ]] || rm -f "$config_tmp"
+    if (( recovery_failed == 0 )); then
+        [[ -z $config_previous ]] || rm -f "$config_previous"
+        [[ -z $previous_db ]] || rm -f "$previous_db"
+    fi
+    exit "$result"
+}
+trap restore_cleanup EXIT
 python3 - "$backup/storage.tar.gz" <<'PY'
 import re
 import sys
@@ -50,9 +97,8 @@ with tarfile.open(sys.argv[1], "r:gz") as archive:
             raise SystemExit("备份包含不安全的文件路径或类型")
 PY
 root tar -C "$stage" --no-same-owner --no-same-permissions -xzf "$backup/storage.tar.gz"
-[[ -d "$stage/storage" ]] || die '备份中缺少 storage 目录。'
-[[ ! -e /opt/luma/data/.storage-before-restore ]] || die '上次恢复残留旧文件目录，请先人工检查。'
-config_previous=''
+root test -d "$stage/storage" || die '备份中缺少 storage 目录。'
+root test ! -e /opt/luma/data/.storage-before-restore || die '上次恢复残留旧文件目录，请先人工检查。'
 if [[ -n ${2:-} ]]; then
     config_previous=$(mktemp /opt/luma/config/.env.pre-restore.XXXXXX)
     cp "$ENV_FILE" "$config_previous"
@@ -60,21 +106,25 @@ if [[ -n ${2:-} ]]; then
     grep -v '^LUMA_USERID_HMAC_SECRET=' "$ENV_FILE" > "$config_tmp"
     printf 'LUMA_USERID_HMAC_SECRET=%s\n' "$key" >> "$config_tmp"
     chmod 600 "$config_tmp"
+    config_swapped=1
     mv "$config_tmp" "$ENV_FILE"
-    trap 'printf "恢复中断；原配置保留在 %s。\n" "$config_previous" >&2; root rm -rf "$stage"' EXIT
 fi
 if [[ $version != "$current" ]]; then git -C "$APP_DIR" reset --hard "$version"; fi
+services_stopped=1
 compose stop backend caddy
+previous_db=$(mktemp "$BACKUP_DIR"/.restore-db.XXXXXX)
+compose exec -T postgres pg_dump -U luma -d luma -Fc > "$previous_db"
+db_changed=1
 compose exec -T postgres dropdb -U luma --if-exists luma
 compose exec -T postgres createdb -U luma -O luma luma
 compose exec -T postgres pg_restore -U luma -d luma --no-owner < "$backup/postgres.dump"
+storage_changed=1
 root mv "$STORAGE_DIR" "/opt/luma/data/.storage-before-restore"
 root mv "$stage/storage" "$STORAGE_DIR"
 root chown -R 10001:10001 "$STORAGE_DIR"
 compose up -d --build --wait
-health >/dev/null || die '恢复后的服务健康检查失败。旧密文目录仍在 /opt/luma/data/.storage-before-restore。'
-root rm -rf /opt/luma/data/.storage-before-restore
+health >/dev/null || die '恢复后的服务健康检查失败。'
 root install -m 0755 "$APP_DIR/deploy/luma" /usr/local/bin/luma
-if [[ -n "$config_previous" ]]; then rm -f "$config_previous"; fi
-trap 'root rm -rf "$stage"' EXIT
 printf '恢复完成：%s\n' "$backup"
+root rm -rf /opt/luma/data/.storage-before-restore ||
+    printf '旧密文目录清理失败，请检查 /opt/luma/data/.storage-before-restore。\n' >&2

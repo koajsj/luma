@@ -7,8 +7,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"io"
+	"net"
 	"net/http"
-	"strings"
+	"net/netip"
 	"time"
 )
 
@@ -49,12 +50,29 @@ func Decode(w http.ResponseWriter, r *http.Request, v any) bool {
 	}
 	return true
 }
-func Limit(redis *redis.Client, prefix string, max int, window time.Duration, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ip := r.RemoteAddr
-		if i := strings.LastIndex(ip, ":"); i > 0 {
-			ip = ip[:i]
+
+// ClientIP accepts a forwarded address only from the configured reverse proxy.
+// The proxy must replace, rather than append to, the incoming X-Forwarded-For header.
+func ClientIP(r *http.Request, trustedProxy netip.Addr) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return "unknown"
+	}
+	peer, err := netip.ParseAddr(host)
+	if err != nil {
+		return "unknown"
+	}
+	if trustedProxy.IsValid() && peer.Unmap() == trustedProxy.Unmap() {
+		forwarded, err := netip.ParseAddr(r.Header.Get("X-Forwarded-For"))
+		if err == nil && !forwarded.IsUnspecified() {
+			return forwarded.Unmap().String()
 		}
+	}
+	return peer.Unmap().String()
+}
+func Limit(redis *redis.Client, prefix string, max int, window time.Duration, trustedProxy netip.Addr, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ip := ClientIP(r, trustedProxy)
 		key := "rate:" + prefix + ":" + ip
 		n, e := redis.Incr(r.Context(), key).Result()
 		if e != nil {

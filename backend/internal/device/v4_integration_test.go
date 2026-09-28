@@ -119,9 +119,13 @@ func TestV4PublicDirectoryAndRevokedHistory(t *testing.T) {
 	if err = db.QueryRow(context.Background(), "SELECT count(*) FROM v4_one_time_prekeys WHERE device_id=$1 AND claimed_at IS NOT NULL", deviceB).Scan(&claimed); err != nil || claimed != 1 {
 		t.Fatalf("one-time claim: %d, %v", claimed, err)
 	}
-	_, code = lookup("/v1/users/" + userID + "/v4-prekey-bundle")
-	if code != 409 {
-		t.Fatalf("exhausted one-time key must fail closed: %d", code)
+	// A newly registered device without v4 keys must not hide available devices.
+	if _, err = db.Exec(context.Background(), "INSERT INTO devices(user_id,device_name,device_public_key,auth_public_key) VALUES($1,'not-ready',$2,$3)", userID, []byte{1}, []byte{2}); err != nil {
+		t.Fatal(err)
+	}
+	rows, code = lookup("/v1/users/" + userID + "/v4-prekey-bundle")
+	if code != 200 || len(rows) != 1 || rows[0]["deviceID"] != deviceA {
+		t.Fatalf("exhausted device must be skipped without returning an empty prekey: %d %v", code, rows)
 	}
 	status := httptest.NewRequest(http.MethodGet, "/v1/devices/"+deviceB+"/v4-prekeys/status", nil)
 	status.SetPathValue("id", deviceB)
@@ -163,6 +167,25 @@ func TestV4PublicDirectoryAndRevokedHistory(t *testing.T) {
 	}
 	if _, err = db.Exec(context.Background(), "INSERT INTO friendships(user_a,user_b) VALUES(LEAST($1::uuid,$2::uuid),GREATEST($1::uuid,$2::uuid))", userID, otherUser); err != nil {
 		t.Fatal(err)
+	}
+	otherDevice := uuid.NewString()
+	if _, err = db.Exec(context.Background(), "INSERT INTO devices(id,user_id,device_name,device_public_key,auth_public_key) VALUES($1,$2,'peer',$3,$4)", otherDevice, otherUser, []byte{1}, []byte{2}); err != nil {
+		t.Fatal(err)
+	}
+	claimFromPeer := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/v1/users/"+userID+"/v4-prekey-bundle", nil)
+		req.SetPathValue("id", userID)
+		req = req.WithContext(middleware.WithIdentity(req.Context(), middleware.Identity{UserID: otherUser, DeviceID: otherDevice}))
+		result := httptest.NewRecorder()
+		(device.Service{DB: db}).V4Bundle(result, req)
+		return result
+	}
+	partial := claimFromPeer()
+	if partial.Code != 200 || partial.Header().Get("X-Luma-Skipped-Devices") != "2" {
+		t.Fatalf("partial bundle must report skipped devices: %d %s", partial.Code, partial.Body.String())
+	}
+	if exhausted := claimFromPeer(); exhausted.Code != 409 {
+		t.Fatalf("bundle with no usable prekeys must fail closed: %d", exhausted.Code)
 	}
 	if _, err = db.Exec(context.Background(), "INSERT INTO blocks(blocker,blocked) VALUES($1,$2)", otherUser, userID); err != nil {
 		t.Fatal(err)

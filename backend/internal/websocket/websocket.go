@@ -162,7 +162,7 @@ func (h *Hub) Serve(w http.ResponseWriter, r *http.Request) {
 			if value, ok := frame.(map[string]any); ok && value["type"] == "device.revoked" {
 				return
 			}
-			if conn.WriteJSON(frame) != nil {
+			if conn.SetWriteDeadline(time.Now().Add(5*time.Second)) != nil || conn.WriteJSON(frame) != nil {
 				return
 			}
 		case <-tick.C:

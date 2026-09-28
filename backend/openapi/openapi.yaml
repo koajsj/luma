@@ -188,7 +188,7 @@ paths:
     get:
       tags: [Device]
       summary: 获取好友或本人所有活动设备的 v4 公钥束
-      description: 默认在事务中为每个目标设备领取一次性预密钥；claim=false 只查看。若任一活动设备尚未登记 v4 公钥或一次性密钥耗尽，则整个请求失败，不会降级为无一次性密钥握手。
+      description: 默认在事务中为可用目标设备领取一次性预密钥；claim=false 只查看公钥资料。未登记 v4 公钥的设备会跳过；领取模式下，一次性密钥耗尽的其他设备也会跳过。响应头 X-Luma-Skipped-Devices 标明跳过数量。若无可用设备则返回 409。发送端仍须遵守消息路由的完整目标设备校验。
       parameters:
         - {name: id, in: path, required: true, schema: {type: string, format: uuid}}
         - {name: claim, in: query, required: false, schema: {type: boolean, default: true}}

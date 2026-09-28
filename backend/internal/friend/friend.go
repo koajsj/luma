@@ -1,12 +1,24 @@
 package friend
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"luma/backend/internal/middleware"
 	"luma/backend/internal/useridindex"
 	"net/http"
 	"strings"
 )
+
+func lockPair(r *http.Request, tx pgx.Tx, a, b string) error {
+	if a > b {
+		a, b = b, a
+	}
+	h := sha256.Sum256([]byte(a + ":" + b))
+	_, err := tx.Exec(r.Context(), "SELECT pg_advisory_xact_lock($1)", int64(binary.BigEndian.Uint64(h[:8])))
+	return err
+}
 
 type Service struct {
 	DB             *pgxpool.Pool
@@ -61,7 +73,10 @@ func (s Service) Request(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var blocked bool
-	_ = s.DB.QueryRow(r.Context(), "SELECT EXISTS(SELECT 1 FROM blocks WHERE (blocker=$1 AND blocked=$2) OR (blocker=$2 AND blocked=$1))", me, target).Scan(&blocked)
+	if e = s.DB.QueryRow(r.Context(), "SELECT EXISTS(SELECT 1 FROM blocks WHERE (blocker=$1 AND blocked=$2) OR (blocker=$2 AND blocked=$1))", me, target).Scan(&blocked); e != nil {
+		middleware.Fail(w, r, 503, "storage_unavailable")
+		return
+	}
 	if blocked {
 		middleware.Fail(w, r, 404, "not_found")
 		return
@@ -91,6 +106,19 @@ func (s Service) Decide(w http.ResponseWriter, r *http.Request) {
 	e = tx.QueryRow(r.Context(), "SELECT from_user,to_user FROM friend_requests WHERE id=$1 AND to_user=$2 AND status='pending' FOR UPDATE", in.RequestID, middleware.Current(r).UserID).Scan(&a, &b)
 	if e != nil {
 		middleware.Fail(w, r, 404, "not_found")
+		return
+	}
+	if e = lockPair(r, tx, a, b); e != nil {
+		middleware.Fail(w, r, 503, "storage_unavailable")
+		return
+	}
+	var blocked bool
+	if e = tx.QueryRow(r.Context(), "SELECT EXISTS(SELECT 1 FROM blocks WHERE (blocker=$1 AND blocked=$2) OR (blocker=$2 AND blocked=$1))", a, b).Scan(&blocked); e != nil {
+		middleware.Fail(w, r, 503, "storage_unavailable")
+		return
+	}
+	if blocked {
+		middleware.Fail(w, r, 403, "forbidden")
 		return
 	}
 	status := "rejected"
@@ -131,6 +159,10 @@ func (s Service) Block(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback(r.Context())
+	if e = lockPair(r, tx, me, in.UserID); e != nil {
+		middleware.Fail(w, r, 503, "storage_unavailable")
+		return
+	}
 	_, e = tx.Exec(r.Context(), "INSERT INTO blocks(blocker,blocked) VALUES($1,$2) ON CONFLICT DO NOTHING", me, in.UserID)
 	if e == nil {
 		_, e = tx.Exec(r.Context(), "DELETE FROM friendships WHERE user_a=LEAST($1::uuid,$2::uuid) AND user_b=GREATEST($1::uuid,$2::uuid)", me, in.UserID)
@@ -142,7 +174,7 @@ func (s Service) Block(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(204)
 }
 func (s Service) Requests(w http.ResponseWriter, r *http.Request) {
-	rows, e := s.DB.Query(r.Context(), "SELECT fr.id,u.user_id,fr.created_at FROM friend_requests fr JOIN users u ON u.id=fr.from_user WHERE fr.to_user=$1 AND fr.status='pending' ORDER BY fr.created_at DESC LIMIT 100", middleware.Current(r).UserID)
+	rows, e := s.DB.Query(r.Context(), "SELECT fr.id,u.user_id,fr.created_at FROM friend_requests fr JOIN users u ON u.id=fr.from_user WHERE fr.to_user=$1 AND fr.status='pending' AND NOT EXISTS(SELECT 1 FROM blocks b WHERE (b.blocker=fr.from_user AND b.blocked=fr.to_user) OR (b.blocker=fr.to_user AND b.blocked=fr.from_user)) ORDER BY fr.created_at DESC LIMIT 100", middleware.Current(r).UserID)
 	if e != nil {
 		middleware.Fail(w, r, 503, "storage_unavailable")
 		return

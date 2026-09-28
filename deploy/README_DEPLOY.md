@@ -23,7 +23,9 @@ curl -fsSL https://raw.githubusercontent.com/koajsj/luma/main/deploy/install.sh 
 
 服务由 Docker Compose 启动：PostgreSQL、Redis、Go Backend、Caddy。后端启动时自动运行版本化 PostgreSQL migration；Caddy 代理普通 HTTP 和 WebSocket。Redis 仅保存可重建的短期状态，不写持久化快照。客户端先加密附件，再上传到 `/opt/luma/data/storage/ciphertext`。服务器仍可见账号、设备、时间、大小等元数据。
 
-域名模式健康地址为 `https://你的域名/health`；IP 测试模式为 `http://VPS_IP/health`。正常结果为 `{"status":"ok"}`。WebSocket 地址为相同域名下的 `wss://你的域名/v1/ws`，需要有效设备认证；未经认证的直接访问被拒绝是预期行为。
+部署网络固定使用 `172.31.251.0/24`，Caddy 在内部网络使用 `172.31.251.2`。后端只信任此地址转发的单个客户端 IP，Caddy 会覆盖客户端提供的 `X-Forwarded-For`。若 VPS 上已有重叠 Docker 网络，须在部署前同步修改 Compose 中的网段、Caddy 地址及 `LUMA_TRUSTED_PROXY_IP`，保持三处一致。
+
+域名模式进程检查地址为 `https://你的域名/health`，就绪检查地址为 `https://你的域名/ready`；IP 测试模式使用 `http://VPS_IP` 加相同路径。正常结果为 `{"status":"ok"}`。部署和更新以 `/ready` 为准，它只返回通用状态，不公开 PostgreSQL、Redis 或存储的错误详情。WebSocket 地址为相同域名下的 `wss://你的域名/v1/ws`，需要有效设备认证；未经认证的直接访问被拒绝是预期行为。
 
 ## 日常管理
 

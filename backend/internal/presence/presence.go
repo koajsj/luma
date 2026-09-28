@@ -33,7 +33,7 @@ func (s Service) Get(w http.ResponseWriter, r *http.Request) {
 	me := middleware.Current(r).UserID
 	var id string
 	var visible bool
-	e := s.DB.QueryRow(r.Context(), "SELECT u.id,u.show_presence FROM users u WHERE u.user_id=$1 AND u.disabled_at IS NULL AND (u.id=$2 OR EXISTS(SELECT 1 FROM friendships f WHERE f.user_a=LEAST(u.id,$2::uuid) AND f.user_b=GREATEST(u.id,$2::uuid)))", target, me).Scan(&id, &visible)
+	e := s.DB.QueryRow(r.Context(), "SELECT u.id,u.show_presence FROM users u WHERE u.user_id=$1 AND u.disabled_at IS NULL AND (u.id=$2 OR EXISTS(SELECT 1 FROM friendships f WHERE f.user_a=LEAST(u.id,$2::uuid) AND f.user_b=GREATEST(u.id,$2::uuid))) AND NOT EXISTS(SELECT 1 FROM blocks b WHERE (b.blocker=u.id AND b.blocked=$2) OR (b.blocker=$2 AND b.blocked=u.id))", target, me).Scan(&id, &visible)
 	if e != nil || !visible {
 		middleware.Fail(w, r, 404, "not_found")
 		return
