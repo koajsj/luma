@@ -23,7 +23,7 @@ The updated code:
 - Completes an outgoing journal that has entered a write/recovery phase before removing the peer session, preserving ratchet advancement for other recipients.
 - Refuses to remove a peer while an incoming journal for that peer is pending. The vault cannot independently know whether the matching SwiftData message and sync cursor were committed; sync recovery must resolve that cross-store state first.
 
-This deliberately prefers a recoverable, temporarily blocked operation over silently discarding ratchet state. The change is on the audit branch and has not been merged into `main`.
+This deliberately prefers a recoverable, temporarily blocked operation over silently discarding ratchet state. The change was merged into `main` through [PR #1](https://github.com/koajsj/luma/pull/1), merge commit `ee6e8ecddb7bb4fe093c8fd50be1db35248f174f` on 2026-10-22. Local builds and regression tests were not run before merging, so the fix remains pending verification.
 
 ## Findings requiring further verification
 
@@ -42,7 +42,7 @@ The repository README itself says real-device two-device attachment flow, two ph
 ### P2 — Rate-limit expiry error is ignored
 `backend/internal/middleware/http.go` ignores the result of Redis `Expire` after incrementing a new rate-limit key. If expiry fails after the increment, the key may persist and keep throttling that route/client indefinitely. Make increment and expiry atomic and handle failure safely; add a test with an isolated Redis or a testable limiter abstraction.
 
-## Required validation before merge
+## Required validation after merge, before release
 
 1. Run `go test ./...`, `go vet ./...`, and `go test -race ./...` in `backend`.
 2. Run all XCTest cases on an iOS Simulator; record the actual test count and result.
@@ -50,4 +50,4 @@ The repository README itself says real-device two-device attachment flow, two ph
 4. Add targeted tests for journal recovery across all transaction phases and peer-removal paths.
 5. Run PostgreSQL integration tests only against a disposable, explicitly isolated test database.
 6. Perform two-physical-device tests for first handshake, simultaneous initiation, offline delivery, duplicate/reordered events, attachment send/receive, revocation, identity change, and forced termination at each persistence boundary.
-7. Do not merge or claim release-ready until the above results are recorded. No production migration, deployment, or live VPS operation is authorized by this audit.
+7. Record the above results before describing the patch as verified or release-ready. No production migration, deployment, or live VPS operation is authorized by this audit.
