@@ -34,3 +34,21 @@ MessageEncryptor → 依据 encryptionVersion 加解密
 2026-09-27 最终验证轮重新通过本机 Ratchet 状态重开、认证事件与附件描述传递的聚焦测试，并通过隔离 PostgreSQL 后端处理器测试。连接中的两台实体设备与运行中的联调后端均不可用，因此本轮没有重新验证实体设备握手、强制退出恢复、断网待发和附件上传下载闭环；会话可恢复性仍以局部测试为证据，不能据此启用完整 E2EE 状态。
 
 设计参考：[Signal X3DH 规范](https://signal.org/docs/specifications/x3dh/)与[Signal Double Ratchet 规范](https://signal.org/docs/specifications/doubleratchet/)。当前实现是 Luma 的实验性子集，不能声称兼容 Signal 协议。
+
+## 2026-10-13 源码审查补充
+
+PreKey 发布按本设备串行执行；状态查询和上传返回后重新读取 Keychain 中的当前私钥池，只清除本次已发布公钥的待发布标记。上传期间被接收流程消费的一次性私钥不得由旧快照重新写回。该调整不改变 v4 握手或信封格式。
+
+**legacy/默认关闭路径的发布阻塞项（原审查记录）**：设备双方同时发起第一次握手并提交各自发送链后，当前实现拒绝对方携带初始握手头的消息，不覆盖已有 Ratchet 状态。新增测试确认双方拒绝且状态版本不变；这不是通信成功验证。后续默认关闭的 protocolVersion=2 恢复路径见下方实现记录；生产验收尚未通过，不能通过静默重置 Session 绕过。
+
+## v4 protocolVersion=2 恢复执行器
+
+- `V4HandshakeRecoveryService` 串行执行设备对的 prepare/receive/协商；认证控制不直接替换 Ratchet。
+- `V4HandshakeRecoveryVault` 按 proposal/version 保存独立候选，协调高水位绑定记录摘要。journal 保存精确输出、前驱版本、待消费 OTP 和控制 outbox。根、链、skipped key、接收暂存 plaintext 均仅进入本设备 Keychain。
+- 每设备目标的 application outbox 保留精确信封，覆盖部分多目标准备及 HTTP 结果丢失；提交可以续办，重试不重新 seal。发送尝试前持久记录 `wasSubmitted`。
+- 已提交 cursor 启动时先完成 incoming journal，再向服务器 ack。缺失高水位、同版本不同内容或旧版本写入失败关闭，不假造空会话。
+- 控制传输失败不挡住入站同步。控制无需等待未来对端确认才提交当前已认证事件。
+- 2,000 个未确认应用序号与恢复控制的额度分开；控制 outbox 有独立上限。当前有界清单使用一个签名 segment（index=0/count=1），超界拒绝，未实现可扩展多段清单。
+- 从未进入 HTTP 的已 seal 事件可生成签名 cancellation 条目；结果不明确的 HTTP 请求必须保留，不能当作取消。关闭已读回执后此类历史回执暂停，不新增发送；若落选清单仍有缺口，排空可等待，不能超时重置。
+
+开关 `LumaV4HandshakeRecoveryEnabled` 缺省 false，只允许显式验证配置启用新版初始化。已有恢复状态仍须恢复，不把开关关闭解释为 legacy 降级。

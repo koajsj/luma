@@ -22,6 +22,7 @@ struct RemoteEventRouting: Decodable {
     let recipientDeviceID: UUID?
     let revokedDeviceID: UUID?
     let mutationEventID: UUID?
+    var controlID: UUID? = nil
 }
 
 struct RemoteSyncPage: Decodable {

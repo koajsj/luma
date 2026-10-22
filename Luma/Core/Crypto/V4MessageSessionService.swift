@@ -36,13 +36,21 @@ struct V4MessageSessionService {
     let vault: V4SessionVault
     let userID: String
     let localDeviceID: UUID
+    let recoveryConfiguration: V4RecoveryConfiguration
+    let recoveryParticipant: V4RecoveryParticipant?
+    var recovery: V4HandshakeRecoveryService {
+        .init(deviceVault: vault, userID: userID, localDevice: localDeviceID)
+    }
 
-    init(vault: V4SessionVault = V4SessionVault(), userID: String, localDeviceID: UUID) {
+    init(vault: V4SessionVault = V4SessionVault(), userID: String, localDeviceID: UUID,
+         recoveryConfiguration: V4RecoveryConfiguration = .init(), recoveryParticipant: V4RecoveryParticipant? = nil) {
         self.vault = vault; self.userID = userID; self.localDeviceID = localDeviceID
+        self.recoveryConfiguration = recoveryConfiguration; self.recoveryParticipant = recoveryParticipant
     }
 
     func prepare(_ plaintext: Data, messageID: UUID, conversationID: UUID,
                  targets: [V4SendTarget], attachmentIDs: [UUID]? = nil) throws -> Data {
+        try V4HandshakeRecoveryVault.serial {
         if let pending = try vault.outgoingPending(userID: userID, deviceID: localDeviceID) {
             guard pending.messageID == messageID else { throw V4VaultError.pendingOperation }
             return pending.request
@@ -52,6 +60,23 @@ struct V4MessageSessionService {
               let device = try vault.loadDevice(userID: userID, deviceID: localDeviceID) else {
             throw V4VaultError.missing
         }
+        // Validate the complete target set before sealing the first envelope. Keychain
+        // failures during later staging are owned by each encrypted per-device outbox.
+        for target in targets {
+            let bundle = target.bundle
+            guard bundle.deviceID != localDeviceID else { throw V4ProtocolError.wrongDevice }
+            try V4Handshake.verify(bundle, expectedFingerprint: bundle.identityFingerprint)
+            if let legacy = try vault.loadSession(userID: userID, local: localDeviceID, remote: bundle.deviceID) {
+                guard legacy.remoteUserID == target.remoteUserID, legacy.remoteIdentityFingerprint == bundle.identityFingerprint,
+                      bundle.keyVersion >= legacy.recipientKeyVersion else { throw V4ProtocolError.untrustedIdentity }
+            } else if try recoveryConfiguration.enabled || recovery.vault.find(remoteDevice: bundle.deviceID) != nil {
+                guard let own = recoveryParticipant, let remote = bundle.recoveryParticipant,
+                      remote.accountID == target.remoteUserID, bundle.recoveryProtocolVersion == 2,
+                      remote.deviceID == bundle.deviceID, remote.agreementPublicKey == bundle.identityAgreementPublicKey,
+                      remote.signingPublicKey == bundle.identitySigningPublicKey else { throw V4ProtocolError.untrustedIdentity }
+                _ = try V4RecoveryPair(own, remote)
+            }
+        }
         let identity = try device.identity()
         var candidates: [V4SessionVault.Session] = []
         var envelopes: [V4WireRecipient] = []
@@ -59,6 +84,25 @@ struct V4MessageSessionService {
             let bundle = target.bundle
             guard bundle.deviceID != localDeviceID else { throw V4ProtocolError.wrongDevice }
             try V4Handshake.verify(bundle, expectedFingerprint: bundle.identityFingerprint)
+            let legacy = try vault.loadSession(userID: userID, local: localDeviceID, remote: bundle.deviceID)
+            let existingRecovery = try recovery.vault.find(remoteDevice: bundle.deviceID)
+            let pendingRecovery = try recovery.vault.pairs().contains { pairID in
+                try recovery.vault.pending(pairID)?.next.coordinator.pair.participants.contains(where: { $0.deviceID == bundle.deviceID }) == true
+            }
+            if legacy == nil && (recoveryConfiguration.enabled || existingRecovery != nil || pendingRecovery) {
+                guard let own = recoveryParticipant, let remote = bundle.recoveryParticipant,
+                      remote.accountID == target.remoteUserID, bundle.recoveryProtocolVersion == 2 else {
+                    throw V4ProtocolError.untrustedIdentity
+                }
+                let pair = try V4RecoveryPair(own, remote)
+                let bytes = try recovery.prepare(plaintext, messageID: messageID, conversationID: conversationID,
+                    pair: pair, recipient: bundle)
+                let sealed = try JSONDecoder().decode(V4RatchetMessage.self, from: bytes)
+                envelopes.append(.init(recipientDeviceID: bundle.deviceID.uuidString.lowercased(),
+                    ciphertext: bytes.base64URLEncodedString(), keyVersion: bundle.keyVersion,
+                    messageKeyIndex: Int64(sealed.messageIndex)))
+                continue
+            }
             var session: V4SessionVault.Session
             if let existing = try vault.loadSession(userID: userID, local: localDeviceID,
                                                     remote: bundle.deviceID) {
@@ -99,9 +143,11 @@ struct V4MessageSessionService {
         try vault.stageOutgoing(.init(messageID: messageID, request: request, sessions: candidates),
             userID: userID, deviceID: localDeviceID)
         return request
+        }
     }
 
     func commitPreparedSend(messageID: UUID) throws {
+        try recovery.commit(messageID)
         try vault.finishOutgoing(userID: userID, deviceID: localDeviceID, messageID: messageID)
     }
 
@@ -123,6 +169,19 @@ struct V4MessageSessionService {
                  senderUserID: UUID, senderBundle: V4PreKeyBundle) throws -> Data {
         guard envelope.encryptionVersion == 4, envelope.receiverDeviceID == localDeviceID,
               envelope.senderDeviceID == senderBundle.deviceID else { throw V4ProtocolError.invalidMessage }
+        if envelope.recoveryProposal != nil || envelope.initialHeader?.protocolVersion != nil {
+            guard let own = recoveryParticipant, let remote = senderBundle.recoveryParticipant,
+                  remote.accountID == senderUserID,
+                  senderBundle.recoveryProtocolVersion == 2,
+                  (try recoveryConfiguration.enabled || recovery.vault.find(remoteDevice: envelope.senderDeviceID) != nil) else {
+                throw V4ProtocolError.untrustedIdentity
+            }
+            return try recovery.receive(wire, eventID: eventID, deviceSeq: deviceSeq,
+                pair: V4RecoveryPair(own, remote), control: false)
+        }
+        guard try recovery.vault.find(remoteDevice: envelope.senderDeviceID) == nil else {
+            throw V4ProtocolError.untrustedIdentity
+        }
         let digest = Data(SHA256.hash(data: wire))
         if let pending = try vault.incomingPending(userID: userID, deviceID: localDeviceID) {
             guard pending.eventID == eventID, pending.deviceSeq == deviceSeq,
@@ -176,10 +235,12 @@ struct V4MessageSessionService {
     }
 
     func finishReceived(eventID: UUID) throws {
+        try recovery.finish(eventID)
         try vault.finishIncoming(userID: userID, deviceID: localDeviceID, eventID: eventID)
     }
 
     func recoverReceived(committedCursor: Int64) throws {
+        try recovery.vault.recoverIncoming(cursor: committedCursor)
         try vault.recoverIncoming(userID: userID, deviceID: localDeviceID,
             committedCursor: committedCursor)
     }

@@ -70,17 +70,25 @@ func ClientIP(r *http.Request, trustedProxy netip.Addr) string {
 	}
 	return peer.Unmap().String()
 }
+
+// Allocate and expire the counter together. Repair an old counter left without
+// a TTL by an interrupted INCR/EXPIRE pair as well.
+var rateCounter = redis.NewScript(`
+local count = redis.call('INCR', KEYS[1])
+if redis.call('PTTL', KEYS[1]) < 0 then
+    redis.call('PEXPIRE', KEYS[1], ARGV[1])
+end
+return count
+`)
+
 func Limit(redis *redis.Client, prefix string, max int, window time.Duration, trustedProxy netip.Addr, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ip := ClientIP(r, trustedProxy)
 		key := "rate:" + prefix + ":" + ip
-		n, e := redis.Incr(r.Context(), key).Result()
+		n, e := rateCounter.Run(r.Context(), redis, []string{key}, window.Milliseconds()).Int64()
 		if e != nil {
 			Fail(w, r, 503, "rate_limit_unavailable")
 			return
-		}
-		if n == 1 {
-			redis.Expire(r.Context(), key, window)
 		}
 		if n > int64(max) {
 			Fail(w, r, 429, "rate_limited")

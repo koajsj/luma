@@ -60,6 +60,9 @@ private extension RemoteMessageRepository {
                 guard try security.currentUserID() == user.userID else { throw MessageStoreError.locked }
                 let original = try localEvent(from: item)
                 if original.kind == .read && !security.preferences.readReceipts {
+                    // Unknown HTTP outcomes cannot become signed cancellations. Keep exact
+                    // ciphertext and pause; do not silently lose the drain obligation.
+                    guard try v4Sessions.recovery.cancelUnsubmitted(item.eventID) else { return }
                     try v4Vault.cancelOutgoing(userID: user.userID,
                         deviceID: registration.backendDeviceID, messageID: item.eventID)
                     context.delete(item)
@@ -117,8 +120,10 @@ private extension RemoteMessageRepository {
                     try context.save()
                 }
                 try v4Sessions.commitPreparedSend(messageID: item.eventID)
+                try v4Sessions.recovery.markSubmitted(item.eventID)
                 _ = try await client.request("POST", path: "/messages/v4/events", body: bytes,
                     extraHeaders: ["Idempotency-Key": item.eventID.uuidString.lowercased()])
+                try v4Sessions.recovery.acknowledgeApplication(item.eventID)
                 // Local state is applied only after an acknowledged request.
                 if let event { try applyOwnV4Event(event) }
                 context.delete(item)
@@ -217,6 +222,8 @@ private extension RemoteMessageRepository {
         if let pending = try v4Vault.incomingPending(userID: user.userID,
             deviceID: registration.backendDeviceID) {
             try ensureV4Metadata(pending.session, friendID: isMine ? nil : friend.id)
+        } else if let pending = try v4Sessions.recovery.vault.pendingForOperation(event.eventID).first?.1 {
+            try ensureRecoveryMetadata(pending.next, remote: sourceDevice, friendID: isMine ? nil : friend.id)
         }
         switch kind {
         case .edit:
@@ -288,15 +295,17 @@ struct RemoteMessageRepository {
     let security: SecurityManager
     let client: RemoteAPIClient
     let registration: RemoteRegistration
+    let recoveryConfiguration: V4RecoveryConfiguration = .current
     private let keychain = KeychainManager()
     private var v4Vault: V4SessionVault { V4SessionVault(keychain: keychain) }
     private var v4Sessions: V4MessageSessionService {
         V4MessageSessionService(vault: v4Vault, userID: user.userID,
-            localDeviceID: registration.backendDeviceID)
+            localDeviceID: registration.backendDeviceID,
+            recoveryConfiguration: recoveryConfiguration, recoveryParticipant: try? localRecoveryParticipant())
     }
     private var v4Prekeys: V4PreKeyService {
         V4PreKeyService(context: context, user: user, registration: registration,
-            client: client, vault: v4Vault)
+            client: client, vault: v4Vault, recoveryConfiguration: recoveryConfiguration)
     }
 
     func sendText(_ text: String, to friend: Friend, in conversation: Conversation) async throws {
@@ -530,13 +539,22 @@ struct RemoteMessageRepository {
     private func v4Bundles(for remoteID: UUID, fingerprint: String) async throws -> [V4PreKeyBundle] {
         let publicBundles = try await v4Prekeys.bundles(for: remoteID,
             expectedAccountFingerprint: fingerprint, claim: false)
-        let missing = try publicBundles.contains { bundle in
+        let missing = try publicBundles.filter { bundle in
             try v4Vault.loadSession(userID: user.userID,
-                local: registration.backendDeviceID, remote: bundle.deviceID) == nil
+                local: registration.backendDeviceID, remote: bundle.deviceID) == nil &&
+                v4Sessions.recovery.vault.find(remoteDevice: bundle.deviceID) == nil
         }
-        if missing {
-            return try await v4Prekeys.bundles(for: remoteID,
+        if !missing.isEmpty {
+            let claimed = try await v4Prekeys.bundles(for: remoteID,
                 expectedAccountFingerprint: fingerprint, claim: true)
+            // Preserve already-prepared peers even if the server skips their depleted OTP pool.
+            return try publicBundles.map { bundle in
+                guard missing.contains(where: { $0.deviceID == bundle.deviceID }) else { return bundle }
+                guard let available = claimed.first(where: { $0.deviceID == bundle.deviceID }) else {
+                    throw V4ProtocolError.invalidPreKey
+                }
+                return available
+            }
         }
         return publicBundles
     }
@@ -783,9 +801,23 @@ struct RemoteMessageRepository {
                         })?.id
                         try ensureV4Metadata(session, friendID: friendID)
                     }
+                    for (_, operation) in try v4Sessions.recovery.vault.pendingForOperation(item.messageID) {
+                        let remote = operation.next.coordinator.pair.participants.first(where: { $0.deviceID != registration.backendDeviceID })
+                        if let remote {
+                            let friendID = try context.fetch(FetchDescriptor<Friend>()).first(where: {
+                                $0.ownerID == user.id && $0.remoteUserID == remote.accountID
+                            })?.id
+                            try ensureRecoveryMetadata(operation.next, remote: remote.deviceID, friendID: friendID)
+                        }
+                    }
                     try context.save()
                 }
                 try v4Sessions.commitPreparedSend(messageID: item.messageID)
+            }, send: { body, id in
+                try v4Sessions.recovery.markSubmitted(id)
+                _ = try await client.request("POST", path: "/messages", body: body,
+                    extraHeaders: ["Idempotency-Key": id.uuidString.lowercased()])
+                try v4Sessions.recovery.acknowledgeApplication(id)
             })
             try await retryV4Events()
         } catch RemoteError.deviceRevoked {
@@ -1007,6 +1039,10 @@ struct RemoteMessageRepository {
     /// v4 events are authenticated against the pinned account identity and the
     /// authenticated device bundle before any plaintext reaches MessageStore.
     func applyV4(_ event: RemoteSyncEvent) async throws {
+        if event.type == "session.control" {
+            try await applySessionControl(event)
+            return
+        }
         if event.type != "message.created" {
             try await applyV4Control(event)
             return
@@ -1029,8 +1065,9 @@ struct RemoteMessageRepository {
            let existing = try context.fetch(FetchDescriptor<Message>()).first(where: { $0.id == messageID }) {
             guard existing.transportEncryptionVersion == 4,
                   existing.lastEventID == event.eventID,
-                  try v4Vault.incomingPending(userID: user.userID,
-                      deviceID: registration.backendDeviceID)?.eventID == event.eventID else {
+                  (try v4Vault.incomingPending(userID: user.userID,
+                      deviceID: registration.backendDeviceID)?.eventID == event.eventID ||
+                      !v4Sessions.recovery.vault.pendingForOperation(event.eventID).isEmpty) else {
                 throw V4ProtocolError.replay
             }
             return
@@ -1081,6 +1118,8 @@ struct RemoteMessageRepository {
         if let pending = try v4Vault.incomingPending(userID: user.userID,
             deviceID: registration.backendDeviceID) {
             try ensureV4Metadata(pending.session, friendID: friend.id)
+        } else if let pending = try v4Sessions.recovery.vault.pendingForOperation(event.eventID).first?.1 {
+            try ensureRecoveryMetadata(pending.next, remote: senderDeviceID, friendID: isMine ? nil : friend.id)
         }
         let conversation = try localConversation(remoteID: envelope.conversationID, friend: friend)
         let store = MessageStore(context: context, encryption: try security.encryptionService())
@@ -1123,6 +1162,93 @@ struct RemoteMessageRepository {
             else { context.insert(Reaction(messageID: messageID, emoji: body.text, reactorID: body.senderUserID)) }
             try context.save()
         }
+    }
+
+    private func ensureRecoveryMetadata(_ state: V4RecoverySnapshot, remote: UUID, friendID: UUID?) throws {
+        guard state.coordinator.pair.participants.contains(where: { $0.deviceID == remote }) else {
+            throw V4ProtocolError.untrustedIdentity
+        }
+        if let metadata = try context.fetch(FetchDescriptor<V4SessionMetadata>()).first(where: {
+            $0.ownerID == user.id && $0.localDeviceID == registration.backendDeviceID && $0.remoteDeviceID == remote
+        }) {
+            guard metadata.friendID == friendID else { throw V4ProtocolError.untrustedIdentity }
+            metadata.updatedAt = .now
+        } else {
+            context.insert(V4SessionMetadata(ownerID: user.id, friendID: friendID,
+                localDeviceID: registration.backendDeviceID, remoteDeviceID: remote, sessionVersion: 1))
+        }
+    }
+
+    private func localRecoveryParticipant() throws -> V4RecoveryParticipant {
+        guard let fingerprint = user.identityFingerprint,
+              let own = try v4Vault.loadDevice(userID: user.userID, deviceID: registration.backendDeviceID) else {
+            throw V4VaultError.missing
+        }
+        let identity = try own.identity()
+        return .init(accountID: registration.backendUserID, deviceID: registration.backendDeviceID,
+            accountFingerprint: fingerprint, agreementPublicKey: identity.agreement.publicKey.rawRepresentation,
+            signingPublicKey: identity.signing.publicKey.rawRepresentation)
+    }
+
+    func drainSessionControls() async throws {
+        let provider = RemoteSessionControlProvider(client: client)
+        var failure: Error?
+        for item in try v4Sessions.recovery.controls() {
+            guard try security.currentUserID() == user.userID else { throw MessageStoreError.locked }
+            do {
+                try await provider.send(item)
+                // HTTP success removes transport work; only authenticated peer controls establish a session.
+                guard let wire = try? JSONDecoder().decode(V4RatchetMessage.self, from: item.wire),
+                      let proposal = wire.recoveryProposal else { throw V4ProtocolError.invalidMessage }
+                try v4Sessions.recovery.acknowledgeControl(item.id, pairID: proposal.pairID)
+            } catch RemoteError.deviceRevoked { throw RemoteError.deviceRevoked }
+            catch {
+                if error is CancellationError { throw error }
+                // One denied/offline peer must not starve the other independent device pairs.
+                failure = error
+            }
+        }
+        if let failure { throw failure }
+    }
+
+    private func applySessionControl(_ event: RemoteSyncEvent) async throws {
+        guard event.routing.encryptionVersion == 4, event.routing.controlID == event.eventID,
+              event.routing.recipientDeviceID == registration.backendDeviceID,
+              let senderID = event.routing.senderUserID, let deviceID = event.routing.senderDeviceID,
+              let conversationID = event.routing.conversationID,
+              let wire = Data(base64URL: event.payloadCiphertext),
+              let envelope = try? JSONDecoder().decode(V4RatchetMessage.self, from: wire),
+              envelope.conversationID == conversationID, envelope.senderDeviceID == deviceID,
+              envelope.receiverDeviceID == registration.backendDeviceID, envelope.messageID == event.eventID else {
+            throw V4ProtocolError.invalidMessage
+        }
+        let fingerprint: String
+        if senderID == registration.backendUserID { fingerprint = try requiredOwnFingerprint() }
+        else {
+            guard let friend = try context.fetch(FetchDescriptor<Friend>()).first(where: {
+                $0.ownerID == user.id && $0.remoteUserID == senderID && $0.sessionStatus != "identityKeyChanged"
+            }), let pinned = friend.identityFingerprint else { throw V4ProtocolError.untrustedIdentity }
+            fingerprint = pinned
+        }
+        let bundle = try await v4Prekeys.senderBundle(for: senderID, deviceID: deviceID,
+            expectedAccountFingerprint: fingerprint)
+        guard try security.currentUserID() == user.userID else { throw MessageStoreError.locked }
+        if senderID != registration.backendUserID {
+            // Trust/ownership may have changed while the public directory request was in flight.
+            guard try context.fetch(FetchDescriptor<Friend>()).contains(where: {
+                $0.ownerID == user.id && $0.remoteUserID == senderID &&
+                $0.sessionStatus != "identityKeyChanged" && $0.identityFingerprint == fingerprint
+            }) else { throw V4ProtocolError.untrustedIdentity }
+        }
+        guard bundle.recoveryProtocolVersion == 2, let remote = bundle.recoveryParticipant else {
+            throw V4ProtocolError.untrustedIdentity
+        }
+        let pair = try V4RecoveryPair(localRecoveryParticipant(), remote)
+        guard try recoveryConfiguration.enabled || v4Sessions.recovery.vault.load(pair.id) != nil else {
+            throw V4ProtocolError.untrustedIdentity
+        }
+        _ = try v4Sessions.recovery.receive(wire, eventID: event.eventID, deviceSeq: event.deviceSeq,
+            pair: pair, control: true)
     }
 
     private func ensureV4Metadata(_ session: V4SessionVault.Session, friendID: UUID?) throws {

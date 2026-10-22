@@ -13,6 +13,10 @@ require_install() {
     [[ -f "$ENV_FILE" && -d "$APP_DIR/.git" && -f "$COMPOSE_FILE" ]] || die '未找到完整安装；请先运行 install.sh。'
     [[ $(stat -c %a "$ENV_FILE") == 600 ]] || die '私有配置权限必须为 600。'
 }
+require_no_incomplete_restore() {
+    [[ ! -e /opt/luma/config/restore-state && ! -e /opt/luma/data/.storage-before-restore ]] ||
+        die '存在未完成的恢复；先运行 luma restore recover，禁止继续备份或更新。'
+}
 require_clean_main() {
     [[ $(git -C "$APP_DIR" branch --show-current) == main ]] || die '服务器仓库必须位于 main 分支。'
     [[ -z $(git -C "$APP_DIR" status --porcelain) ]] || die '服务器仓库有本地改动；为防止覆盖，操作已停止。'

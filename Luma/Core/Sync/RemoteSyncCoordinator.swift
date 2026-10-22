@@ -33,6 +33,7 @@ struct RemoteSyncCoordinator {
         try V4MessageSessionService(userID: repository.user.userID,
             localDeviceID: deviceID).recoverReceived(committedCursor: checkpoint.cursor)
         let provider = RemoteMessageSyncProvider(client: repository.client)
+        // Never let a failed control upload block inbound revocation/confirmation events.
         if checkpoint.cursor > 0 { try await provider.acknowledge(checkpoint.cursor) }
         let page = try await provider.fetch(after: checkpoint.cursor, limit: limit)
         var applied = 0
@@ -70,6 +71,7 @@ struct RemoteSyncCoordinator {
             try await provider.acknowledge(checkpoint.cursor)
             applied += 1
         }
+        try await repository.drainSessionControls()
         return applied
     }
 

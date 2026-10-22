@@ -24,6 +24,7 @@ final class SecurityManager {
     private(set) var activeUserID: String?
     private(set) var preferences = PrivacyPreferences()
     var startupError: String?
+    var logoutNotice: String?
     private let keychain: KeychainManager
     private let keys: KeyManager
     private let lifecycle: KeyLifecycleManager
@@ -140,6 +141,19 @@ final class SecurityManager {
     }
 
     func logout() throws {
+        if let activeUserID {
+            let remote = RemoteSessionStore(keychain: keychain)
+            let hasRegistration = try remote.registration(for: activeUserID) != nil
+            if hasRegistration {
+                try remote.markRevocationPending(for: activeUserID)
+            }
+            if try remote.revocationPending(for: activeUserID) {
+                logoutNotice = "本机已退出。服务器会话正在撤销；若当前离线，下次解锁并联网后会重试。"
+            } else {
+                logoutNotice = nil
+            }
+            try remote.clearTokens(for: activeUserID)
+        }
         try keychain.delete(sessionAccount)
         unlockedKey = nil
         preferences = PrivacyPreferences()

@@ -12,3 +12,5 @@
 | 安全 | [威胁模型](Security/Threat_Model.md) · [隐私模型](Security/Privacy_Model.md) · [上线前审计清单](Security/Security_Audit_Checklist.md) |
 
 开发新功能前，先读对应的 Architecture、Security、Protocol 文档，并对照当前代码确认状态。若实现与文档不符，以代码的可验证行为为准，同时更新文档。不要把设计草案描述为已部署能力。
+
+最新源码审查：[2026-10-13 审查与修复记录](Security/Source_Audit_2026-10-13.md)。包含审查时的修复证据与首次会话并发冲突。后续默认关闭的恢复实现与剩余验收项见 [v4 恢复验收](Security/V4_Recovery_Validation.md)。

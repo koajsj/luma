@@ -348,36 +348,64 @@ struct V4SessionVault {
         try keychain.delete(outgoingAccount(userID, deviceID))
         try keychain.delete(incomingAccount(userID, deviceID))
         for peer in peers { try deleteSession(userID: userID, local: deviceID, remote: peer) }
+        try V4HandshakeRecoveryVault(keychain: keychain, userID: userID, localDevice: deviceID).purge()
         try deleteDevice(userID: userID, deviceID: deviceID)
     }
 
     /// Removes material for a revoked device or an identity that must be reverified.
-    /// Pending journals referencing that peer cannot be replayed with stale trust.
+    /// Never discard a journal after session writes may have started: an outgoing
+    /// message can advance several recipient ratchets as one logical operation.
     func deletePeer(userID: String, localDeviceID: UUID, remoteDeviceID: UUID) throws {
-        try deleteSession(userID: userID, local: localDeviceID, remote: remoteDeviceID)
         if let pending = try outgoingPending(userID: userID, deviceID: localDeviceID),
            pending.sessions.contains(where: { $0.remoteDeviceID == remoteDeviceID }) {
-            try keychain.delete(outgoingAccount(userID, localDeviceID))
+            if pending.phase == .prepared {
+                try keychain.delete(outgoingAccount(userID, localDeviceID))
+            } else {
+                try finishOutgoing(userID: userID, deviceID: localDeviceID,
+                    messageID: pending.messageID)
+            }
         }
         if let pending = try incomingPending(userID: userID, deviceID: localDeviceID),
            pending.session.remoteDeviceID == remoteDeviceID {
-            try keychain.delete(incomingAccount(userID, localDeviceID))
+            // The vault cannot know whether SwiftData and the sync cursor committed.
+            // Keep the exact journal and let sync recovery resolve it before cleanup.
+            throw V4VaultError.pendingOperation
         }
+        try V4HandshakeRecoveryVault(keychain: keychain, userID: userID,
+            localDevice: localDeviceID).removePeer(remoteDeviceID)
+        try deleteSession(userID: userID, local: localDeviceID, remote: remoteDeviceID)
     }
 
+    /// Resolve any in-progress ratchet transaction before a caller removes all sessions
+    /// for a peer whose identity changed or whose friendship was deleted.
     func discardPendingForRemoteUser(userID: String, localDeviceID: UUID,
                                      remoteUserID: UUID) throws {
+        let recovery = V4HandshakeRecoveryVault(keychain: keychain, userID: userID, localDevice: localDeviceID)
         if let pending = try outgoingPending(userID: userID, deviceID: localDeviceID),
            pending.sessions.contains(where: { $0.remoteUserID == remoteUserID }) {
-            try keychain.delete(outgoingAccount(userID, localDeviceID))
+            if pending.phase == .prepared {
+                try keychain.delete(outgoingAccount(userID, localDeviceID))
+            } else {
+                try finishOutgoing(userID: userID, deviceID: localDeviceID,
+                    messageID: pending.messageID)
+            }
         }
         if let pending = try incomingPending(userID: userID, deviceID: localDeviceID),
            pending.session.remoteUserID == remoteUserID {
-            try keychain.delete(incomingAccount(userID, localDeviceID))
+            throw V4VaultError.pendingOperation
+        }
+        for pair in try recovery.pairs() {
+            if let state = try recovery.pending(pair)?.next ?? recovery.load(pair),
+               let remote = state.coordinator.pair.participants.first(where: {
+                   $0.deviceID != localDeviceID && $0.accountID == remoteUserID
+               }) {
+                try recovery.removePeer(remote.deviceID)
+            }
         }
     }
 
     func purgeAccount(userID: String) throws {
+        try keychain.deleteAccounts(prefix: "v4.recovery.\(userID).")
         for category in ["session", "version", "device", "outgoing", "incoming"] {
             try keychain.deleteAccounts(prefix: "v4.\(category).\(userID).")
         }

@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 func Open(ctx context.Context, url string) (*pgxpool.Pool, error) {
@@ -24,7 +25,29 @@ func Open(ctx context.Context, url string) (*pgxpool.Pool, error) {
 	return p, nil
 }
 func Migrate(ctx context.Context, p *pgxpool.Pool, dir string) error {
-	if _, e := p.Exec(ctx, "CREATE TABLE IF NOT EXISTS schema_migrations(version integer PRIMARY KEY)"); e != nil {
+	// A dedicated connection holds the migration lock across per-file transactions.
+	// Concurrent backend startup must not both observe an unapplied migration.
+	conn, err := p.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	const migrationLock int64 = 0x4c554d410001
+	if _, err = conn.Exec(ctx, "SELECT pg_advisory_lock($1)", migrationLock); err != nil {
+		_ = conn.Hijack().Close(context.Background())
+		return err
+	}
+	defer func() {
+		cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		var unlocked bool
+		if err := conn.QueryRow(cleanup, "SELECT pg_advisory_unlock($1)", migrationLock).Scan(&unlocked); err != nil || !unlocked {
+			// Never return a connection still holding a session lock to the pool.
+			_ = conn.Hijack().Close(cleanup)
+		} else {
+			conn.Release()
+		}
+	}()
+	if _, e := conn.Exec(ctx, "CREATE TABLE IF NOT EXISTS schema_migrations(version integer PRIMARY KEY)"); e != nil {
 		return e
 	}
 	entries, e := os.ReadDir(dir)
@@ -44,7 +67,7 @@ func Migrate(ctx context.Context, p *pgxpool.Pool, dir string) error {
 		if e != nil {
 			return e
 		}
-		tx, e := p.BeginTx(ctx, pgx.TxOptions{})
+		tx, e := conn.BeginTx(ctx, pgx.TxOptions{})
 		if e != nil {
 			return e
 		}

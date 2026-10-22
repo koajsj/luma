@@ -72,8 +72,20 @@ func (s Service) Request(w http.ResponseWriter, r *http.Request) {
 		middleware.Fail(w, r, 404, "not_found")
 		return
 	}
+	tx, e := s.DB.Begin(r.Context())
+	if e != nil {
+		middleware.Fail(w, r, 503, "storage_unavailable")
+		return
+	}
+	defer tx.Rollback(r.Context())
+	// Serialize requests with block and accept for this pair. Otherwise a block
+	// can commit between the check and the request insert.
+	if e = lockPair(r, tx, me, target); e != nil {
+		middleware.Fail(w, r, 503, "storage_unavailable")
+		return
+	}
 	var blocked bool
-	if e = s.DB.QueryRow(r.Context(), "SELECT EXISTS(SELECT 1 FROM blocks WHERE (blocker=$1 AND blocked=$2) OR (blocker=$2 AND blocked=$1))", me, target).Scan(&blocked); e != nil {
+	if e = tx.QueryRow(r.Context(), "SELECT EXISTS(SELECT 1 FROM blocks WHERE (blocker=$1 AND blocked=$2) OR (blocker=$2 AND blocked=$1))", me, target).Scan(&blocked); e != nil {
 		middleware.Fail(w, r, 503, "storage_unavailable")
 		return
 	}
@@ -81,8 +93,8 @@ func (s Service) Request(w http.ResponseWriter, r *http.Request) {
 		middleware.Fail(w, r, 404, "not_found")
 		return
 	}
-	_, e = s.DB.Exec(r.Context(), "INSERT INTO friend_requests(from_user,to_user) VALUES($1,$2) ON CONFLICT(from_user,to_user) DO UPDATE SET status='pending',updated_at=now() WHERE friend_requests.status='rejected'", me, target)
-	if e != nil {
+	_, e = tx.Exec(r.Context(), "INSERT INTO friend_requests(from_user,to_user) VALUES($1,$2) ON CONFLICT(from_user,to_user) DO UPDATE SET status='pending',updated_at=now() WHERE friend_requests.status='rejected'", me, target)
+	if e != nil || tx.Commit(r.Context()) != nil {
 		middleware.Fail(w, r, 503, "storage_unavailable")
 		return
 	}
@@ -103,13 +115,21 @@ func (s Service) Decide(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback(r.Context())
 	var a, b string
-	e = tx.QueryRow(r.Context(), "SELECT from_user,to_user FROM friend_requests WHERE id=$1 AND to_user=$2 AND status='pending' FOR UPDATE", in.RequestID, middleware.Current(r).UserID).Scan(&a, &b)
+	e = tx.QueryRow(r.Context(), "SELECT from_user,to_user FROM friend_requests WHERE id=$1 AND to_user=$2 AND status='pending'", in.RequestID, middleware.Current(r).UserID).Scan(&a, &b)
 	if e != nil {
 		middleware.Fail(w, r, 404, "not_found")
 		return
 	}
 	if e = lockPair(r, tx, a, b); e != nil {
 		middleware.Fail(w, r, 503, "storage_unavailable")
+		return
+	}
+	// All pair operations acquire the advisory lock before a request row lock.
+	// Recheck pending state after the lock because the first read was unlocked.
+	var lockedA, lockedB string
+	e = tx.QueryRow(r.Context(), "SELECT from_user,to_user FROM friend_requests WHERE id=$1 AND to_user=$2 AND status='pending' FOR UPDATE", in.RequestID, middleware.Current(r).UserID).Scan(&lockedA, &lockedB)
+	if e != nil || lockedA != a || lockedB != b {
+		middleware.Fail(w, r, 404, "not_found")
 		return
 	}
 	var blocked bool
@@ -138,9 +158,23 @@ func (s Service) Decide(w http.ResponseWriter, r *http.Request) {
 func (s Service) Remove(w http.ResponseWriter, r *http.Request) {
 	me := middleware.Current(r).UserID
 	other := r.PathValue("id")
-	tag, e := s.DB.Exec(r.Context(), "DELETE FROM friendships WHERE user_a=LEAST($1::uuid,$2::uuid) AND user_b=GREATEST($1::uuid,$2::uuid)", me, other)
+	tx, e := s.DB.Begin(r.Context())
+	if e != nil {
+		middleware.Fail(w, r, 503, "storage_unavailable")
+		return
+	}
+	defer tx.Rollback(r.Context())
+	if e = lockPair(r, tx, me, other); e != nil {
+		middleware.Fail(w, r, 503, "storage_unavailable")
+		return
+	}
+	tag, e := tx.Exec(r.Context(), "DELETE FROM friendships WHERE user_a=LEAST($1::uuid,$2::uuid) AND user_b=GREATEST($1::uuid,$2::uuid)", me, other)
 	if e != nil || tag.RowsAffected() == 0 {
 		middleware.Fail(w, r, 404, "not_found")
+		return
+	}
+	if e = tx.Commit(r.Context()); e != nil {
+		middleware.Fail(w, r, 503, "storage_unavailable")
 		return
 	}
 	w.WriteHeader(204)
@@ -189,6 +223,10 @@ func (s Service) Requests(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		out = append(out, map[string]any{"requestID": id, "fromUserID": user, "createdAt": created})
+	}
+	if rows.Err() != nil {
+		middleware.Fail(w, r, 503, "storage_unavailable")
+		return
 	}
 	middleware.JSON(w, 200, out)
 }

@@ -20,6 +20,8 @@ struct OnlineConnectionViewModel {
         (try store.registration(for: user.userID), try store.tokens(for: user.userID) != nil)
     }
 
+    func pendingRevocation() throws -> Bool { try store.revocationPending(for: user.userID) }
+
     func register(address: String) async throws -> RemoteRegistration {
         guard let url = URL(string: address) else { throw RemoteError.invalidURL }
         return try await RemoteAuthProvider(context: context).register(user: user, baseURL: url,
@@ -32,6 +34,10 @@ struct OnlineConnectionViewModel {
 
     func signOut() async throws {
         try await RemoteAuthProvider(context: context).signOut(userID: user.userID)
+    }
+
+    func retryPendingRevocation() async throws {
+        try await RemoteAuthProvider(context: context).revokePending(userID: user.userID)
     }
 
     func devices() async throws -> [RemoteDeviceInfo] {

@@ -11,6 +11,9 @@ struct AuthenticationView: View {
     var body: some View {
         NavigationStack {
             Form {
+                if let notice = security.logoutNotice {
+                    Section { Text(notice).foregroundStyle(.secondary) }
+                }
                 Section {
                     TextField("UserID", text: $viewModel.userID)
                         .textInputAutocapitalization(.never)

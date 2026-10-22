@@ -13,10 +13,14 @@ case ${1:-} in
         action=$1; shift
         exec bash "$APP_DIR/deploy/$action.sh" "$@"
         ;;
+    backup-key)
+        [[ ${2:-} == rotate ]] || die '用法：luma backup-key rotate'
+        exec bash "$APP_DIR/deploy/backup-key.sh"
+        ;;
     domain)
         [[ ${2:-} == change ]] || die '用法：luma domain change [新域名]'
         shift 2
         exec bash "$APP_DIR/deploy/domain.sh" "$@"
         ;;
-    *) die '用法：luma {status|logs|update|backup|restore|domain change|rollback}' ;;
+    *) die '用法：luma {status|logs|update|backup|backup-key rotate|restore|domain change|rollback}' ;;
 esac

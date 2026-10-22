@@ -31,7 +31,16 @@ func (s S3Storage) Put(ctx context.Context, key string, data []byte) error {
 	return err
 }
 func (s S3Storage) Open(ctx context.Context, key string) (io.ReadCloser, error) {
-	return s.Client.GetObject(ctx, s.Bucket, key, minio.GetObjectOptions{})
+	object, err := s.Client.GetObject(ctx, s.Bucket, key, minio.GetObjectOptions{})
+	if err != nil {
+		return nil, err
+	}
+	// GetObject is lazy: force the object lookup before a download writes 200.
+	if _, err = object.Stat(); err != nil {
+		_ = object.Close()
+		return nil, err
+	}
+	return object, nil
 }
 func (s S3Storage) Delete(ctx context.Context, key string) error {
 	return s.Client.RemoveObject(ctx, s.Bucket, key, minio.RemoveObjectOptions{})

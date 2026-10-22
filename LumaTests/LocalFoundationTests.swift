@@ -5,6 +5,150 @@ import XCTest
 
 @MainActor
 final class LocalFoundationTests: XCTestCase {
+    func testConcurrentRequestsShareTokenRefresh() async throws {
+        let keychain = KeychainManager(service: "app.luma.refresh.\(UUID().uuidString)")
+        let store = RemoteSessionStore(keychain: keychain)
+        let signer = RemoteDeviceSigner(keychain: keychain)
+        let userID = "refresh-test"
+        defer { try? store.clearAll(for: userID) }
+        _ = try signer.publicKey(for: userID)
+        try keychain.save(JSONEncoder().encode(RemoteTokens(accessToken: "expired-test-token",
+            refreshToken: "refresh-test-token", expiresAt: .distantPast)), account: "remote.tokens.\(userID)")
+        TokenRefreshURLProtocol.reset()
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [TokenRefreshURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let url = URL(string: "https://refresh.example.invalid")!
+        let firstClient = try RemoteAPIClient(baseURL: url, userID: userID, store: store, signer: signer, session: session)
+        let secondClient = try RemoteAPIClient(baseURL: url, userID: userID, store: store, signer: signer, session: session)
+        async let first = firstClient.request("GET", path: "/users/me")
+        async let second = secondClient.request("GET", path: "/users/me")
+        _ = try await (first, second)
+        XCTAssertEqual(TokenRefreshURLProtocol.refreshCount, 1,
+            "Concurrent clients must not reuse the same rotating refresh token")
+    }
+
+    func testLogoutDuringRefreshDoesNotRestoreTokens() async throws {
+        let keychain = KeychainManager(service: "app.luma.logout-refresh.\(UUID().uuidString)")
+        let store = RemoteSessionStore(keychain: keychain)
+        let signer = RemoteDeviceSigner(keychain: keychain)
+        let userID = "logout-refresh-test"
+        defer { try? store.clearAll(for: userID) }
+        _ = try signer.publicKey(for: userID)
+        try keychain.save(JSONEncoder().encode(RemoteTokens(accessToken: "expired-test-token",
+            refreshToken: "logout-test-token", expiresAt: .distantPast)), account: "remote.tokens.\(userID)")
+        TokenRefreshURLProtocol.reset()
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [TokenRefreshURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let client = try RemoteAPIClient(baseURL: URL(string: "https://refresh.example.invalid")!,
+            userID: userID, store: store, signer: signer, session: session)
+        let request = Task { try await client.request("GET", path: "/users/me") }
+        for _ in 0..<100 where TokenRefreshURLProtocol.refreshCount == 0 {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(TokenRefreshURLProtocol.refreshCount, 1)
+        try store.clearTokens(for: userID)
+        do { _ = try await request.value; XCTFail("Logged-out request should fail") }
+        catch RemoteError.authenticationExpired { }
+        XCTAssertNil(try store.tokens(for: userID))
+    }
+
+    func testOfflineSignOutRetriesWithDeviceSignatureWithoutKeepingTokens() async throws {
+        let userID = "revoke-test"
+        let keychain = KeychainManager(service: "app.luma.revoke.\(UUID().uuidString)")
+        let store = RemoteSessionStore(keychain: keychain)
+        let signer = RemoteDeviceSigner(keychain: keychain)
+        defer { try? store.clearAll(for: userID) }
+        _ = try signer.publicKey(for: userID)
+        try store.save(RemoteRegistration(backendUserID: UUID(), backendDeviceID: UUID(),
+            baseURL: URL(string: "https://revoke.example.invalid")!), for: userID)
+        try store.save(RemoteTokenResponse(accessToken: "old-test-access", refreshToken: "old-test-refresh",
+                                            expiresIn: 900), for: userID)
+        RevocationURLProtocol.reset()
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [RevocationURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let provider = RemoteAuthProvider(context: try makeContext(), store: store, signer: signer, session: session)
+        do { try await provider.signOut(userID: userID); XCTFail("First revoke must fail") }
+        catch RemoteError.server(503, _) { }
+        XCTAssertNil(try store.tokens(for: userID))
+        XCTAssertTrue(try store.revocationPending(for: userID))
+        try await provider.revokePending(userID: userID)
+        XCTAssertNil(try store.tokens(for: userID))
+        XCTAssertFalse(try store.revocationPending(for: userID))
+        XCTAssertEqual(RevocationURLProtocol.paths, ["/v1/auth/challenge", "/v1/auth/token",
+                                                       "/v1/auth/revoke", "/v1/auth/challenge",
+                                                       "/v1/auth/token", "/v1/auth/revoke"])
+        XCTAssertTrue(RevocationURLProtocol.revokeHadDeviceProof)
+    }
+
+    func testPreKeyPublicationDoesNotRestoreConsumedPrivateKey() async throws {
+        let context = try makeContext()
+        let user = User(userID: "prekey-race", nickname: "Alice", passwordHash: "verifier")
+        context.insert(user)
+        let keychain = KeychainManager(service: "app.luma.prekey-race.\(UUID().uuidString)")
+        let vault = V4SessionVault(keychain: keychain)
+        let store = RemoteSessionStore(keychain: keychain)
+        let signer = RemoteDeviceSigner(keychain: keychain)
+        let identity = P256.Signing.PrivateKey()
+        user.identityPublicKey = identity.publicKey.x963Representation
+        try keychain.save(identity.rawRepresentation, account: "identity-private.\(user.userID)")
+        _ = try signer.publicKey(for: user.userID)
+        try store.save(RemoteTokenResponse(accessToken: "test-token", refreshToken: "test-refresh", expiresIn: 900), for: user.userID)
+        let deviceID = UUID()
+        defer {
+            try? vault.purgeAccount(userID: user.userID)
+            try? store.clearAll(for: user.userID)
+            try? keychain.delete("identity-private.\(user.userID)")
+        }
+        let registration = RemoteRegistration(backendUserID: UUID(), backendDeviceID: deviceID,
+            baseURL: URL(string: "https://prekey.example.invalid")!)
+        TokenRefreshURLProtocol.reset()
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [TokenRefreshURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let client = try RemoteAPIClient(baseURL: registration.baseURL, userID: user.userID,
+            store: store, signer: signer, session: session)
+        let publication = Task { try await V4PreKeyService(context: context, user: user,
+            registration: registration, client: client, vault: vault).ensurePublished() }
+        for _ in 0..<100 where TokenRefreshURLProtocol.requestCount == 0 {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(TokenRefreshURLProtocol.requestCount, 1)
+        var current = try XCTUnwrap(vault.loadDevice(userID: user.userID, deviceID: deviceID))
+        let consumed = try XCTUnwrap(current.oneTimePreKeys.keys.first)
+        current.oneTimePreKeys.removeValue(forKey: consumed)
+        current.pendingOneTimePreKeys.removeAll { $0 == consumed }
+        try vault.saveDevice(current, userID: user.userID)
+        try await publication.value
+        XCTAssertNil(try vault.loadDevice(userID: user.userID, deviceID: deviceID)?.oneTimePreKeys[consumed])
+    }
+
+    func testSearchRejectsStaleDeletedAndOrphanedEntries() throws {
+        let context = try makeContext()
+        let user = User(userID: "search-test", nickname: "Alice", passwordHash: "verifier")
+        let friend = Friend(ownerID: user.id, userID: "bob", nickname: "Bob")
+        let conversation = Conversation(ownerID: user.id, friendID: friend.id)
+        context.insert(user); context.insert(friend); context.insert(conversation)
+        let encryption = EncryptionService(key: SymmetricKey(size: .bits256))
+        let message = try MessageStore(context: context, encryption: encryption).send(
+            conversationID: conversation.id, senderID: user.userID, type: .text, content: "private needle")
+        let index = SearchIndexService(context: context, encryption: encryption)
+        try index.rebuild(for: user)
+        XCTAssertEqual(try index.search("needle", for: user).count, 1)
+        message.deleted = true
+        try context.save()
+        XCTAssertTrue(try index.search("needle", for: user).isEmpty)
+        context.delete(message)
+        try context.save()
+        XCTAssertTrue(try index.search("needle", for: user).isEmpty)
+    }
+
     func testV4AttachmentSealingAndIdentitySafetyCode() throws {
         let message = UUID(), conversation = UUID()
         for type in [MessageType.image, .file, .voice] {
@@ -34,7 +178,7 @@ final class LocalFoundationTests: XCTestCase {
         XCTAssertFalse(IdentitySafetyCode.matches(IdentitySafetyCode.make(alice, mallory), code: code))
     }
     private func makeContext() throws -> ModelContext {
-        let container = try ModelContainer(for: User.self, Device.self, Friend.self, Conversation.self, Message.self, Attachment.self, UserPresence.self, Reaction.self, SearchIndexEntry.self, SessionKey.self, PreKeyMetadata.self, ChainState.self, RemoteSyncCheckpoint.self, RemoteDeviceTrust.self, OutgoingMessageQueueItem.self, CleanupState.self,
+        let container = try ModelContainer(for: User.self, Device.self, Friend.self, Conversation.self, Message.self, Attachment.self, UserPresence.self, Reaction.self, SearchIndexEntry.self, SessionKey.self, PreKeyMetadata.self, ChainState.self, RemoteSyncCheckpoint.self, RemoteDeviceTrust.self, OutgoingMessageQueueItem.self, CleanupState.self, V4DeviceMetadata.self,
                                            configurations: ModelConfiguration(isStoredInMemoryOnly: true))
         return ModelContext(container)
     }
@@ -118,7 +262,8 @@ final class LocalFoundationTests: XCTestCase {
 
     func testLocalAccountAndChatUserFlow() throws {
         let context = try makeContext()
-        let security = SecurityManager(keychain: KeychainManager(service: "app.luma.flow.\(UUID().uuidString)"))
+        let keychain = KeychainManager(service: "app.luma.flow.\(UUID().uuidString)")
+        let security = SecurityManager(keychain: keychain)
         try security.register(userID: "alice", nickname: "Alice", password: "password123", context: context)
         try security.setPIN("123456", context: context)
         let user = try XCTUnwrap(try LocalRepository(context: context).user("alice"))
@@ -136,7 +281,13 @@ final class LocalFoundationTests: XCTestCase {
         security.lock()
         XCTAssertThrowsError(try security.verifyPIN("000000", context: context))
         try security.verifyPIN("123456", context: context)
+        let remoteSessions = RemoteSessionStore(keychain: keychain)
+        try remoteSessions.save(RemoteRegistration(backendUserID: UUID(), backendDeviceID: UUID(),
+            baseURL: URL(string: "https://logout.example.invalid")!), for: "alice")
+        try remoteSessions.save(RemoteTokenResponse(accessToken: "test-access", refreshToken: "test-refresh", expiresIn: 900), for: "alice")
         try security.logout()
+        XCTAssertNil(try remoteSessions.tokens(for: "alice"))
+        XCTAssertTrue(try remoteSessions.revocationPending(for: "alice"))
         try security.login(userID: "alice", password: "password123", context: context)
 
         let friend = try LocalRepository(context: context).addFriend(owner: user, userID: "bob", nickname: "Bob",
@@ -545,6 +696,44 @@ final class LocalFoundationTests: XCTestCase {
             senderUserID: bobUserID, senderBundle: bobBundle))
     }
 
+    /// Documents a release blocker: simultaneous first handshakes are rejected
+    /// rather than silently replacing either established sending ratchet.
+    func testSimultaneousInitialSessionsFailClosed() throws {
+        struct Wire: Decodable {
+            struct Recipient: Decodable { let ciphertext: String }
+            let recipientEnvelopes: [Recipient]
+        }
+        let vault = V4SessionVault(keychain: KeychainManager(service: "app.luma.collision.\(UUID().uuidString)"))
+        defer { try? vault.purgeAccount(userID: "alice"); try? vault.purgeAccount(userID: "bob") }
+        let aliceID = UUID(), bobID = UUID(), aliceUser = UUID(), bobUser = UUID(), conversation = UUID()
+        let aliceIdentity = V4IdentityKeys(), bobIdentity = V4IdentityKeys()
+        let aliceSigned = Curve25519.KeyAgreement.PrivateKey(), bobSigned = Curve25519.KeyAgreement.PrivateKey()
+        for (name, id, identity, signed) in [("alice", aliceID, aliceIdentity, aliceSigned), ("bob", bobID, bobIdentity, bobSigned)] {
+            try vault.saveDevice(.init(formatVersion: 1, deviceID: id, keyVersion: 1,
+                identityAgreement: identity.agreement.rawRepresentation,
+                identitySigning: identity.signing.rawRepresentation, signedPreKey: signed.rawRepresentation,
+                oneTimePreKeys: [:]), userID: name)
+        }
+        let aliceBundle = try V4Handshake.bundle(deviceID: aliceID, version: 1, identity: aliceIdentity, signedPreKey: aliceSigned, oneTimePreKey: nil)
+        let bobBundle = try V4Handshake.bundle(deviceID: bobID, version: 1, identity: bobIdentity, signedPreKey: bobSigned, oneTimePreKey: nil)
+        let alice = V4MessageSessionService(vault: vault, userID: "alice", localDeviceID: aliceID)
+        let bob = V4MessageSessionService(vault: vault, userID: "bob", localDeviceID: bobID)
+        let first = UUID(), second = UUID()
+        let a = try alice.prepare(Data("first".utf8), messageID: first, conversationID: conversation,
+            targets: [.init(remoteUserID: bobUser, bundle: bobBundle)])
+        let b = try bob.prepare(Data("second".utf8), messageID: second, conversationID: conversation,
+            targets: [.init(remoteUserID: aliceUser, bundle: aliceBundle)])
+        try alice.commitPreparedSend(messageID: first); try bob.commitPreparedSend(messageID: second)
+        let aBytes = try XCTUnwrap(Data(base64URL: JSONDecoder().decode(Wire.self, from: a).recipientEnvelopes[0].ciphertext))
+        let bBytes = try XCTUnwrap(Data(base64URL: JSONDecoder().decode(Wire.self, from: b).recipientEnvelopes[0].ciphertext))
+        XCTAssertThrowsError(try bob.decrypt(JSONDecoder().decode(V4RatchetMessage.self, from: aBytes),
+            wire: aBytes, eventID: UUID(), deviceSeq: 1, senderUserID: aliceUser, senderBundle: aliceBundle))
+        XCTAssertThrowsError(try alice.decrypt(JSONDecoder().decode(V4RatchetMessage.self, from: bBytes),
+            wire: bBytes, eventID: UUID(), deviceSeq: 1, senderUserID: bobUser, senderBundle: bobBundle))
+        XCTAssertEqual(try vault.loadSession(userID: "alice", local: aliceID, remote: bobID)?.stateVersion, 1)
+        XCTAssertEqual(try vault.loadSession(userID: "bob", local: bobID, remote: aliceID)?.stateVersion, 1)
+    }
+
     func testV4ControlEventsUseFreshKeysAndRejectReplayOrTampering() throws {
         struct Request: Decodable {
             struct Recipient: Decodable { let ciphertext: String }
@@ -661,4 +850,77 @@ final class LocalFoundationTests: XCTestCase {
         try alice.finishReceived(eventID: attachmentSyncID)
     }
 
+}
+
+/// Returns synthetic tokens only; no external HTTP request leaves the test process.
+private final class TokenRefreshURLProtocol: URLProtocol, @unchecked Sendable {
+    private static let lock = NSLock()
+    private static var count = 0
+    private static var requests = 0
+    static var refreshCount: Int { lock.withLock { count } }
+    static var requestCount: Int { lock.withLock { requests } }
+    static func reset() { lock.withLock { count = 0; requests = 0 } }
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        let refresh = request.url?.path == "/v1/auth/refresh"
+        Self.lock.withLock { Self.requests += 1; if refresh { Self.count += 1 } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + (refresh || request.httpMethod == "PUT" ? 0.2 : 0)) { [self] in
+            let body = refresh ? "{\"accessToken\":\"new-test-token\",\"refreshToken\":\"rotated-test-token\",\"expiresIn\":900}" : "{}"
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200,
+                httpVersion: nil, headerFields: nil)!
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: Data(body.utf8))
+            client?.urlProtocolDidFinishLoading(self)
+        }
+    }
+    override func stopLoading() {}
+}
+
+private final class RevocationURLProtocol: URLProtocol, @unchecked Sendable {
+    private static let lock = NSLock()
+    private static var seenPaths: [String] = []
+    private static var revocations = 0
+    private static var proofSeen = false
+    static var paths: [String] { lock.withLock { seenPaths } }
+    static var revokeHadDeviceProof: Bool { lock.withLock { proofSeen } }
+    static func reset() { lock.withLock { seenPaths = []; revocations = 0; proofSeen = false } }
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        let path = request.url!.path
+        let attempt = Self.lock.withLock { () -> Int in
+            Self.seenPaths.append(path)
+            if path == "/v1/auth/revoke" {
+                Self.revocations += 1
+                Self.proofSeen = Self.proofSeen || request.value(forHTTPHeaderField: "X-Device-Signature") != nil
+            }
+            return Self.revocations
+        }
+        let status: Int
+        let body: String
+        switch path {
+        case "/v1/auth/challenge":
+            status = 200
+            body = "{\"challengeID\":\"\(UUID())\",\"nonce\":\"test-nonce\"}"
+        case "/v1/auth/token":
+            status = 200
+            body = "{\"accessToken\":\"temporary-test-access\",\"refreshToken\":\"temporary-test-refresh\",\"expiresIn\":900}"
+        case "/v1/auth/revoke" where attempt == 1:
+            status = 503
+            body = "{\"code\":\"storage_unavailable\"}"
+        case "/v1/auth/revoke":
+            status = 204
+            body = ""
+        default:
+            status = 404
+            body = "{}"
+        }
+        let response = HTTPURLResponse(url: request.url!, statusCode: status,
+                                       httpVersion: nil, headerFields: nil)!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        if !body.isEmpty { client?.urlProtocol(self, didLoad: Data(body.utf8)) }
+        client?.urlProtocolDidFinishLoading(self)
+    }
+    override func stopLoading() {}
 }

@@ -52,13 +52,15 @@ func (s Service) PutV4Prekeys(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in struct {
-		IdentityAgreementPublic string   `json:"identityAgreementPublicKey"`
-		IdentitySigningPublic   string   `json:"identitySigningPublicKey"`
-		IdentityBinding         string   `json:"identityBindingSignature"`
-		SignedPrekey            string   `json:"signedPreKeyPublicKey"`
-		SignedPrekeySignature   string   `json:"signedPreKeySignature"`
-		KeyVersion              int      `json:"keyVersion"`
-		OneTimePrekeys          []string `json:"oneTimePreKeys"`
+		IdentityAgreementPublic     string   `json:"identityAgreementPublicKey"`
+		IdentitySigningPublic       string   `json:"identitySigningPublicKey"`
+		IdentityBinding             string   `json:"identityBindingSignature"`
+		SignedPrekey                string   `json:"signedPreKeyPublicKey"`
+		SignedPrekeySignature       string   `json:"signedPreKeySignature"`
+		KeyVersion                  int      `json:"keyVersion"`
+		OneTimePrekeys              []string `json:"oneTimePreKeys"`
+		RecoveryProtocolVersion     int      `json:"recoveryProtocolVersion"`
+		RecoveryCapabilitySignature string   `json:"recoveryCapabilitySignature"`
 	}
 	if !middleware.Decode(w, r, &in) {
 		return
@@ -85,6 +87,20 @@ func (s Service) PutV4Prekeys(w http.ResponseWriter, r *http.Request) {
 			v4PrekeyProof(deviceID, in.KeyVersion, agreement, signing, prekey), proof) {
 		middleware.Fail(w, r, 400, "invalid_v4_signature")
 		return
+	}
+	var capability []byte
+	if in.RecoveryProtocolVersion != 0 || in.RecoveryCapabilitySignature != "" {
+		var err error
+		capability, err = v4Decode(in.RecoveryCapabilitySignature, 64)
+		parsed, parseErr := uuid.Parse(deviceID)
+		var keyVersion, protocol [8]byte
+		binary.BigEndian.PutUint64(keyVersion[:], uint64(in.KeyVersion))
+		binary.BigEndian.PutUint64(protocol[:], 2)
+		if err != nil || parseErr != nil || in.RecoveryProtocolVersion != 2 || !ed25519.Verify(ed25519.PublicKey(signing),
+			v4Fields("luma.v4.recovery-capability.v2", parsed[:], keyVersion[:], agreement, signing, prekey, protocol[:]), capability) {
+			middleware.Fail(w, r, 400, "invalid_recovery_capability")
+			return
+		}
 	}
 	keys := make([][]byte, 0, len(in.OneTimePrekeys))
 	for _, raw := range in.OneTimePrekeys {
@@ -115,10 +131,10 @@ func (s Service) PutV4Prekeys(w http.ResponseWriter, r *http.Request) {
 		middleware.Fail(w, r, 503, "storage_unavailable")
 		return
 	}
-	_, err = tx.Exec(r.Context(), `INSERT INTO v4_device_prekeys(device_id,identity_agreement_public,identity_signing_public,identity_binding_signature,signed_prekey_public,signed_prekey_signature,key_version)
-		VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(device_id) DO UPDATE SET identity_binding_signature=EXCLUDED.identity_binding_signature,
-		signed_prekey_public=EXCLUDED.signed_prekey_public,signed_prekey_signature=EXCLUDED.signed_prekey_signature,key_version=EXCLUDED.key_version,updated_at=now()`,
-		deviceID, agreement, signing, binding, prekey, proof, in.KeyVersion)
+	_, err = tx.Exec(r.Context(), `INSERT INTO v4_device_prekeys(device_id,identity_agreement_public,identity_signing_public,identity_binding_signature,signed_prekey_public,signed_prekey_signature,key_version,recovery_protocol_version,recovery_capability_signature)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(device_id) DO UPDATE SET identity_binding_signature=EXCLUDED.identity_binding_signature,
+		signed_prekey_public=EXCLUDED.signed_prekey_public,signed_prekey_signature=EXCLUDED.signed_prekey_signature,key_version=EXCLUDED.key_version,recovery_protocol_version=EXCLUDED.recovery_protocol_version,recovery_capability_signature=EXCLUDED.recovery_capability_signature,updated_at=now()`,
+		deviceID, agreement, signing, binding, prekey, proof, in.KeyVersion, in.RecoveryProtocolVersion, capability)
 	for _, key := range keys {
 		if err != nil {
 			break
@@ -147,7 +163,12 @@ func (s Service) V4PrekeyStatus(w http.ResponseWriter, r *http.Request) {
 		middleware.Fail(w, r, 503, "storage_unavailable")
 		return
 	}
-	middleware.JSON(w, 200, map[string]int{"availableOneTimePreKeys": available})
+	var recoveryVersion int
+	if err = s.DB.QueryRow(r.Context(), "SELECT recovery_protocol_version FROM v4_device_prekeys WHERE device_id=$1", i.DeviceID).Scan(&recoveryVersion); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		middleware.Fail(w, r, 503, "storage_unavailable")
+		return
+	}
+	middleware.JSON(w, 200, map[string]int{"availableOneTimePreKeys": available, "recoveryProtocolVersion": recoveryVersion})
 }
 
 func (s Service) V4Bundle(w http.ResponseWriter, r *http.Request) {
@@ -191,7 +212,7 @@ func (s Service) V4Bundle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rows, err := tx.Query(r.Context(), `SELECT d.id,p.identity_agreement_public,p.identity_signing_public,p.identity_binding_signature,
-		p.signed_prekey_public,p.signed_prekey_signature,p.key_version FROM devices d
+		p.signed_prekey_public,p.signed_prekey_signature,p.key_version,p.recovery_protocol_version,p.recovery_capability_signature FROM devices d
 		JOIN v4_device_prekeys p ON p.device_id=d.id WHERE d.user_id=$1 AND
 		(($2 AND d.id::text=$3) OR (NOT $2 AND d.revoked_at IS NULL)) ORDER BY d.id`, target, includeRevoked, selectedDevice)
 	if err != nil {
@@ -202,11 +223,13 @@ func (s Service) V4Bundle(w http.ResponseWriter, r *http.Request) {
 		id                                         string
 		agreement, signing, binding, prekey, proof []byte
 		version                                    int
+		recoveryVersion                            int
+		capability                                 []byte
 	}
 	entries := []entry{}
 	for rows.Next() {
 		var x entry
-		if rows.Scan(&x.id, &x.agreement, &x.signing, &x.binding, &x.prekey, &x.proof, &x.version) != nil {
+		if rows.Scan(&x.id, &x.agreement, &x.signing, &x.binding, &x.prekey, &x.proof, &x.version, &x.recoveryVersion, &x.capability) != nil {
 			rows.Close()
 			middleware.Fail(w, r, 503, "storage_unavailable")
 			return
@@ -246,7 +269,7 @@ func (s Service) V4Bundle(w http.ResponseWriter, r *http.Request) {
 			"keyVersion": x.version, "identityAgreementPublicKey": encode(x.agreement),
 			"identitySigningPublicKey": encode(x.signing), "identityBindingSignature": encode(x.binding),
 			"signedPreKeyPublicKey": encode(x.prekey), "signedPreKeySignature": encode(x.proof),
-			"oneTimePreKeyPublicKey": encode(one)})
+			"oneTimePreKeyPublicKey": encode(one), "recoveryProtocolVersion": x.recoveryVersion, "recoveryCapabilitySignature": encode(x.capability)})
 	}
 	if len(out) == 0 {
 		middleware.Fail(w, r, 409, "v4_prekeys_exhausted")

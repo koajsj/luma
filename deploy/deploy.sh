@@ -14,6 +14,7 @@ require_clean_main
 root install -d -m 0700 -o "$(id -u)" -g "$(id -g)" /opt/luma/config "$BACKUP_DIR"
 root install -d -m 0755 /opt/luma/data
 lock_operation
+require_no_incomplete_restore
 if [[ ! -d /opt/luma/data/postgres ]]; then root install -d -m 0700 /opt/luma/data/postgres; fi
 if [[ ! -d /opt/luma/data/redis ]]; then
     root install -d -m 0700 -o 999 -g 999 /opt/luma/data/redis
@@ -80,6 +81,27 @@ if ! command -v docker >/dev/null || ! root docker compose version >/dev/null 2>
     root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin >/dev/null
 fi
 root systemctl enable --now docker >/dev/null
+# The private network uses a fixed address because only Caddy may supply the
+# client IP header. Refuse an overlapping network before Compose changes any
+# service on a host that may already run other containers.
+network_ids=$(root docker network ls -q) || die '无法检查现有 Docker 网络。'
+if [[ -n $network_ids ]]; then
+    # Docker network IDs contain no whitespace; word splitting supplies inspect arguments.
+    # shellcheck disable=SC2086
+    root docker network inspect $network_ids | python3 -c '
+import ipaddress, json, sys
+target = ipaddress.ip_network("172.31.251.0/24")
+for network in json.load(sys.stdin):
+    labels = network.get("Labels") or {}
+    if network.get("Name") == "luma_private" and labels.get("com.docker.compose.project") == "luma" and labels.get("com.docker.compose.network") == "private":
+        continue
+    for config in network.get("IPAM", {}).get("Config") or []:
+        subnet = config.get("Subnet")
+        if subnet and ipaddress.ip_network(subnet, strict=False).overlaps(target):
+            print("Docker 网络 %s 的 %s 与 Luma 私有网段冲突。" % (network.get("Name"), subnet), file=sys.stderr)
+            sys.exit(1)
+' || die '请先解决 Docker 网段冲突；安装未启动 Luma 容器。'
+fi
 if root docker volume inspect luma_pgdata >/dev/null 2>&1 &&
    [[ -z $(root find /opt/luma/data/postgres -mindepth 1 -maxdepth 1 -print -quit) ]]; then
     die '检测到旧版 PostgreSQL Docker volume，而新数据目录为空。已停止以防启动空数据库；先备份并迁移旧 volume。'

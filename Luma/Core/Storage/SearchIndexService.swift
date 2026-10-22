@@ -56,25 +56,40 @@ struct SearchIndexService {
         let query = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines).localizedLowercase
         guard !query.isEmpty else { return [] }
         let entries = try context.fetch(FetchDescriptor<SearchIndexEntry>()).filter { $0.ownerID == user.id }
-        let messages = try context.fetch(FetchDescriptor<Message>())
-        let attachments = try context.fetch(FetchDescriptor<Attachment>())
         let conversations = try context.fetch(FetchDescriptor<Conversation>()).filter { $0.ownerID == user.id }
+        let conversationIDs = Set(conversations.map(\.id))
+        let messages = try context.fetch(FetchDescriptor<Message>()).filter {
+            conversationIDs.contains($0.conversationID) && !$0.deleted
+        }.reduce(into: [UUID: Message]()) { $0[$1.id] = $1 }
+        let attachments = try context.fetch(FetchDescriptor<Attachment>()).filter {
+            messages[$0.messageID] != nil
+        }.reduce(into: [UUID: Attachment]()) { $0[$1.id] = $1 }
+        let friendIDs = Set(try context.fetch(FetchDescriptor<Friend>())
+            .filter { $0.ownerID == user.id }.map(\.id))
         let hiddenConversationIDs = Set(conversations.filter { $0.requiresPrivacyShield == true || $0.requiresUnlock == true }.map(\.id))
         let hiddenFriendIDs = Set(conversations.filter {
             $0.requiresPrivacyShield == true || $0.requiresUnlock == true
         }.map(\.friendID))
         return try entries.compactMap { entry in
-            if entry.kind == "friend" && hiddenFriendIDs.contains(entry.sourceID) { return nil }
+            let conversationID: UUID?
+            switch entry.kind {
+            case "friend":
+                guard friendIDs.contains(entry.sourceID), !hiddenFriendIDs.contains(entry.sourceID) else { return nil }
+                conversationID = nil
+            case "message":
+                guard let message = messages[entry.sourceID] else { return nil }
+                conversationID = message.conversationID
+            case "file":
+                guard let attachment = attachments[entry.sourceID],
+                      let message = messages[attachment.messageID] else { return nil }
+                conversationID = message.conversationID
+            default: return nil
+            }
+            if let conversationID, hiddenConversationIDs.contains(conversationID) { return nil }
             let binding = Data("luma-index-v1|\(user.id.uuidString)|\(entry.sourceID.uuidString)|\(entry.kind)".utf8)
             let data = try encryption.decrypt(EncryptedData(bytes: entry.encryptedText), authenticatedData: binding)
             guard let text = String(data: data, encoding: .utf8) else { throw EncryptionError.invalidText }
             guard text.localizedLowercase.contains(query) else { return nil }
-            let conversationID: UUID?
-            if entry.kind == "message" { conversationID = messages.first { $0.id == entry.sourceID }?.conversationID }
-            else if entry.kind == "file", let attachment = attachments.first(where: { $0.id == entry.sourceID }) {
-                conversationID = messages.first { $0.id == attachment.messageID }?.conversationID
-            } else { conversationID = nil }
-            if let conversationID, hiddenConversationIDs.contains(conversationID) { return nil }
             return LocalSearchResult(id: entry.id, sourceID: entry.sourceID, kind: entry.kind, preview: text, conversationID: conversationID)
         }
     }

@@ -12,9 +12,9 @@ if [[ $(id -u) != 0 ]]; then
     command -v sudo >/dev/null || fail '需要 sudo 权限。'
     sudo -v || fail '当前账号没有 sudo 权限。'
 fi
-curl -fsSI --max-time 15 https://github.com >/dev/null || fail '无法连接 GitHub；请检查 VPS 网络。'
 root apt-get update -qq
-root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git curl ca-certificates openssl python3 >/dev/null
+root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git curl ca-certificates openssl python3 age >/dev/null
+curl -fsSI --max-time 15 https://github.com >/dev/null || fail '无法连接 GitHub；请检查 VPS 网络。'
 root install -d -m 0755 /opt/luma
 root install -d -m 0755 -o "$(id -u)" -g "$(id -g)" /opt/luma/app
 if [[ ! -d /opt/luma/app/.git ]]; then

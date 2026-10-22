@@ -47,7 +47,8 @@ struct V4RatchetState: Codable {
 
     mutating func encrypt(_ plaintext: Data, messageID: UUID, conversationID: UUID,
                           senderDeviceID: UUID, receiverDeviceID: UUID,
-                          initialHeader: V4InitialHeader? = nil, sessionVersion: Int = 1) throws -> V4RatchetMessage {
+                          initialHeader: V4InitialHeader? = nil, sessionVersion: Int = 1,
+                          recoveryProposal: V4RecoveryProposal? = nil) throws -> V4RatchetMessage {
         guard let chain = sendingChainKey, sendingIndex < Int.max else { throw V4ProtocolError.invalidHandshake }
         let (next, messageKey) = Self.advanceChain(chain)
         let keyPair = try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: ownRatchetPrivateKey)
@@ -56,7 +57,7 @@ struct V4RatchetState: Codable {
             encryptionVersion: 4, ratchetPublicKey: keyPair.publicKey.rawRepresentation,
             previousChainLength: previousSendingLength, messageIndex: sendingIndex,
             sessionVersion: sessionVersion, initialHeader: initialHeader,
-            nonce: Data(), ciphertext: Data(), authenticationTag: Data())
+            nonce: Data(), ciphertext: Data(), authenticationTag: Data(), recoveryProposal: recoveryProposal)
         let sealed = try AES.GCM.seal(plaintext, using: SymmetricKey(data: messageKey),
                                       authenticating: header.authenticatedHeader())
         let result = V4RatchetMessage(messageID: header.messageID, conversationID: header.conversationID,
@@ -65,7 +66,7 @@ struct V4RatchetState: Codable {
             previousChainLength: header.previousChainLength, messageIndex: header.messageIndex,
             sessionVersion: header.sessionVersion, initialHeader: header.initialHeader,
             nonce: sealed.nonce.withUnsafeBytes { Data($0) }, ciphertext: sealed.ciphertext,
-            authenticationTag: sealed.tag)
+            authenticationTag: sealed.tag, recoveryProposal: recoveryProposal)
         sendingChainKey = next
         sendingIndex += 1
         return result
@@ -184,9 +185,10 @@ struct V4RatchetMessage: Codable {
     let nonce: Data
     let ciphertext: Data
     let authenticationTag: Data
+    var recoveryProposal: V4RecoveryProposal? = nil
 
     func authenticatedHeader() -> Data {
-        V4Handshake.fields("luma.v4.message", [Data(messageID.uuidString.lowercased().utf8),
+        let legacy = V4Handshake.fields("luma.v4.message", [Data(messageID.uuidString.lowercased().utf8),
             Data(conversationID.uuidString.lowercased().utf8),
             Data(senderDeviceID.uuidString.lowercased().utf8),
             Data(receiverDeviceID.uuidString.lowercased().utf8),
@@ -194,5 +196,7 @@ struct V4RatchetMessage: Codable {
             Data(String(previousChainLength).utf8), Data(String(messageIndex).utf8),
             Data(String(sessionVersion).utf8), initialHeader?.transcript() ?? Data(),
             initialHeader?.signature ?? Data()])
+        guard let recoveryProposal else { return legacy }
+        return V4Handshake.fields("luma.v4.message.v2", [legacy, recoveryProposal.transcript, recoveryProposal.signature])
     }
 }

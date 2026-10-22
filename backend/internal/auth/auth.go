@@ -154,7 +154,7 @@ func (s Service) Token(w http.ResponseWriter, r *http.Request) {
 	defer tx.Rollback(r.Context())
 	var key, nonceHash []byte
 	var uid string
-	e = tx.QueryRow(r.Context(), "SELECT d.auth_public_key,d.user_id,c.nonce_hash FROM devices d JOIN auth_challenges c ON c.device_id=d.id WHERE d.id=$1 AND d.revoked_at IS NULL AND c.id=$2 AND c.purpose='login' AND c.expires_at>now() AND c.used_at IS NULL FOR UPDATE OF c", in.DeviceID, in.ChallengeID).Scan(&key, &uid, &nonceHash)
+	e = tx.QueryRow(r.Context(), "SELECT d.auth_public_key,d.user_id,c.nonce_hash FROM devices d JOIN users u ON u.id=d.user_id JOIN auth_challenges c ON c.device_id=d.id WHERE d.id=$1 AND d.revoked_at IS NULL AND u.disabled_at IS NULL AND c.id=$2 AND c.purpose='login' AND c.expires_at>now() AND c.used_at IS NULL FOR UPDATE OF c", in.DeviceID, in.ChallengeID).Scan(&key, &uid, &nonceHash)
 	if e != nil || !equalHash(nonceHash, crypto.Hash(in.Nonce)) || !crypto.VerifyEd25519(key, sig, "luma.login.v1\n"+in.Nonce+"\n"+in.DeviceID) {
 		middleware.Fail(w, r, 401, "invalid_credentials")
 		return
@@ -201,7 +201,7 @@ func (s Service) Refresh(w http.ResponseWriter, r *http.Request) {
 	var did, family string
 	var publicKey []byte
 	var used bool
-	e = tx.QueryRow(r.Context(), "SELECT rs.device_id,rs.family_id,rs.used_at IS NOT NULL,d.auth_public_key FROM refresh_sessions rs JOIN devices d ON d.id=rs.device_id WHERE rs.token_hash=$1 AND rs.expires_at>now() AND rs.revoked_at IS NULL AND d.revoked_at IS NULL FOR UPDATE OF rs", crypto.Hash(in.RefreshToken)).Scan(&did, &family, &used, &publicKey)
+	e = tx.QueryRow(r.Context(), "SELECT rs.device_id,rs.family_id,rs.used_at IS NOT NULL,d.auth_public_key FROM refresh_sessions rs JOIN devices d ON d.id=rs.device_id JOIN users u ON u.id=d.user_id WHERE u.disabled_at IS NULL AND rs.token_hash=$1 AND rs.expires_at>now() AND rs.revoked_at IS NULL AND d.revoked_at IS NULL FOR UPDATE OF rs", crypto.Hash(in.RefreshToken)).Scan(&did, &family, &used, &publicKey)
 	if e != nil {
 		var revoked bool
 		_ = tx.QueryRow(r.Context(), "SELECT EXISTS(SELECT 1 FROM refresh_sessions rs JOIN devices d ON d.id=rs.device_id WHERE rs.token_hash=$1 AND d.revoked_at IS NOT NULL)", crypto.Hash(in.RefreshToken)).Scan(&revoked)
@@ -216,9 +216,14 @@ func (s Service) Refresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if used {
-		_, _ = tx.Exec(r.Context(), "UPDATE refresh_sessions SET revoked_at=now() WHERE family_id=$1 AND revoked_at IS NULL", family)
-		_, _ = tx.Exec(r.Context(), "UPDATE access_sessions SET revoked_at=now() WHERE family_id=$1 AND revoked_at IS NULL", family)
-		_ = tx.Commit(r.Context())
+		_, e = tx.Exec(r.Context(), "UPDATE refresh_sessions SET revoked_at=now() WHERE family_id=$1 AND revoked_at IS NULL", family)
+		if e == nil {
+			_, e = tx.Exec(r.Context(), "UPDATE access_sessions SET revoked_at=now() WHERE family_id=$1 AND revoked_at IS NULL", family)
+		}
+		if e != nil || tx.Commit(r.Context()) != nil {
+			middleware.Fail(w, r, 503, "storage_unavailable")
+			return
+		}
 		middleware.Fail(w, r, 401, "refresh_reuse_detected")
 		return
 	}

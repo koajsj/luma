@@ -6,15 +6,26 @@ import SwiftData
 @MainActor
 struct RemoteAuthProvider {
     let context: ModelContext
-    let store = RemoteSessionStore()
-    let signer = RemoteDeviceSigner()
+    let store: RemoteSessionStore
+    let signer: RemoteDeviceSigner
+    let session: URLSession?
+    private static var pendingRevocations: [String: Task<Void, Error>] = [:]
+
+    init(context: ModelContext, store: RemoteSessionStore = RemoteSessionStore(),
+         signer: RemoteDeviceSigner = RemoteDeviceSigner(), session: URLSession? = nil) {
+        self.context = context
+        self.store = store
+        self.signer = signer
+        self.session = session
+    }
 
     func register(user: User, baseURL: URL, nickname: String) async throws -> RemoteRegistration {
         guard try store.registration(for: user.userID) == nil else { throw RemoteError.server(409, "device_already_registered") }
         guard let device = try localDevice(for: user),
               let identity = user.identityPublicKey,
               let devicePublic = device.publicKey else { throw AsymmetricKeyError.missing }
-        let client = try RemoteAPIClient(baseURL: baseURL, userID: user.userID)
+        let client = try RemoteAPIClient(baseURL: baseURL, userID: user.userID,
+                                         store: store, signer: signer, session: session)
         let challengeBody = try JSONEncoder().encode(["userID": user.userID])
         let challenge: RemoteChallenge = try await client.json(RemoteChallenge.self, method: "POST",
                                                                path: "/auth/register/challenge", body: challengeBody,
@@ -62,16 +73,11 @@ struct RemoteAuthProvider {
     }
 
     func login(userID: String) async throws {
+        try await revokePending(userID: userID)
         guard let registration = try store.registration(for: userID) else { throw RemoteError.unregistered }
-        let client = try RemoteAPIClient(baseURL: registration.baseURL, userID: userID)
-        let deviceID = registration.backendDeviceID.uuidString.lowercased()
-        let challenge: RemoteChallenge = try await client.json(RemoteChallenge.self, method: "POST",
-            path: "/auth/challenge", body: JSONEncoder().encode(["deviceID": deviceID]), authenticated: false)
-        let signature = try signer.sign("luma.login.v1\n\(challenge.nonce)\n\(deviceID)", userID: userID)
-        let body = try JSONEncoder().encode(LoginRequest(challengeID: challenge.challengeID,
-                                                          nonce: challenge.nonce, deviceID: deviceID, signature: signature))
-        let response: RemoteTokenResponse = try await client.json(RemoteTokenResponse.self, method: "POST",
-                                                                  path: "/auth/token", body: body, authenticated: false)
+        let client = try RemoteAPIClient(baseURL: registration.baseURL, userID: userID,
+                                         store: store, signer: signer, session: session)
+        let response = try await deviceToken(userID: userID, registration: registration, client: client)
         try store.save(response, for: userID)
         if let user = try context.fetch(FetchDescriptor<User>()).first(where: { $0.userID == userID }) {
             try await V4PreKeyService(context: context, user: user, registration: registration,
@@ -80,11 +86,44 @@ struct RemoteAuthProvider {
     }
 
     func signOut(userID: String) async throws {
-        if let registration = try store.registration(for: userID), try store.tokens(for: userID) != nil {
-            let client = try RemoteAPIClient(baseURL: registration.baseURL, userID: userID)
-            _ = try await client.request("POST", path: "/auth/revoke")
+        if try store.registration(for: userID) != nil {
+            try store.markRevocationPending(for: userID)
         }
         try store.clearTokens(for: userID)
+        try await revokePending(userID: userID)
+    }
+
+    func revokePending(userID: String) async throws {
+        if let existing = Self.pendingRevocations[userID] {
+            try await existing.value
+            return
+        }
+        guard try store.revocationPending(for: userID) else { return }
+        let task = Task { try await performPendingRevocation(userID: userID) }
+        Self.pendingRevocations[userID] = task
+        defer { Self.pendingRevocations.removeValue(forKey: userID) }
+        try await task.value
+    }
+
+    private func performPendingRevocation(userID: String) async throws {
+        guard let registration = try store.registration(for: userID) else { throw RemoteError.unregistered }
+        let client = try RemoteAPIClient(baseURL: registration.baseURL, userID: userID,
+                                         store: store, signer: signer, session: session)
+        let temporary = try await deviceToken(userID: userID, registration: registration, client: client)
+        try await client.revoke(using: temporary.accessToken)
+        try store.clearRevocationPending(for: userID)
+    }
+
+    private func deviceToken(userID: String, registration: RemoteRegistration,
+                             client: RemoteAPIClient) async throws -> RemoteTokenResponse {
+        let deviceID = registration.backendDeviceID.uuidString.lowercased()
+        let challenge: RemoteChallenge = try await client.json(RemoteChallenge.self, method: "POST",
+            path: "/auth/challenge", body: JSONEncoder().encode(["deviceID": deviceID]), authenticated: false)
+        let signature = try signer.sign("luma.login.v1\n\(challenge.nonce)\n\(deviceID)", userID: userID)
+        let body = try JSONEncoder().encode(LoginRequest(challengeID: challenge.challengeID,
+                                                          nonce: challenge.nonce, deviceID: deviceID, signature: signature))
+        return try await client.json(RemoteTokenResponse.self, method: "POST",
+                                     path: "/auth/token", body: body, authenticated: false)
     }
 
     private func localDevice(for user: User) throws -> Device? {

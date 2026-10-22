@@ -362,11 +362,19 @@ func (s Service) Receipt(w http.ResponseWriter, r *http.Request) {
 	ids := []string{}
 	for rows.Next() {
 		var id string
-		if rows.Scan(&id) == nil {
-			ids = append(ids, id)
+		if e = rows.Scan(&id); e != nil {
+			break
 		}
+		ids = append(ids, id)
+	}
+	if e == nil {
+		e = rows.Err()
 	}
 	rows.Close()
+	if e != nil {
+		middleware.Fail(w, r, 503, "storage_unavailable")
+		return
+	}
 	seqs := map[string]int64{}
 	for _, did := range ids {
 		seqs[did], e = sync.Append(r.Context(), tx, did, typ, nil, map[string]any{"messageID": in.MessageID, "recipientDeviceID": i.DeviceID, "senderUserID": i.UserID, "senderDeviceID": i.DeviceID})

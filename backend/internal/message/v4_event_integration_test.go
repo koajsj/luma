@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"luma/backend/internal/database"
 	"luma/backend/internal/message"
 	"luma/backend/internal/middleware"
@@ -30,30 +31,8 @@ func TestV4ControlEventsAreOpaqueIdempotentAndAuthorized(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	a, b := uuid.NewString(), uuid.NewString()
-	ad, bd := uuid.NewString(), uuid.NewString()
-	cid, mid := uuid.NewString(), uuid.NewString()
-	for _, row := range []struct{ id, name string }{{a, "test_" + uuid.NewString()[:8]}, {b, "test_" + uuid.NewString()[:8]}} {
-		if _, err = db.Exec(ctx, "INSERT INTO users(id,user_id,identity_public_key) VALUES($1,$2,$3)", row.id, row.name, []byte{1}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	for _, row := range []struct{ id, user string }{{ad, a}, {bd, b}} {
-		if _, err = db.Exec(ctx, "INSERT INTO devices(id,user_id,device_name,device_public_key,auth_public_key) VALUES($1,$2,'test',$3,$4)", row.id, row.user, []byte{1}, []byte{2}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err = db.Exec(ctx, "INSERT INTO friendships(user_a,user_b) VALUES(LEAST($1::uuid,$2::uuid),GREATEST($1::uuid,$2::uuid))", a, b); err != nil {
-		t.Fatal(err)
-	}
-	if _, err = db.Exec(ctx, "INSERT INTO conversations(id) VALUES($1)", cid); err != nil {
-		t.Fatal(err)
-	}
-	for _, uid := range []string{a, b} {
-		if _, err = db.Exec(ctx, "INSERT INTO conversation_members(conversation_id,user_id) VALUES($1,$2)", cid, uid); err != nil {
-			t.Fatal(err)
-		}
-	}
+	a, b, ad, bd, cid := seedDirectConversation(t, db)
+	mid := uuid.NewString()
 	if _, err = db.Exec(ctx, "INSERT INTO messages(id,conversation_id,sender_user_id,sender_device_id,encryption_version,request_hash,idempotency_key) VALUES($1,$2,$3,$4,4,$5,$6)", mid, cid, a, ad, []byte{1}, uuid.NewString()); err != nil {
 		t.Fatal(err)
 	}
@@ -198,3 +177,33 @@ func (noOpNotifier) Notify(string, int64) {}
 type countingNotifier struct{ calls int }
 
 func (n *countingNotifier) Notify(string, int64) { n.calls++ }
+
+func seedDirectConversation(t *testing.T, db *pgxpool.Pool) (a, b, ad, bd, cid string) {
+	t.Helper()
+	ctx := context.Background()
+	a, b, ad, bd, cid = uuid.NewString(), uuid.NewString(), uuid.NewString(), uuid.NewString(), uuid.NewString()
+	for _, id := range []string{a, b} {
+		if _, err := db.Exec(ctx, "INSERT INTO users(id,user_id,identity_public_key) VALUES($1,$2,$3)",
+			id, "test_"+uuid.NewString()[:8], []byte{1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, device := range []struct{ id, user string }{{ad, a}, {bd, b}} {
+		if _, err := db.Exec(ctx, "INSERT INTO devices(id,user_id,device_name,device_public_key,auth_public_key) VALUES($1,$2,'test',$3,$4)",
+			device.id, device.user, []byte{1}, []byte{2}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Exec(ctx, "INSERT INTO friendships(user_a,user_b) VALUES(LEAST($1::uuid,$2::uuid),GREATEST($1::uuid,$2::uuid))", a, b); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(ctx, "INSERT INTO conversations(id) VALUES($1)", cid); err != nil {
+		t.Fatal(err)
+	}
+	for _, user := range []string{a, b} {
+		if _, err := db.Exec(ctx, "INSERT INTO conversation_members(conversation_id,user_id) VALUES($1,$2)", cid, user); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return
+}

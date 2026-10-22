@@ -129,6 +129,7 @@ func main() {
 	private("POST /v1/messages/delivered", messageSvc.Receipt, 60)
 	private("POST /v1/messages/reaction", messageSvc.Reaction, 60)
 	private("POST /v1/messages/v4/events", messageSvc.V4Event, 60)
+	private("POST /v1/sessions/controls", messageSvc.SessionControl, 120)
 	private("GET /v1/sync", syncSvc.Events, 120)
 	private("GET /v1/sync/events", syncSvc.Events, 120)
 	private("POST /v1/sync/ack", syncSvc.Ack, 120)

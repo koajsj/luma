@@ -59,8 +59,23 @@ private struct AccountSettingsView: View {
             }
             Section("账号操作") {
                 Button("锁定应用") { security.lock() }
-                Button("退出登录", role: .destructive) {
-                    do { try security.logout() } catch { errorMessage = LumaError.message(for: error) }
+                Button("退出本机登录", role: .destructive) {
+                    do {
+                        try security.logout()
+                        Task { @MainActor in
+                            do {
+                                try await OnlineConnectionViewModel(user: user, context: context,
+                                    security: security).retryPendingRevocation()
+                                if security.phase == .login && security.activeUserID == nil {
+                                    security.logoutNotice = "本机已退出，服务器会话已撤销。"
+                                }
+                            } catch {
+                                if security.phase == .login && security.activeUserID == nil {
+                                    security.logoutNotice = "本机已退出。服务器会话待撤销；下次解锁并联网后会重试。"
+                                }
+                            }
+                        }
+                    } catch { errorMessage = LumaError.message(for: error) }
                 }
                 Button("删除本地账号", role: .destructive) { showingDeleteAccount = true }
             }

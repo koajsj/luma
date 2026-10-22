@@ -5,6 +5,7 @@ source "$(dirname "$0")/lib.sh"
 require_install
 require_clean_main
 lock_operation
+require_no_incomplete_restore
 old=$(git -C "$APP_DIR" rev-parse HEAD)
 bash "$APP_DIR/deploy/backup.sh"
 backup=$(find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d ! -name '*.partial' -print | sort | tail -1)
@@ -19,7 +20,6 @@ if compose config --quiet && compose up -d --build --wait && health >/dev/null; 
     exit 0
 fi
 printf '新版本未通过健康检查，正在恢复代码、数据库与密文文件。\n' >&2
-git -C "$APP_DIR" reset --hard "$old"
 LUMA_RESTORE_CONFIRMED=1 bash "$APP_DIR/deploy/restore.sh" "$backup" ||
     die "自动恢复失败，服务已停止或状态未知。请保留备份 $backup 并人工排查。"
 die "更新失败，已恢复到 $old。"

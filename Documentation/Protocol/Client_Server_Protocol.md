@@ -19,3 +19,11 @@
 聊天页显式选择“在线密文聊天”后，经 `ChatViewModel → RemoteMessageRepository → RemoteAPIClient` 发送文本。`GET /v1/friends` 提供已确认好友路由 UUID；`GET /v1/users/{id}/prekey-bundle?claim=false` 仅供身份指纹核对，不占用一次性预密钥。正常发送领取公钥束并为每个活动目标设备生成信封。`GET /v1/sync/events` 按连续游标应用到本地加密存储；聊天页定时拉取。后端仍只接收公钥、路由元数据和密文。
 
 隔离的本机 HTTPS 后端与两个独立 iOS 模拟器已完成 v4 双向文字、编辑、删除、已读、Reaction 和一次离线待发恢复；实体设备尚未验证。首次身份固定必须通过可信渠道核对，点击“已核对”本身不构成身份保证。本次联调只从后端目录取得测试指纹，没有验证独立线下核对。持久待发队列与已登记设备撤销已加入代码；图片、文件、导入语音的加密上传与下载代码已有局部验证，但完整双设备附件、强制退出恢复及实时通知仍待后续验收。
+
+## v4 首次初始化恢复控制
+
+`POST /v1/sessions/controls` 接收 controlID、conversationID、receiverDeviceID、encryptionVersion=4 和 base64url opaque envelope。身份、pair、proposal、winner、冻结清单及控制签名位于客户端认证密文内；服务端只校验路由权限、活动设备、block 和幂等。
+
+产生定向 `session.control` Sync Event，eventID 等于 controlID；路由包含发送账号/设备、目标设备及会话。客户端验证路由与内层认证字段后处理，不显示聊天气泡。相同 ID/精确内容返回原结果，改内容返回冲突。HTTP 201/200 不等于对端认证确认。
+
+PreKey 公钥束增加设备 Ed25519 签名的 recoveryProtocolVersion=2 能力；客户端验证账号绑定、能力签名及固定身份。服务端移除能力只能导致新版初始化拒绝，不能触发自动降级。版本/签名详情见 OpenAPI。

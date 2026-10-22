@@ -51,7 +51,7 @@ func (s Service) Search(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var id, name, nick string
-	e := s.DB.QueryRow(r.Context(), "SELECT id,user_id,nickname FROM users WHERE user_id_hash=$1 AND searchable=true AND disabled_at IS NULL AND id<>$2", s.UserIDIndexKey.Sum(q), middleware.Current(r).UserID).Scan(&id, &name, &nick)
+	e := s.DB.QueryRow(r.Context(), "SELECT id,user_id,nickname FROM users WHERE user_id_hash=$1 AND searchable=true AND disabled_at IS NULL AND id<>$2 AND NOT EXISTS(SELECT 1 FROM blocks b WHERE (b.blocker=$2 AND b.blocked=users.id) OR (b.blocker=users.id AND b.blocked=$2))", s.UserIDIndexKey.Sum(q), middleware.Current(r).UserID).Scan(&id, &name, &nick)
 	if e != nil {
 		middleware.Fail(w, r, 404, "not_found")
 		return

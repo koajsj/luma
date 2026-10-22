@@ -39,6 +39,10 @@ func (s Service) List(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, map[string]any{"id": id, "deviceName": name, "createdAt": created, "lastActiveAt": last, "revokedAt": revoked})
 	}
+	if rows.Err() != nil {
+		middleware.Fail(w, r, 503, "storage_unavailable")
+		return
+	}
 	middleware.JSON(w, 200, out)
 }
 func (s Service) Revoke(w http.ResponseWriter, r *http.Request) {

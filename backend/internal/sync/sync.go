@@ -80,6 +80,10 @@ func (s Service) Events(w http.ResponseWriter, r *http.Request) {
 		out = append(out, map[string]any{"eventID": id, "deviceSeq": seq, "type": typ, "payloadCiphertext": base64.RawURLEncoding.EncodeToString(payload), "routing": routing, "createdAt": created})
 		last = seq
 	}
+	if rows.Err() != nil {
+		middleware.Fail(w, r, 503, "storage_unavailable")
+		return
+	}
 	middleware.JSON(w, 200, map[string]any{"events": out, "nextCursor": last})
 }
 func (s Service) Ack(w http.ResponseWriter, r *http.Request) {

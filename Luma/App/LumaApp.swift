@@ -106,6 +106,17 @@ struct MainTabsView: View {
         .task(id: scenePhase) {
             guard scenePhase == .active else { return }
             try? ChatViewModel(context: context, security: security).cleanAttachmentFiles(for: user)
+            if (try? RemoteSessionStore().revocationPending(for: user.userID)) == true {
+                do {
+                    try await OnlineConnectionViewModel(user: user, context: context,
+                        security: security).retryPendingRevocation()
+                    if security.activeUserID == user.userID { security.logoutNotice = nil }
+                } catch {
+                    if security.activeUserID == user.userID {
+                        security.logoutNotice = "服务器会话撤销尚未完成；下次联网后请在在线连接中重试。"
+                    }
+                }
+            }
             while !Task.isCancelled && security.phase == .unlocked {
                 if let registration = try? RemoteSessionStore().registration(for: user.userID),
                    (try? RemoteSessionStore().tokens(for: user.userID)) != nil,

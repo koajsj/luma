@@ -160,7 +160,7 @@ paths:
       tags: [Device]
       summary: 上传当前设备签名预密钥和一次性预密钥
       parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
-      requestBody: {required: true, content: {application/json: {schema: {type: object, required: [signedPreKey, signature, keyVersion], properties: {signedPreKey: {type: string}, signature: {type: string}, keyVersion: {type: integer}, oneTimePreKeys: {type: array, maxItems: 100, items: {type: string}}}}}}}
+      requestBody: {required: true, content: {application/json: {schema: {type: object, required: [signedPreKey, signature, keyVersion], properties: {signedPreKey: {type: string}, signature: {type: string}, keyVersion: {type: integer}, oneTimePreKeys: {type: array, maxItems: 100, items: {type: string}}, recoveryProtocolVersion: {type: integer, enum: [0, 2], description: 新恢复路径能力版本；省略为 legacy}, recoveryCapabilitySignature: {type: string, description: protocolVersion=2 时必需的设备 Ed25519 能力签名}}}}}}
       responses: {'204': {description: 已保存}}
   /users/{id}/prekey-bundle:
     get:
@@ -176,14 +176,14 @@ paths:
       summary: 上传当前设备的 v4 公开身份、签名预密钥和一次性预密钥
       description: 不接受私钥。v4 Curve25519 身份由已登记 P-256 账号身份签名绑定；签名预密钥由 v4 Ed25519 身份签名。相同设备的身份不可静默替换，版本不得倒退。
       parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
-      requestBody: {required: true, content: {application/json: {schema: {type: object, required: [identityAgreementPublicKey, identitySigningPublicKey, identityBindingSignature, signedPreKeyPublicKey, signedPreKeySignature, keyVersion], properties: {identityAgreementPublicKey: {type: string, description: base64url X25519 公钥}, identitySigningPublicKey: {type: string, description: base64url Ed25519 公钥}, identityBindingSignature: {type: string, description: base64url P-256 DER 签名}, signedPreKeyPublicKey: {type: string, description: base64url X25519 公钥}, signedPreKeySignature: {type: string, description: base64url Ed25519 签名}, keyVersion: {type: integer, minimum: 1}, oneTimePreKeys: {type: array, maxItems: 100, items: {type: string}}}}}}}
+      requestBody: {required: true, content: {application/json: {schema: {type: object, required: [identityAgreementPublicKey, identitySigningPublicKey, identityBindingSignature, signedPreKeyPublicKey, signedPreKeySignature, keyVersion], properties: {identityAgreementPublicKey: {type: string, description: base64url X25519 公钥}, identitySigningPublicKey: {type: string, description: base64url Ed25519 公钥}, identityBindingSignature: {type: string, description: base64url P-256 DER 签名}, signedPreKeyPublicKey: {type: string, description: base64url X25519 公钥}, signedPreKeySignature: {type: string, description: base64url Ed25519 签名}, keyVersion: {type: integer, minimum: 1}, oneTimePreKeys: {type: array, maxItems: 100, items: {type: string}}, recoveryProtocolVersion: {type: integer, enum: [0, 2], description: 新恢复路径能力版本；省略为 legacy}, recoveryCapabilitySignature: {type: string, description: protocolVersion=2 时必需的设备 Ed25519 能力签名}}}}}}
       responses: {'204': {description: 已保存公开密钥}, '409': {$ref: '#/components/responses/Error'}}
   /devices/{id}/v4-prekeys/status:
     get:
       tags: [Device]
       summary: 查询当前已认证设备剩余可领取的一次性 v4 PreKey 数量
       parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
-      responses: {'200': {description: 返回 availableOneTimePreKeys 整数}, '403': {$ref: '#/components/responses/Error'}}
+      responses: {'200': {description: 返回 availableOneTimePreKeys 和 recoveryProtocolVersion 整数}, '403': {$ref: '#/components/responses/Error'}}
   /users/{id}/v4-prekey-bundle:
     get:
       tags: [Device]
@@ -291,3 +291,34 @@ paths:
     get: {tags: [Presence], summary: 读取允许展示的好友在线状态, parameters: [{name: userID, in: path, required: true, schema: {type: string}}], responses: {'200': {description: 在线状态}, '404': {$ref: '#/components/responses/Error'}}}
   /ws:
     get: {tags: [Sync], summary: WebSocket 事件提示；完整数据仍从游标同步获取, responses: {'101': {description: WebSocket upgrade}}}
+  /sessions/controls:
+    post:
+      tags: [Message, Sync]
+      summary: 定向投递 v4 首次握手恢复控制密文
+      description: |
+        仅用于 protocolVersion=2 的客户端恢复控制；encryptionVersion 仍为 4。
+        服务端检查活动设备、会话成员、好友/同账号关系与 block 状态，不解密、签名或选择 winner。
+        相同 controlID、发送设备和精确请求内容幂等；同 ID 不同请求返回 409。
+        事务中保存 opaque envelope 与目标设备 session.control Sync Event；WebSocket 仅提供同步提醒。
+        客户端须验证身份签名、pair、proposal、冻结证明、AEAD 和状态前置条件，HTTP 成功不是会话确认。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [controlID, conversationID, receiverDeviceID, encryptionVersion, envelope]
+              properties:
+                controlID: {type: string, format: uuid}
+                conversationID: {type: string, format: uuid}
+                receiverDeviceID: {type: string, format: uuid}
+                encryptionVersion: {type: integer, const: 4}
+                envelope: {type: string, description: Base64url 的完整 opaque 控制信封；解码后 28–1048576 字节}
+      responses:
+        '201': {description: 已定向保存}
+        '200': {description: 相同请求已保存；没有重复事件}
+        '400': {$ref: '#/components/responses/Error'}
+        '403': {$ref: '#/components/responses/Error'}
+        '409': {$ref: '#/components/responses/Error'}
+        '503': {$ref: '#/components/responses/Error'}

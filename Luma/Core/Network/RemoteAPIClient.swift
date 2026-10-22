@@ -73,8 +73,21 @@ struct RemoteSessionStore {
 
     func clearTokens(for userID: String) throws { try keychain.delete("remote.tokens.\(userID)") }
 
+    func revocationPending(for userID: String) throws -> Bool {
+        try keychain.read("remote.revoke-pending.\(userID)") != nil
+    }
+
+    func markRevocationPending(for userID: String) throws {
+        try keychain.save(Data([1]), account: "remote.revoke-pending.\(userID)")
+    }
+
+    func clearRevocationPending(for userID: String) throws {
+        try keychain.delete("remote.revoke-pending.\(userID)")
+    }
+
     func clearAll(for userID: String) throws {
         try clearTokens(for: userID)
+        try clearRevocationPending(for: userID)
         try keychain.delete("remote.registration.\(userID)")
         try keychain.delete("remote.auth-private.\(userID)")
     }
@@ -114,6 +127,21 @@ extension Data {
     }
 }
 
+/// One rotating refresh token must have at most one request in flight, even when
+/// repositories create separate API clients for the same account.
+private actor RemoteTokenRefreshCoordinator {
+    static let shared = RemoteTokenRefreshCoordinator()
+    private var pending: [String: Task<RemoteTokens, Error>] = [:]
+
+    func refresh(key: String, operation: @escaping @Sendable () async throws -> RemoteTokens) async throws -> RemoteTokens {
+        if let existing = pending[key] { return try await existing.value }
+        let task = Task { try await operation() }
+        pending[key] = task
+        defer { pending.removeValue(forKey: key) }
+        return try await task.value
+    }
+}
+
 /// All requests use URLSession's normal TLS validation; no certificate bypass is installed.
 final class RemoteAPIClient {
     static let ephemeralSession: URLSession = {
@@ -150,11 +178,24 @@ final class RemoteAPIClient {
             let tokens = try await validTokens()
             try authorize(&request, token: tokens.accessToken)
         }
+        return try await perform(request, authenticated: authenticated)
+    }
+
+    /// Used only to revoke a logged-out device after a fresh device-signed challenge.
+    /// The short-lived token stays in memory and is never written to Keychain.
+    func revoke(using accessToken: String) async throws {
+        var request = try makeRequest("POST", path: "/auth/revoke", body: nil,
+                                      contentType: "application/json", extraHeaders: [:])
+        try authorize(&request, token: accessToken)
+        _ = try await perform(request, authenticated: true)
+    }
+
+    private func perform(_ request: URLRequest, authenticated: Bool) async throws -> Data {
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw RemoteError.invalidResponse }
         if http.statusCode == 401 && authenticated {
             if case .server(_, "device_revoked") = Self.serverError(http.statusCode, data: data) {
-                try store.clearTokens(for: userID)
+                try await MainActor.run { try store.clearTokens(for: userID) }
                 throw RemoteError.deviceRevoked
             }
             throw RemoteError.authenticationExpired
@@ -182,6 +223,18 @@ final class RemoteAPIClient {
     private func validTokens() async throws -> RemoteTokens {
         guard let tokens = try store.tokens(for: userID) else { throw RemoteError.authenticationExpired }
         if tokens.expiresAt > Date().addingTimeInterval(30) { return tokens }
+        let key = baseURL.absoluteString + "|" + userID + "|" +
+            Data(SHA256.hash(data: Data(tokens.refreshToken.utf8))).base64URLEncodedString()
+        return try await RemoteTokenRefreshCoordinator.shared.refresh(key: key) { [self] in
+            try await refreshTokens(expected: tokens)
+        }
+    }
+
+    private func refreshTokens(expected: RemoteTokens) async throws -> RemoteTokens {
+        // A caller may have read the old token just before a completed refresh.
+        // Recheck under the coordinator before ever sending a single-use token.
+        guard let tokens = try store.tokens(for: userID) else { throw RemoteError.authenticationExpired }
+        if tokens.refreshToken != expected.refreshToken { return tokens }
         let body = try JSONEncoder().encode(["refreshToken": tokens.refreshToken])
         var request = try makeRequest("POST", path: "/auth/refresh", body: body, contentType: "application/json", extraHeaders: [:])
         try authorize(&request, token: tokens.refreshToken, bearer: false)
@@ -190,7 +243,7 @@ final class RemoteAPIClient {
         guard (200...299).contains(http.statusCode) else {
             if http.statusCode == 401 {
                 if case .server(_, "device_revoked") = Self.serverError(http.statusCode, data: data) {
-                    try store.clearTokens(for: userID)
+                    try await MainActor.run { try store.clearTokens(for: userID) }
                     throw RemoteError.deviceRevoked
                 }
                 throw RemoteError.authenticationExpired
@@ -198,6 +251,15 @@ final class RemoteAPIClient {
             throw Self.serverError(http.statusCode, data: data)
         }
         let renewed = try JSONDecoder().decode(RemoteTokenResponse.self, from: data)
+        return try await commitRefresh(renewed, replacing: tokens)
+    }
+
+    @MainActor
+    private func commitRefresh(_ renewed: RemoteTokenResponse, replacing tokens: RemoteTokens) throws -> RemoteTokens {
+        // Logout/device cleanup also runs on MainActor. With no suspension between
+        // the check and save, a removed session cannot be recreated by this response.
+        guard let current = try store.tokens(for: userID) else { throw RemoteError.authenticationExpired }
+        guard current.refreshToken == tokens.refreshToken else { return current }
         try store.save(renewed, for: userID)
         guard let fresh = try store.tokens(for: userID) else { throw RemoteError.authenticationExpired }
         return fresh

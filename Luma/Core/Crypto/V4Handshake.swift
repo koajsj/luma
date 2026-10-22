@@ -26,6 +26,9 @@ struct V4PreKeyBundle: Codable {
     let signedPreKeyPublicKey: Data
     let signedPreKeySignature: Data
     let oneTimePreKeyPublicKey: Data?
+    var recoveryProtocolVersion: Int? = nil
+    var recoveryCapabilitySignature: Data? = nil
+    var recoveryParticipant: V4RecoveryParticipant? = nil
 
     var identityFingerprint: String {
         V4Handshake.fingerprint(signing: identitySigningPublicKey, agreement: identityAgreementPublicKey)
@@ -44,9 +47,11 @@ struct V4InitialHeader: Codable {
     let recipientSignedPreKeyPublicKey: Data
     let recipientOneTimePreKeyPublicKey: Data?
     let signature: Data
+    var protocolVersion: Int? = nil
+    var pairID: Data? = nil
 
     func transcript() -> Data {
-        V4Handshake.fields("luma.v4.initial", [
+        let legacy = V4Handshake.fields("luma.v4.initial", [
             Data(senderDeviceID.uuidString.lowercased().utf8),
             Data(receiverDeviceID.uuidString.lowercased().utf8),
             Data(String(recipientKeyVersion).utf8),
@@ -54,6 +59,10 @@ struct V4InitialHeader: Codable {
             recipientIdentityAgreementPublicKey, recipientIdentitySigningPublicKey,
             recipientSignedPreKeyPublicKey, recipientOneTimePreKeyPublicKey ?? Data()
         ])
+        if let protocolVersion {
+            return V4Handshake.fields("luma.v4.initial.v2", [V4HandshakeRecovery.integer(protocolVersion), pairID ?? Data(), legacy])
+        }
+        return legacy
     }
 }
 
@@ -101,6 +110,11 @@ enum V4Handshake {
     }
 
     static func verify(_ bundle: V4PreKeyBundle, expectedFingerprint: String) throws {
+        if let version = bundle.recoveryProtocolVersion {
+            guard version == 2, let signature = bundle.recoveryCapabilitySignature,
+                  let signer = try? Curve25519.Signing.PublicKey(rawRepresentation: bundle.identitySigningPublicKey),
+                  signer.isValidSignature(signature, for: recoveryCapabilityTranscript(bundle)) else { throw V4ProtocolError.invalidPreKey }
+        } else if bundle.recoveryCapabilitySignature != nil { throw V4ProtocolError.invalidPreKey }
         let validOneTimeKey: Bool
         if let oneTime = bundle.oneTimePreKeyPublicKey {
             validOneTimeKey = (try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: oneTime)) != nil
@@ -119,11 +133,15 @@ enum V4Handshake {
     }
 
     static func initiate(senderDeviceID: UUID, identity: V4IdentityKeys,
-                         recipient: V4PreKeyBundle, expectedFingerprint: String) throws -> V4Initiation {
+                         recipient: V4PreKeyBundle, expectedFingerprint: String, recoveryPair: V4RecoveryPair? = nil) throws -> V4Initiation {
         guard recipient.identityFingerprint == expectedFingerprint else { throw V4ProtocolError.untrustedIdentity }
         try verify(recipient, expectedFingerprint: expectedFingerprint)
+        if let recoveryPair {
+            try recoveryPair.validate()
+            guard recipient.recoveryProtocolVersion == 2, recipient.oneTimePreKeyPublicKey != nil else { throw V4ProtocolError.invalidPreKey }
+        }
         let ephemeral = Curve25519.KeyAgreement.PrivateKey()
-        let headerUnsigned = V4InitialHeader(senderDeviceID: senderDeviceID,
+        var headerUnsigned = V4InitialHeader(senderDeviceID: senderDeviceID,
             receiverDeviceID: recipient.deviceID, recipientKeyVersion: recipient.keyVersion,
             senderIdentityAgreementPublicKey: identity.agreement.publicKey.rawRepresentation,
             senderIdentitySigningPublicKey: identity.signing.publicKey.rawRepresentation,
@@ -132,6 +150,8 @@ enum V4Handshake {
             recipientIdentitySigningPublicKey: recipient.identitySigningPublicKey,
             recipientSignedPreKeyPublicKey: recipient.signedPreKeyPublicKey,
             recipientOneTimePreKeyPublicKey: recipient.oneTimePreKeyPublicKey, signature: Data())
+        headerUnsigned.protocolVersion = recoveryPair == nil ? nil : 2
+        headerUnsigned.pairID = recoveryPair?.id
         let signature = try identity.signing.signature(for: headerUnsigned.transcript())
         let header = V4InitialHeader(senderDeviceID: headerUnsigned.senderDeviceID,
             receiverDeviceID: headerUnsigned.receiverDeviceID,
@@ -143,7 +163,7 @@ enum V4Handshake {
             recipientIdentitySigningPublicKey: headerUnsigned.recipientIdentitySigningPublicKey,
             recipientSignedPreKeyPublicKey: headerUnsigned.recipientSignedPreKeyPublicKey,
             recipientOneTimePreKeyPublicKey: headerUnsigned.recipientOneTimePreKeyPublicKey,
-            signature: signature)
+            signature: signature, protocolVersion: headerUnsigned.protocolVersion, pairID: headerUnsigned.pairID)
         let peerIdentity = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: recipient.identityAgreementPublicKey)
         let peerSigned = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: recipient.signedPreKeyPublicKey)
         var secrets = try [identity.agreement.sharedSecretFromKeyAgreement(with: peerSigned),
@@ -166,6 +186,8 @@ enum V4Handshake {
                           agreement: header.senderIdentityAgreementPublicKey) == expectedSenderFingerprint else {
             throw V4ProtocolError.untrustedIdentity
         }
+        guard (header.protocolVersion == nil && header.pairID == nil) ||
+              (header.protocolVersion == 2 && header.pairID?.count == 32) else { throw V4ProtocolError.invalidHandshake }
         guard expectedKeyVersion > 0, header.recipientKeyVersion == expectedKeyVersion,
               header.recipientIdentityAgreementPublicKey == identity.agreement.publicKey.rawRepresentation,
               header.recipientIdentitySigningPublicKey == identity.signing.publicKey.rawRepresentation,
@@ -197,6 +219,20 @@ enum V4Handshake {
                                          signing: Data, signedPreKey: Data) -> Data {
         fields("luma.v4.signed-prekey", [Data(deviceID.uuidString.lowercased().utf8),
             Data(String(version).utf8), agreement, signing, signedPreKey])
+    }
+
+    static func recoveryCapabilityTranscript(_ bundle: V4PreKeyBundle) -> Data {
+        fields("luma.v4.recovery-capability.v2", [V4HandshakeRecovery.uuidBytes(bundle.deviceID),
+            V4HandshakeRecovery.integer(bundle.keyVersion), bundle.identityAgreementPublicKey,
+            bundle.identitySigningPublicKey, bundle.signedPreKeyPublicKey, V4HandshakeRecovery.integer(2)])
+    }
+
+    static func enableRecovery(_ bundle: V4PreKeyBundle, identity: V4IdentityKeys) throws -> V4PreKeyBundle {
+        var result = bundle
+        result.recoveryProtocolVersion = 2
+        result.recoveryCapabilitySignature = try identity.signing.signature(for: recoveryCapabilityTranscript(bundle))
+        try verify(result, expectedFingerprint: result.identityFingerprint)
+        return result
     }
 
     static func fields(_ domain: String, _ values: [Data]) -> Data {

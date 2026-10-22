@@ -30,3 +30,9 @@ RC1.2 后端与部署加固涵盖 Block 权限、PreKey 可用设备筛选、Rea
 ## 文档与开发约束
 
 完整索引见 [Documentation/README.md](Documentation/README.md)。开发新功能前，先读相关的 **Architecture、Security、Protocol** 文档，并核对代码及 OpenAPI。`Product` 记录产品范围，`Crypto` 记录密钥与协议边界，`Backend` 记录服务端设计；设计文档中的未来方案不能当作已实现或已部署能力。
+
+## 源码审查与验证
+
+2026-10-13 的[源码审查报告](Documentation/Security/Source_Audit_2026-10-13.md)记录本地凭据/PreKey 竞态、搜索隐私、后端权限与部署可靠性修复，以及实际验证范围。新版双方同时首次握手恢复已加入默认关闭的验证路径，legacy 路径仍失败关闭。实现记录与人工验收步骤见 [v4 恢复验收](Documentation/Security/V4_Recovery_Validation.md)。实体设备/VPS 验收及独立密码学评审尚未完成，本项目仍适合开发和受控联调，不应据此宣称完整 E2EE 已通过发布验收。
+
+后端基础检查：在 `backend/` 执行 `go build ./...`、`go vet ./...`、`go test -race ./...`。数据库/Redis 集成测试需要明确提供隔离的 `LUMA_DEVICE_TEST_DSN`、`LUMA_FILE_TEST_DSN`、`LUMA_USERID_INDEX_TEST_DSN`、`LUMA_REDIS_TEST_URL`；缺少配置时会跳过，不能计为通过。不要对生产数据库运行测试。iOS 的 `Luma` Scheme 包含 `LumaTests`，使用 Xcode 或 `xcodebuild test` 在 iOS 模拟器运行。

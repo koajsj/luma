@@ -8,6 +8,7 @@ struct OnlineConnectionView: View {
     @State private var address = ""
     @State private var registration: RemoteRegistration?
     @State private var hasTokens = false
+    @State private var pendingRevocation = false
     @State private var profile: RemoteProfile?
     @State private var searchID = ""
     @State private var found: RemoteUserResult?
@@ -29,6 +30,11 @@ struct OnlineConnectionView: View {
                     LabeledContent("服务器", value: registration.baseURL.absoluteString)
                     LabeledContent("设备", value: registration.backendDeviceID.uuidString)
                     LabeledContent("状态", value: hasTokens ? "已登录 · 可在聊天中选择在线模式" : "需要设备登录")
+                    if pendingRevocation {
+                        Text("本机凭据已清除，服务器会话撤销尚未确认。联网后会重试，也可手动重试。")
+                            .font(.footnote).foregroundStyle(.secondary)
+                        Button("重试服务器撤销") { run { try await retryPendingRevocation() } }
+                    }
                     if !hasTokens { Button("设备签名登录") { run { try await login() } } }
                     else { Button("退出服务器会话") { run { try await signOut() } } }
                 } else {
@@ -142,6 +148,7 @@ struct OnlineConnectionView: View {
     private func loadState() {
         do {
             (registration, hasTokens) = try viewModel.localState()
+            pendingRevocation = try viewModel.pendingRevocation()
             address = registration?.baseURL.absoluteString ?? ProcessInfo.processInfo.environment["LUMA_DEV_API_URL"] ?? ""
         } catch { errorMessage = LumaError.message(for: error) }
     }
@@ -172,8 +179,15 @@ struct OnlineConnectionView: View {
     private func signOut() async throws {
         try await viewModel.signOut()
         hasTokens = false
+        pendingRevocation = false
         profile = nil
         pending = []
+    }
+
+    private func retryPendingRevocation() async throws {
+        try await viewModel.retryPendingRevocation()
+        pendingRevocation = false
+        notice = "服务器会话已撤销"
     }
 
     private func refresh() async throws {
