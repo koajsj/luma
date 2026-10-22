@@ -365,12 +365,9 @@ struct V4SessionVault {
         }
         if let pending = try incomingPending(userID: userID, deviceID: localDeviceID),
            pending.session.remoteDeviceID == remoteDeviceID {
-            if pending.phase == .prepared {
-                // No candidate session has been committed; the server event can be replayed.
-                try keychain.delete(incomingAccount(userID, localDeviceID))
-            } else {
-                try finishIncoming(userID: userID, deviceID: localDeviceID, eventID: pending.eventID)
-            }
+            // Whether the corresponding sync cursor was committed is external to this
+            // vault. Keep the journal and abort removal; sync recovery must resolve it first.
+            throw V4VaultError.pendingOperation
         }
         try deleteSession(userID: userID, local: localDeviceID, remote: remoteDeviceID)
     }
@@ -389,11 +386,8 @@ struct V4SessionVault {
         }
         if let pending = try incomingPending(userID: userID, deviceID: localDeviceID),
            pending.session.remoteUserID == remoteUserID {
-            if pending.phase == .prepared {
-                try keychain.delete(incomingAccount(userID, localDeviceID))
-            } else {
-                try finishIncoming(userID: userID, deviceID: localDeviceID, eventID: pending.eventID)
-            }
+            // Cursor and SwiftData commit state must be reconciled by sync recovery first.
+            throw V4VaultError.pendingOperation
         }
     }
 
