@@ -352,28 +352,42 @@ struct V4SessionVault {
     }
 
     /// Removes material for a revoked device or an identity that must be reverified.
-    /// Pending journals referencing that peer cannot be replayed with stale trust.
+    /// Never discard a journal after session writes may have started: an outgoing
+    /// message can advance several recipient ratchets as one logical operation.
     func deletePeer(userID: String, localDeviceID: UUID, remoteDeviceID: UUID) throws {
-        try deleteSession(userID: userID, local: localDeviceID, remote: remoteDeviceID)
         if let pending = try outgoingPending(userID: userID, deviceID: localDeviceID),
            pending.sessions.contains(where: { $0.remoteDeviceID == remoteDeviceID }) {
-            try keychain.delete(outgoingAccount(userID, localDeviceID))
+            if pending.phase == .prepared {
+                try keychain.delete(outgoingAccount(userID, localDeviceID))
+            } else {
+                try finishOutgoing(userID: userID, deviceID: localDeviceID, messageID: pending.messageID)
+            }
         }
         if let pending = try incomingPending(userID: userID, deviceID: localDeviceID),
            pending.session.remoteDeviceID == remoteDeviceID {
-            try keychain.delete(incomingAccount(userID, localDeviceID))
+            // Whether the corresponding sync cursor was committed is external to this
+            // vault. Keep the journal and abort removal; sync recovery must resolve it first.
+            throw V4VaultError.pendingOperation
         }
+        try deleteSession(userID: userID, local: localDeviceID, remote: remoteDeviceID)
     }
 
+    /// Resolve any in-progress ratchet transaction before a caller removes all sessions
+    /// for a peer whose identity changed or whose friendship was deleted.
     func discardPendingForRemoteUser(userID: String, localDeviceID: UUID,
                                      remoteUserID: UUID) throws {
         if let pending = try outgoingPending(userID: userID, deviceID: localDeviceID),
            pending.sessions.contains(where: { $0.remoteUserID == remoteUserID }) {
-            try keychain.delete(outgoingAccount(userID, localDeviceID))
+            if pending.phase == .prepared {
+                try keychain.delete(outgoingAccount(userID, localDeviceID))
+            } else {
+                try finishOutgoing(userID: userID, deviceID: localDeviceID, messageID: pending.messageID)
+            }
         }
         if let pending = try incomingPending(userID: userID, deviceID: localDeviceID),
            pending.session.remoteUserID == remoteUserID {
-            try keychain.delete(incomingAccount(userID, localDeviceID))
+            // Cursor and SwiftData commit state must be reconciled by sync recovery first.
+            throw V4VaultError.pendingOperation
         }
     }
 
