@@ -5,7 +5,8 @@ import Foundation
 struct RemoteSessionControlProvider {
     let client: RemoteAPIClient
 
-    func send(_ item: V4RecoveryControlOutbox) async throws {
+    func send(_ item: V4RecoveryControlOutbox,
+              beforeTransmission: (@MainActor () throws -> Void)? = nil) async throws {
         struct Request: Encodable {
             let controlID: UUID
             let conversationID: UUID
@@ -16,6 +17,6 @@ struct RemoteSessionControlProvider {
         _ = try await client.request("POST", path: "/sessions/controls", body: JSONEncoder().encode(
             Request(controlID: item.id, conversationID: item.conversationID,
                 receiverDeviceID: item.receiverDeviceID, encryptionVersion: 4,
-                envelope: item.wire.base64URLEncodedString())))
+                envelope: item.wire.base64URLEncodedString())), beforeTransmission: beforeTransmission)
     }
 }

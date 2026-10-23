@@ -38,6 +38,10 @@ struct RemoteSyncCoordinator {
         let page = try await provider.fetch(after: checkpoint.cursor, limit: limit)
         var applied = 0
         for event in page.events {
+            try Task.checkCancellation()
+            guard try repository.security.currentUserID() == repository.user.userID else {
+                throw MessageStoreError.locked
+            }
             guard event.deviceSeq == checkpoint.cursor + 1 else { throw DeviceSessionError.invalidEnvelope }
             do {
                 if event.type == "device.revoked" {
@@ -57,6 +61,10 @@ struct RemoteSyncCoordinator {
                 // A failed receipt leaves the event unacked; replay is safe after local persistence.
                 _ = try await repository.client.request("POST", path: "/messages/delivered",
                     body: JSONEncoder().encode(["messageID": messageID.uuidString.lowercased()]))
+            }
+            try Task.checkCancellation()
+            guard try repository.security.currentUserID() == repository.user.userID else {
+                throw MessageStoreError.locked
             }
             checkpoint.cursor = event.deviceSeq
             do { try context.save() }

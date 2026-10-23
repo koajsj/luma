@@ -54,7 +54,8 @@ struct FriendsView: View {
                             HStack(spacing: 12) {
                                 AvatarView(name: security.friendDisplayName(friend, context: context), imageData: security.friendAvatar(friend, context: context))
                                     .overlay(alignment: .bottomTrailing) {
-                                        if !isProtected(friend), presences.first(where: { $0.friendID == friend.id })?.onlineStatus == .online {
+                                        if !isProtected(friend), security.preferences.effectiveOnlineStatus,
+                                           presences.first(where: { $0.friendID == friend.id })?.onlineStatus == .online {
                                             Circle().fill(.green).frame(width: 11, height: 11)
                                                 .overlay(Circle().stroke(.background, lineWidth: 2))
                                                 .accessibilityLabel("在线 · 本地模拟")
@@ -63,7 +64,8 @@ struct FriendsView: View {
                                 VStack(alignment: .leading, spacing: 3) {
                                     Text(security.friendDisplayName(friend, context: context)).font(.headline).lineLimit(1)
                                     Text("@\(friend.userID)").font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
-                                    if !isProtected(friend), presences.first(where: { $0.friendID == friend.id })?.onlineStatus == .online {
+                                    if !isProtected(friend), security.preferences.effectiveOnlineStatus,
+                                       presences.first(where: { $0.friendID == friend.id })?.onlineStatus == .online {
                                         Text("在线 · 本地模拟").font(.caption2).foregroundStyle(.secondary)
                                     }
                                 }

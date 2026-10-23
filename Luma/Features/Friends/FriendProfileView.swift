@@ -53,9 +53,12 @@ struct FriendProfileView: View {
                 }
             }
             Section("在线状态 · 本地演示") {
-                LabeledContent("状态", value: presence?.onlineStatus == .online ? "在线（本地模拟）" :
-                               presence?.onlineStatus == .offline ? "离线（本地模拟）" : "未知")
-                if let date = presence?.lastSeenAt { LabeledContent("最后在线") { Text(date, style: .relative) } }
+                LabeledContent("状态", value: security.preferences.effectiveOnlineStatus ?
+                               (presence?.onlineStatus == .online ? "在线（本地模拟）" :
+                                presence?.onlineStatus == .offline ? "离线（本地模拟）" : "未知") : "已隐藏")
+                if security.preferences.effectiveLastSeen, let date = presence?.lastSeenAt {
+                    LabeledContent("最后在线") { Text(date, style: .relative) }
+                }
                 Button(presence?.onlineStatus == .online ? "模拟离线" : "模拟在线") {
                     do { try FriendsViewModel(context: context).setMockOnline(presence?.onlineStatus != .online, for: friend) }
                     catch { errorMessage = LumaError.message(for: error) }

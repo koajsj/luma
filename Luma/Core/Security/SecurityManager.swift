@@ -29,6 +29,7 @@ final class SecurityManager {
     private let keys: KeyManager
     private let lifecycle: KeyLifecycleManager
     @ObservationIgnored private var unlockedKey: SymmetricKey?
+    @ObservationIgnored private var authorizationGeneration = UUID()
     private let sessionAccount = "active-user-id"
 
     init(keychain: KeychainManager = KeychainManager()) {
@@ -38,6 +39,7 @@ final class SecurityManager {
     }
 
     func restore(users: [User], context: ModelContext) {
+        authorizationGeneration = UUID()
         unlockedKey = nil
         do {
             try resumeAccountCleanup(context: context)
@@ -55,8 +57,8 @@ final class SecurityManager {
         }
     }
 
-    func showRegistration() { unlockedKey = nil; preferences = PrivacyPreferences(); phase = .registration }
-    func showLogin() { unlockedKey = nil; preferences = PrivacyPreferences(); phase = .login }
+    func showRegistration() { authorizationGeneration = UUID(); unlockedKey = nil; preferences = PrivacyPreferences(); phase = .registration }
+    func showLogin() { authorizationGeneration = UUID(); unlockedKey = nil; preferences = PrivacyPreferences(); phase = .login }
 
     func register(userID: String, nickname: String, password: String, context: ModelContext) throws {
         let hash = try PasswordHasher.hash(password)
@@ -104,12 +106,17 @@ final class SecurityManager {
 
     func unlockWithBiometrics(context: ModelContext) async throws {
         guard let id = activeUserID else { throw AuthenticationError.noSession }
+        let generation = authorizationGeneration, expectedPhase = phase
         let auth = LAContext()
         var error: NSError?
         guard auth.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error), auth.biometryType == .faceID else {
             throw AuthenticationError.biometricsUnavailable
         }
         try await auth.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: "解锁 Luma")
+        try Task.checkCancellation()
+        guard authorizationGeneration == generation, activeUserID == id, phase == expectedPhase else {
+            throw AuthenticationError.noSession
+        }
         guard let user = try LocalRepository(context: context).user(id) else { throw AuthenticationError.noSession }
         try unlock(user: user, key: try keys.read(for: id), context: context)
     }
@@ -128,19 +135,27 @@ final class SecurityManager {
     }
 
     func verifyChatBiometrics() async throws {
-        guard phase == .unlocked else { throw MessageStoreError.locked }
+        let id = try currentUserID(), generation = authorizationGeneration
         let auth = LAContext()
         guard auth.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: nil), auth.biometryType == .faceID else {
             throw AuthenticationError.biometricsUnavailable
         }
         try await auth.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: "查看此聊天")
+        try Task.checkCancellation()
+        guard authorizationGeneration == generation, try currentUserID() == id else {
+            throw MessageStoreError.locked
+        }
     }
 
     func lock() {
-        if phase == .unlocked { unlockedKey = nil; preferences = PrivacyPreferences(); phase = .locked }
+        authorizationGeneration = UUID()
+        if phase == .unlocked {
+            unlockedKey = nil; preferences = PrivacyPreferences(); phase = .locked
+        }
     }
 
     func logout() throws {
+        authorizationGeneration = UUID()
         if let activeUserID {
             let remote = RemoteSessionStore(keychain: keychain)
             let hasRegistration = try remote.registration(for: activeUserID) != nil
@@ -169,6 +184,7 @@ final class SecurityManager {
 
     private func establishSession(for id: String) throws {
         try keychain.save(Data(id.utf8), account: sessionAccount)
+        authorizationGeneration = UUID()
         activeUserID = id
     }
 
@@ -401,6 +417,7 @@ final class SecurityManager {
             throw error
         }
         preferences = try PrivateMetadataStore(context: context, encryption: EncryptionService(key: key)).preferences(for: user)
+        authorizationGeneration = UUID()
         unlockedKey = key
         phase = .unlocked
     }

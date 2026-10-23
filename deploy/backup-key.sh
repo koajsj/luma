@@ -7,6 +7,7 @@ require_install
 lock_operation
 require_no_incomplete_restore
 require_age
+[[ $(backup_key_mode) == local ]] || die '离线模式不轮换本地私钥；请在独立设备管理公钥，保留旧恢复私钥。'
 if [[ -f "$BACKUP_KEY_DIR/current" ]]; then
     backup_key_id >/dev/null
 elif [[ -d "$BACKUP_KEY_DIR" ]] && compgen -G "$BACKUP_KEY_DIR/*.key" >/dev/null; then

@@ -7,6 +7,13 @@ require_install
 lock_operation
 require_no_incomplete_restore
 ensure_backup_key
+verify_new_backup=1
+if [[ $(backup_key_mode) == offline && -z ${LUMA_BACKUP_IDENTITY:-} ]]; then
+    verify_new_backup=0
+    printf '离线密钥模式：本机只加密，不具备解密能力；完成后必须在独立可信设备验证备份。\n' >&2
+else
+    backup_require_recovery
+fi
 if [[ ${1:-} == migrate ]]; then
     legacy=${2:-}
     [[ -n $legacy && ! -L $legacy ]] || die '用法：luma backup migrate /opt/luma/backups/旧备份目录'
@@ -30,11 +37,13 @@ if [[ ${1:-} == migrate ]]; then
     printf '2\n' > "$target/FORMAT"
     backup_key_id > "$target/BACKUP_KEY_ID"
     backup_create_manifest "$target"
-    backup_identity_args "$(cat "$target/BACKUP_KEY_ID")"
-    backup_validate_manifest "$target" || die '转换后的加密备份校验失败。'
+    if (( verify_new_backup )); then
+        backup_identity_args "$(cat "$target/BACKUP_KEY_ID")"
+        backup_validate_manifest "$target" || die '转换后的加密备份校验失败。'
+    fi
     chmod 600 "$target"/*
     mv "$target" "$complete"
-    printf '加密副本已生成：%s；原旧备份保持不变，请核对后另行安全处置。\n' "$complete"
+    printf '加密副本已生成：%s；原旧备份保持不变，请在独立设备核对后另行安全处置。\n' "$complete"
     exit 0
 fi
 [[ -d "$STORAGE_DIR" ]] || die '密文目录不存在。'
@@ -72,15 +81,18 @@ printf '%s' "$(env_value LUMA_USERID_HMAC_SECRET)" | sha256sum | awk '{print $1}
 printf '2\n' > "$target/FORMAT"
 backup_key_id > "$target/BACKUP_KEY_ID"
 backup_create_manifest "$target"
-backup_identity_args "$(cat "$target/BACKUP_KEY_ID")"
-backup_validate_manifest "$target" || die '备份认证校验失败。'
-backup_decrypt "$target/postgres.dump.age" | compose exec -T postgres pg_restore -l >/dev/null || die '数据库备份验证失败。'
-backup_decrypt "$target/storage.tar.gz.age" |
-    python3 "$APP_DIR/deploy/backup-format.py" verify-storage >/dev/null || die '密文目录备份验证失败。'
+if (( verify_new_backup )); then
+    backup_identity_args "$(cat "$target/BACKUP_KEY_ID")"
+    backup_validate_manifest "$target" || die '备份认证校验失败。'
+    backup_decrypt "$target/postgres.dump.age" | compose exec -T postgres pg_restore -l >/dev/null || die '数据库备份验证失败。'
+    backup_decrypt "$target/storage.tar.gz.age" |
+        python3 "$APP_DIR/deploy/backup-format.py" verify-storage >/dev/null || die '密文目录备份验证失败。'
+fi
 chmod 600 "$target"/*
 mv "$target" "$complete"
 compose up -d --wait >/dev/null
 health >/dev/null || die '备份后服务健康检查失败。'
 services_stopped=0
 printf '备份完成：%s\n' "$complete"
-printf '数据库和密文目录已加密并认证；备份不包含私钥或 .env。跨服务器恢复需另行保管恢复私钥和原 UserID HMAC 密钥。\n'
+printf '数据库和密文目录已加密；备份不包含私钥或 .env。跨服务器恢复需另行保管恢复私钥和原 UserID HMAC 密钥。\n'
+if (( ! verify_new_backup )); then printf '尚未完成解密校验；请勿将本次生成结果视为已经验证可恢复。\n' >&2; fi

@@ -2,10 +2,12 @@
 set -Eeuo pipefail
 umask 077
 source "$(dirname "$0")/lib.sh"
+source "$(dirname "$0")/backup-crypto.sh"
 require_install
 require_clean_main
 lock_operation
 require_no_incomplete_restore
+backup_require_recovery
 old=$(git -C "$APP_DIR" rev-parse HEAD)
 bash "$APP_DIR/deploy/backup.sh"
 backup=$(find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d ! -name '*.partial' -print | sort | tail -1)

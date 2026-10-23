@@ -71,7 +71,15 @@ struct RemoteSessionStore {
         try keychain.save(JSONEncoder().encode(value), account: "remote.tokens.\(userID)")
     }
 
-    func clearTokens(for userID: String) throws { try keychain.delete("remote.tokens.\(userID)") }
+    /// A non-secret tombstone also invalidates logins that have no stored token yet.
+    func authenticationGeneration(for userID: String) throws -> Data? {
+        try keychain.read("remote.auth-generation.\(userID)")
+    }
+
+    func clearTokens(for userID: String) throws {
+        try keychain.save(Data(UUID().uuidString.utf8), account: "remote.auth-generation.\(userID)")
+        try keychain.delete("remote.tokens.\(userID)")
+    }
 
     func revocationPending(for userID: String) throws -> Bool {
         try keychain.read("remote.revoke-pending.\(userID)") != nil
@@ -171,13 +179,19 @@ final class RemoteAPIClient {
         self.session = session ?? Self.ephemeralSession
     }
 
+    @MainActor
     func request(_ method: String, path: String, body: Data? = nil, authenticated: Bool = true,
-                 contentType: String = "application/json", extraHeaders: [String: String] = [:]) async throws -> Data {
+                 contentType: String = "application/json", extraHeaders: [String: String] = [:],
+                 beforeTransmission: (@MainActor () throws -> Void)? = nil) async throws -> Data {
         var request = try makeRequest(method, path: path, body: body, contentType: contentType, extraHeaders: extraHeaders)
         if authenticated {
             let tokens = try await validTokens()
             try authorize(&request, token: tokens.accessToken)
         }
+        try Task.checkCancellation()
+        // Token refresh can suspend. Recheck repository authorization immediately
+        // before handing the request to URLSession, not just before encryption.
+        try beforeTransmission?()
         return try await perform(request, authenticated: authenticated)
     }
 
@@ -190,12 +204,17 @@ final class RemoteAPIClient {
         _ = try await perform(request, authenticated: true)
     }
 
+    @MainActor
     private func perform(_ request: URLRequest, authenticated: Bool) async throws -> Data {
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw RemoteError.invalidResponse }
         if http.statusCode == 401 && authenticated {
             if case .server(_, "device_revoked") = Self.serverError(http.statusCode, data: data) {
-                try await MainActor.run { try store.clearTokens(for: userID) }
+                guard let current = try store.tokens(for: userID),
+                      request.value(forHTTPHeaderField: "Authorization") == "Bearer \(current.accessToken)" else {
+                    throw RemoteError.authenticationExpired
+                }
+                try store.clearTokens(for: userID)
                 throw RemoteError.deviceRevoked
             }
             throw RemoteError.authenticationExpired
@@ -205,8 +224,10 @@ final class RemoteAPIClient {
     }
 
     func json<T: Decodable>(_ type: T.Type, method: String = "GET", path: String,
-                            body: Data? = nil, authenticated: Bool = true) async throws -> T {
-        let data = try await request(method, path: path, body: body, authenticated: authenticated)
+                            body: Data? = nil, authenticated: Bool = true,
+                            beforeTransmission: (@MainActor () throws -> Void)? = nil) async throws -> T {
+        let data = try await request(method, path: path, body: body, authenticated: authenticated,
+                                     beforeTransmission: beforeTransmission)
         do { return try JSONDecoder().decode(type, from: data) }
         catch { throw RemoteError.invalidResponse }
     }
@@ -243,7 +264,12 @@ final class RemoteAPIClient {
         guard (200...299).contains(http.statusCode) else {
             if http.statusCode == 401 {
                 if case .server(_, "device_revoked") = Self.serverError(http.statusCode, data: data) {
-                    try await MainActor.run { try store.clearTokens(for: userID) }
+                    try await MainActor.run {
+                        guard try store.tokens(for: userID)?.refreshToken == tokens.refreshToken else {
+                            throw RemoteError.authenticationExpired
+                        }
+                        try store.clearTokens(for: userID)
+                    }
                     throw RemoteError.deviceRevoked
                 }
                 throw RemoteError.authenticationExpired

@@ -55,6 +55,11 @@ struct V4MessageSessionService {
             guard pending.messageID == messageID else { throw V4VaultError.pendingOperation }
             return pending.request
         }
+        // Sync may be suspended on a delivery receipt after persisting the message,
+        // but before committing its receiving ratchet. Never fork from that old state.
+        guard try vault.incomingPending(userID: userID, deviceID: localDeviceID) == nil else {
+            throw V4VaultError.pendingOperation
+        }
         guard !targets.isEmpty, targets.count <= 32,
               Set(targets.map(\.bundle.deviceID)).count == targets.count,
               let device = try vault.loadDevice(userID: userID, deviceID: localDeviceID) else {
@@ -65,7 +70,8 @@ struct V4MessageSessionService {
         for target in targets {
             let bundle = target.bundle
             guard bundle.deviceID != localDeviceID else { throw V4ProtocolError.wrongDevice }
-            try V4Handshake.verify(bundle, expectedFingerprint: bundle.identityFingerprint)
+            try vault.observePeerBundle(bundle, remoteUserID: target.remoteUserID,
+                userID: userID, local: localDeviceID)
             if let legacy = try vault.loadSession(userID: userID, local: localDeviceID, remote: bundle.deviceID) {
                 guard legacy.remoteUserID == target.remoteUserID, legacy.remoteIdentityFingerprint == bundle.identityFingerprint,
                       bundle.keyVersion >= legacy.recipientKeyVersion else { throw V4ProtocolError.untrustedIdentity }
@@ -82,8 +88,6 @@ struct V4MessageSessionService {
         var envelopes: [V4WireRecipient] = []
         for target in targets {
             let bundle = target.bundle
-            guard bundle.deviceID != localDeviceID else { throw V4ProtocolError.wrongDevice }
-            try V4Handshake.verify(bundle, expectedFingerprint: bundle.identityFingerprint)
             let legacy = try vault.loadSession(userID: userID, local: localDeviceID, remote: bundle.deviceID)
             let existingRecovery = try recovery.vault.find(remoteDevice: bundle.deviceID)
             let pendingRecovery = try recovery.vault.pairs().contains { pairID in
@@ -169,6 +173,8 @@ struct V4MessageSessionService {
                  senderUserID: UUID, senderBundle: V4PreKeyBundle) throws -> Data {
         guard envelope.encryptionVersion == 4, envelope.receiverDeviceID == localDeviceID,
               envelope.senderDeviceID == senderBundle.deviceID else { throw V4ProtocolError.invalidMessage }
+        try vault.observePeerBundle(senderBundle, remoteUserID: senderUserID,
+            userID: userID, local: localDeviceID)
         if envelope.recoveryProposal != nil || envelope.initialHeader?.protocolVersion != nil {
             guard let own = recoveryParticipant, let remote = senderBundle.recoveryParticipant,
                   remote.accountID == senderUserID,
@@ -187,6 +193,11 @@ struct V4MessageSessionService {
             guard pending.eventID == eventID, pending.deviceSeq == deviceSeq,
                   pending.envelopeDigest == digest else { throw V4VaultError.pendingOperation }
             return pending.plaintext
+        }
+        // A prepared multi-recipient send may not yet be durable in SwiftData.
+        // Its owner must finish committing it before receiving can advance a chain.
+        guard try vault.outgoingPending(userID: userID, deviceID: localDeviceID) == nil else {
+            throw V4VaultError.pendingOperation
         }
         guard let device = try vault.loadDevice(userID: userID, deviceID: localDeviceID) else {
             throw V4VaultError.missing

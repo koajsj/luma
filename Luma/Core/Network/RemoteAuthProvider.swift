@@ -21,6 +21,7 @@ struct RemoteAuthProvider {
 
     func register(user: User, baseURL: URL, nickname: String) async throws -> RemoteRegistration {
         guard try store.registration(for: user.userID) == nil else { throw RemoteError.server(409, "device_already_registered") }
+        let generation = try store.authenticationGeneration(for: user.userID)
         guard let device = try localDevice(for: user),
               let identity = user.identityPublicKey,
               let devicePublic = device.publicKey else { throw AsymmetricKeyError.missing }
@@ -54,6 +55,11 @@ struct RemoteAuthProvider {
                                                               path: "/auth/register", body: body, authenticated: false)
         let registration = RemoteRegistration(backendUserID: result.userID,
                                               backendDeviceID: result.deviceID, baseURL: baseURL)
+        guard try store.authenticationGeneration(for: user.userID) == generation,
+              try context.fetch(FetchDescriptor<User>()).contains(where: { $0.id == user.id }) else {
+            throw RemoteError.authenticationExpired
+        }
+        try Task.checkCancellation()
         try store.save(registration, for: user.userID)
         try await login(userID: user.userID)
         let oneTime = try prekeys.records(for: user.id).filter { $0.type == "oneTime" && $0.usedAt == nil }
@@ -75,9 +81,17 @@ struct RemoteAuthProvider {
     func login(userID: String) async throws {
         try await revokePending(userID: userID)
         guard let registration = try store.registration(for: userID) else { throw RemoteError.unregistered }
+        let generation = try store.authenticationGeneration(for: userID)
         let client = try RemoteAPIClient(baseURL: registration.baseURL, userID: userID,
                                          store: store, signer: signer, session: session)
         let response = try await deviceToken(userID: userID, registration: registration, client: client)
+        try Task.checkCancellation()
+        guard try store.authenticationGeneration(for: userID) == generation,
+              let current = try store.registration(for: userID),
+              current.backendDeviceID == registration.backendDeviceID,
+              current.backendUserID == registration.backendUserID, current.baseURL == registration.baseURL else {
+            throw RemoteError.authenticationExpired
+        }
         try store.save(response, for: userID)
         if let user = try context.fetch(FetchDescriptor<User>()).first(where: { $0.userID == userID }) {
             try await V4PreKeyService(context: context, user: user, registration: registration,

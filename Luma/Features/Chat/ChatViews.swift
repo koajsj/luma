@@ -65,7 +65,8 @@ struct ChatListView: View {
                             HStack(alignment: .top, spacing: 12) {
                                 AvatarView(name: security.friendDisplayName(friend, context: context), imageData: security.friendAvatar(friend, context: context))
                                     .overlay(alignment: .bottomTrailing) {
-                                        if !isProtected(friend) && presences.first(where: { $0.friendID == friend.id })?.onlineStatus == .online {
+                                        if !isProtected(friend) && security.preferences.effectiveOnlineStatus &&
+                                            presences.first(where: { $0.friendID == friend.id })?.onlineStatus == .online {
                                             Circle().fill(.green).frame(width: 11, height: 11).overlay(Circle().stroke(.background, lineWidth: 2))
                                                 .accessibilityLabel("在线 · 本地模拟")
                                         }
@@ -249,8 +250,8 @@ struct ChatDetailView: View {
                         VStack(alignment: .leading, spacing: 1) {
                             Text(security.friendDisplayName(friend, context: context)).font(.headline).lineLimit(1)
                             if typingStatus == .typing && canViewChat { Text("正在输入 · 本地演示").font(.caption2).foregroundStyle(.secondary) }
-                            else if canViewChat && presence?.onlineStatus == .online { Text("在线 · 本地模拟").font(.caption2).foregroundStyle(.green) }
-                            else if canViewChat && presence?.onlineStatus == .offline, let lastSeen = presence?.lastSeenAt { Text("最后在线 \(lastSeen, style: .relative) · 本地模拟").font(.caption2).foregroundStyle(.secondary) }
+                            else if canViewChat && security.preferences.effectiveOnlineStatus && presence?.onlineStatus == .online { Text("在线 · 本地模拟").font(.caption2).foregroundStyle(.green) }
+                            else if canViewChat && security.preferences.effectiveLastSeen && presence?.onlineStatus == .offline, let lastSeen = presence?.lastSeenAt { Text("最后在线 \(lastSeen, style: .relative) · 本地模拟").font(.caption2).foregroundStyle(.secondary) }
                         }
                     }
                 }
@@ -525,7 +526,11 @@ struct ChatDetailView: View {
                                 Button { replyTo = message; UIImpactFeedbackGenerator(style: .light).impactOccurred() } label: { Label("回复", systemImage: "arrowshape.turn.up.left") }
                                 if message.type == .text {
                                     Button {
-                                        do { UIPasteboard.general.string = try viewModel.displayContent(for: message) }
+                                        do {
+                                            UIPasteboard.general.setItems(
+                                                [[UTType.utf8PlainText.identifier: try viewModel.displayContent(for: message)]],
+                                                options: [.localOnly: true, .expirationDate: Date().addingTimeInterval(120)])
+                                        }
                                         catch { featureNote = LumaError.message(for: error) }
                                     } label: { Label("复制", systemImage: "doc.on.doc") }
                                 }

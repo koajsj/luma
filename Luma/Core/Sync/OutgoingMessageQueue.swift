@@ -11,7 +11,7 @@ enum OutgoingQueueError: LocalizedError {
     }
 }
 
-/// Persists the exact v3 request before transmission. Retries reuse its message ID and envelopes.
+/// Persists the exact encrypted request before transmission. Retries reuse its ID and envelopes.
 @MainActor
 struct OutgoingMessageQueue {
     let context: ModelContext
@@ -31,6 +31,7 @@ struct OutgoingMessageQueue {
     }
 
     func drain(validate: ((OutgoingMessageQueueItem) async throws -> Void)? = nil,
+               checkAccess: ((OutgoingMessageQueueItem) throws -> Void)? = nil,
                prepare: (OutgoingMessageQueueItem, Data) async throws -> Data,
                afterPrepared: ((OutgoingMessageQueueItem, Data) throws -> Void)? = nil,
                send: ((Data, UUID) async throws -> Void)? = nil) async throws {
@@ -39,14 +40,24 @@ struct OutgoingMessageQueue {
         defer { Self.draining.remove(backendDeviceID) }
         let items = try context.fetch(FetchDescriptor<OutgoingMessageQueueItem>()).filter {
             $0.ownerID == ownerID && $0.backendDeviceID == backendDeviceID &&
-            $0.state != "sent" && $0.attempts < maxAttempts
+            $0.state != "sent"
         }.sorted { $0.createdAt == $1.createdAt ? $0.id.uuidString < $1.id.uuidString : $0.createdAt < $1.createdAt }
         for item in items {
             // Do not let a later message overtake one waiting for its retry window.
-            guard item.nextAttemptAt <= .now else { return }
+            guard item.attempts < maxAttempts, item.nextAttemptAt <= .now else { return }
+            let itemID = item.id, messageID = item.messageID
+            func requireCurrentItem() throws {
+                guard let current = try context.fetch(FetchDescriptor<OutgoingMessageQueueItem>()).first(where: {
+                    $0.id == itemID && $0.ownerID == ownerID && $0.backendDeviceID == backendDeviceID
+                }), try context.fetch(FetchDescriptor<Message>()).contains(where: {
+                    $0.id == messageID
+                }) else { throw OutgoingQueueError.missing }
+                guard current.state != "identityChanged" else { throw OutgoingQueueError.identityChanged }
+            }
             guard let message = try context.fetch(FetchDescriptor<Message>()).first(where: { $0.id == item.messageID }) else {
-                // Never transmit an orphaned queue item.
-                context.delete(item); try context.save(); continue
+                // A crypto journal may still refer to this exact request. Cleanup
+                // must resolve it; a retry must not silently discard the only outbox.
+                throw OutgoingQueueError.missing
             }
             do {
                 var body: Data
@@ -61,10 +72,14 @@ struct OutgoingMessageQueue {
                     throw error
                 }
                 try await validate?(item)
+                try requireCurrentItem()
+                try checkAccess?(item)
                 item.state = "sending"
                 try context.save()
                 if !item.prepared {
                     body = try await prepare(item, body)
+                    try requireCurrentItem()
+                    try checkAccess?(item)
                     item.encryptedRequest = try encryption.encrypt(body, authenticatedData: binding(item)).bytes
                     item.prepared = true
                     try context.save()
@@ -77,13 +92,31 @@ struct OutgoingMessageQueue {
                     _ = try await client.request("POST", path: "/messages", body: body,
                         extraHeaders: ["Idempotency-Key": item.messageID.uuidString.lowercased()])
                 }
-                message.deliveryStatus = .sent
+                try requireCurrentItem()
+                try checkAccess?(item)
+                guard item.state == "sending", item.attempts < maxAttempts else { throw OutgoingQueueError.missing }
+                // Sync can deliver a receipt before the original HTTP response.
+                if message.deliveryStatus == .sending || message.deliveryStatus == .failed {
+                    message.deliveryStatus = .sent
+                }
                 item.state = "sent"
                 try context.save()
                 context.delete(item)
                 try context.save()
             } catch {
+                // Cleanup, identity changes or logout may have occurred during I/O.
+                // Do not resurrect deleted models or mark old requests successful.
+                try requireCurrentItem()
+                try checkAccess?(item)
                 if item.state == "failed" || item.state == "identityChanged" { throw error }
+                if (error as? V4VaultError) == .pendingOperation {
+                    // A receiving transaction must finish first; this is not a failed
+                    // delivery attempt and must not exhaust the network retry budget.
+                    item.state = "pending"
+                    item.nextAttemptAt = Date().addingTimeInterval(3)
+                    try context.save()
+                    throw error
+                }
                 if case DeviceSessionError.identityKeyChanged = error {
                     item.attempts = maxAttempts
                     item.state = "identityChanged"

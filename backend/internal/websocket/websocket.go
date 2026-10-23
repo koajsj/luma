@@ -65,16 +65,29 @@ func (h *Hub) Notify(device string, seq int64) {
 func (h *Hub) Presence(userID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	rows, e := h.DB.Query(ctx, "SELECT d.id FROM users u JOIN friendships f ON (f.user_a=u.id OR f.user_b=u.id) JOIN devices d ON d.user_id=CASE WHEN f.user_a=u.id THEN f.user_b ELSE f.user_a END AND d.revoked_at IS NULL WHERE u.id=$1 AND u.show_presence=true", userID)
+	rows, e := h.DB.Query(ctx, `SELECT d.id FROM users u
+		JOIN friendships f ON (f.user_a=u.id OR f.user_b=u.id)
+		JOIN users peer ON peer.id=CASE WHEN f.user_a=u.id THEN f.user_b ELSE f.user_a END
+		JOIN devices d ON d.user_id=peer.id AND d.revoked_at IS NULL
+		WHERE u.id=$1 AND u.show_presence=true AND u.disabled_at IS NULL AND peer.disabled_at IS NULL
+		AND NOT EXISTS (SELECT 1 FROM blocks b WHERE
+			(b.blocker=u.id AND b.blocked=peer.id) OR
+			(b.blocker=peer.id AND b.blocked=u.id))`, userID)
 	if e != nil {
 		return
 	}
 	ids := []string{}
 	for rows.Next() {
 		var id string
-		if rows.Scan(&id) == nil {
-			ids = append(ids, id)
+		if rows.Scan(&id) != nil {
+			rows.Close()
+			return
 		}
+		ids = append(ids, id)
+	}
+	if rows.Err() != nil {
+		rows.Close()
+		return
 	}
 	rows.Close()
 	frame := map[string]any{"protocolVersion": 1, "type": "presence.updated", "userID": userID, "online": true, "lastSeenAt": time.Now().UTC()}

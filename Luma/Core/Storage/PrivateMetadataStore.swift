@@ -18,6 +18,8 @@ struct PrivacyPreferences: Codable {
     var privacyModeEnabled = false
     var privacyModeLockChats = false
 
+    var effectiveOnlineStatus: Bool { !privacyModeEnabled && showOnlineStatus }
+    var effectiveLastSeen: Bool { !privacyModeEnabled && showLastSeen }
     var effectiveMessagePreviews: Bool { !privacyModeEnabled && messagePreviews }
     var effectiveBackgroundHide: Bool { privacyModeEnabled || hideInBackground }
     var effectiveScreenCaptureProtection: Bool { screenCaptureProtection ?? true }
@@ -166,6 +168,10 @@ struct PrivateMetadataStore {
                 let data = try JSONEncoder().encode(AttachmentMetadata(name: attachment.path, encryptedPath: attachment.encryptedPath,
                                                                         metadata: attachment.encryptionMetadata))
                 attachment.encryptedMetadata = try encryption.encrypt(data, authenticatedData: binding("attachment", attachment.id)).bytes
+                attachment.path = ""; attachment.encryptedPath = nil; attachment.encryptionMetadata = nil
+            } else if !attachment.path.isEmpty || attachment.encryptedPath != nil || attachment.encryptionMetadata != nil {
+                // Clear leftover plaintext only after the encrypted copy authenticates.
+                _ = try attachmentMetadata(for: attachment)
                 attachment.path = ""; attachment.encryptedPath = nil; attachment.encryptionMetadata = nil
             }
         }

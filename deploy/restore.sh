@@ -5,6 +5,7 @@ source "$(dirname "$0")/lib.sh"
 source "$(dirname "$0")/backup-crypto.sh"
 require_install
 lock_operation
+export LUMA_BACKUP_IDENTITY=${3:-${LUMA_BACKUP_IDENTITY:-}}
 
 state=/opt/luma/config/restore-state
 old_storage=/opt/luma/data/.storage-before-restore
@@ -168,7 +169,7 @@ if [[ ${LUMA_RESTORE_CONFIRMED:-} != 1 ]]; then
     read -r answer < /dev/tty
     [[ $answer == "$expected" ]] || die '已取消恢复。'
 fi
-ensure_backup_key
+backup_require_recovery
 stage=$(root mktemp -d /opt/luma/data/.restore.XXXXXX)
 root test -d "$stage" || die '无法创建恢复暂存目录。'
 config_tmp=''
@@ -200,6 +201,9 @@ restore_cleanup() {
 trap restore_cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+# The recovery preflight selected the current snapshot's keys, which may differ
+# from the target backup. Restore its identity selection before extraction.
+if [[ $format == 2 ]]; then backup_identity_args "$(cat "$backup/BACKUP_KEY_ID")" "${3:-}"; fi
 backup_data storage.tar.gz |
     root tar -C "$stage" --no-same-owner --no-same-permissions -xzf -
 root test -d "$stage/storage" || die '备份中缺少 storage 目录。'

@@ -130,8 +130,8 @@ struct PrivacyOptionsView: View {
             Section("资料与消息") {
                 Toggle("允许通过 UserID 搜索我", isOn: preference(\.searchable))
                 Toggle("消息预览", isOn: preference(\.messagePreviews))
-                Toggle("显示在线状态", isOn: preference(\.showOnlineStatus))
-                Toggle("显示最后上线时间", isOn: preference(\.showLastSeen))
+                Toggle("显示本机模拟在线状态", isOn: preference(\.showOnlineStatus))
+                Toggle("显示本机模拟最后在线时间", isOn: preference(\.showLastSeen))
             }
             Section { Text("设置仅保存在本机。当前在线状态仅供本机查看，不能代表好友的实时状态。") }
                 .font(.footnote).foregroundStyle(.secondary)

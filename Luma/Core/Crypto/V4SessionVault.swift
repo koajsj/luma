@@ -192,6 +192,42 @@ struct V4SessionVault {
     let keychain: KeychainManager
     init(keychain: KeychainManager = KeychainManager()) { self.keychain = keychain }
 
+    private struct PeerPin: Codable {
+        let fingerprint: String
+        let keyVersion: Int
+        let signedPreKey: Data
+    }
+
+    /// Remember authenticated directory observations independently of ratchet commits.
+    /// This is a local high-water mark, not a proof of directory completeness or freshness.
+    func observePeerBundle(_ bundle: V4PreKeyBundle, remoteUserID: UUID,
+                           userID: String, local: UUID) throws {
+        try V4HandshakeRecoveryVault.serial {
+            try V4Handshake.verify(bundle, expectedFingerprint: bundle.identityFingerprint)
+            if let session = try loadSession(userID: userID, local: local, remote: bundle.deviceID) {
+                guard session.remoteUserID == remoteUserID,
+                      session.remoteIdentityFingerprint == bundle.identityFingerprint,
+                      bundle.keyVersion >= session.recipientKeyVersion else {
+                    throw V4ProtocolError.untrustedIdentity
+                }
+            }
+            let account = peerPrefix(userID, local, remoteUserID) + bundle.deviceID.uuidString
+            if let bytes = try keychain.read(account) {
+                guard let pin = try? JSONDecoder().decode(PeerPin.self, from: bytes),
+                      pin.keyVersion > 0, pin.fingerprint.count == 64,
+                      pin.signedPreKey.count == 32 else { throw V4VaultError.damaged }
+                guard pin.fingerprint == bundle.identityFingerprint,
+                      bundle.keyVersion >= pin.keyVersion,
+                      bundle.keyVersion != pin.keyVersion || pin.signedPreKey == bundle.signedPreKeyPublicKey else {
+                    throw V4ProtocolError.untrustedIdentity
+                }
+                if bundle.keyVersion == pin.keyVersion { return }
+            }
+            try keychain.save(JSONEncoder().encode(PeerPin(fingerprint: bundle.identityFingerprint,
+                keyVersion: bundle.keyVersion, signedPreKey: bundle.signedPreKeyPublicKey)), account: account)
+        }
+    }
+
     func loadSession(userID: String, local: UUID, remote: UUID) throws -> Session? {
         guard let bytes = try keychain.read(sessionAccount(userID, local, remote)) else { return nil }
         guard let session = try? JSONDecoder().decode(Session.self, from: bytes) else { throw V4VaultError.damaged }
@@ -348,6 +384,7 @@ struct V4SessionVault {
         try keychain.delete(outgoingAccount(userID, deviceID))
         try keychain.delete(incomingAccount(userID, deviceID))
         for peer in peers { try deleteSession(userID: userID, local: deviceID, remote: peer) }
+        try keychain.deleteAccounts(prefix: "v4.peer.\(userID).\(deviceID.uuidString).")
         try V4HandshakeRecoveryVault(keychain: keychain, userID: userID, localDevice: deviceID).purge()
         try deleteDevice(userID: userID, deviceID: deviceID)
     }
@@ -402,17 +439,23 @@ struct V4SessionVault {
                 try recovery.removePeer(remote.deviceID)
             }
         }
+        // Called by explicit identity/friendship cleanup, never by a failed lookup.
+        try keychain.deleteAccounts(prefix: peerPrefix(userID, localDeviceID, remoteUserID))
     }
 
     func purgeAccount(userID: String) throws {
         try keychain.deleteAccounts(prefix: "v4.recovery.\(userID).")
-        for category in ["session", "version", "device", "outgoing", "incoming"] {
+        for category in ["session", "version", "device", "outgoing", "incoming", "peer"] {
             try keychain.deleteAccounts(prefix: "v4.\(category).\(userID).")
         }
     }
 
     private func sessionAccount(_ userID: String, _ local: UUID, _ remote: UUID) -> String {
         "v4.session.\(userID).\(local.uuidString).\(remote.uuidString)"
+    }
+
+    private func peerPrefix(_ userID: String, _ local: UUID, _ remoteUser: UUID) -> String {
+        "v4.peer.\(userID).\(local.uuidString).\(remoteUser.uuidString)."
     }
 
     private func versionAccount(_ userID: String, _ local: UUID, _ remote: UUID) -> String {

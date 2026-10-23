@@ -213,6 +213,8 @@ struct V4PreKeyService {
         }
         return try wire.map {
             var bundle = try $0.verified(expectedAccountFingerprint: expectedAccountFingerprint)
+            guard !claim || bundle.deviceID == registration.backendDeviceID ||
+                  bundle.oneTimePreKeyPublicKey != nil else { throw V4ProtocolError.invalidPreKey }
             bundle.recoveryParticipant = .init(accountID: remoteUserID, deviceID: bundle.deviceID,
                 accountFingerprint: expectedAccountFingerprint,
                 agreementPublicKey: bundle.identityAgreementPublicKey, signingPublicKey: bundle.identitySigningPublicKey)
