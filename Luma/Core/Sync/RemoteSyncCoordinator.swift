@@ -56,7 +56,8 @@ struct RemoteSyncCoordinator {
                 context.rollback()
                 throw error
             }
-            if event.type == "message.created", let messageID = event.routing.messageID,
+            if event.type == "message.created", event.routing.encryptionVersion == 4,
+               let messageID = event.routing.messageID,
                try context.fetch(FetchDescriptor<Message>()).contains(where: { $0.id == messageID && !$0.isMine }) {
                 // A failed receipt leaves the event unacked; replay is safe after local persistence.
                 _ = try await repository.client.request("POST", path: "/messages/delivered",

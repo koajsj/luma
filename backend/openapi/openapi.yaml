@@ -3,9 +3,9 @@ info:
   title: Luma Backend API
   version: 0.1.0
   description: |
-    密文路由与设备同步基础 API。线上消息信封版本尚未冻结，当前 iOS Mock Provider 不能直接接入。
+    密文路由与设备同步基础 API。iOS 在线模式已接入 Remote Provider，生产 E2EE 验收尚未完成。
     除公开认证端点外，每个请求都要带 X-Device-Timestamp（Unix 秒）、X-Device-Nonce（随机 16-128 字符）、X-Device-Signature（Ed25519/Base64url）。
-    签名文本为 luma.request.v1、HTTP 方法、原始 RequestURI、时间戳、nonce、Base64url(SHA-256(token)) 六行，以实际换行分隔。
+    签名文本为 luma.request.v2、HTTP 方法、原始 RequestURI、时间戳、nonce、Base64url(SHA-256(token)) 六行，以实际换行分隔。v1 请求证明不再接受；签名验证绑定已登记设备公钥和令牌，不能作为二进制代码远程证明。
     刷新端点也须用已登记设备认证私钥对 refresh token 做相同请求证明；WebSocket 握手同样需要这三个标头。
 servers:
   - url: https://localhost:8080/v1
@@ -146,30 +146,15 @@ paths:
     post:
       tags: [Device]
       summary: 现有设备和新设备双签名授权新设备
-      description: 签名文本为 luma.device.authorize.v1、nonce、用户 UUID、新协商公钥、新认证公钥、新签名预密钥六行。
+      description: 签名文本为 luma.device.authorize.v1、nonce、用户 UUID、新协商公钥、新认证公钥、新签名预密钥六行。事务中串行账号设备变更并重新检查活动审批设备；这不是完整设备集合的透明目录授权。
       requestBody: {required: true, content: {application/json: {schema: {type: object, required: [challengeID, nonce, deviceName, devicePublicKey, authPublicKey, signedPreKey, signedPreKeySignature, signedPreKeyVersion, newDeviceSignature, approverSignature], properties: {challengeID: {type: string}, nonce: {type: string}, deviceName: {type: string}, devicePublicKey: {type: string}, authPublicKey: {type: string}, signedPreKey: {type: string}, signedPreKeySignature: {type: string}, signedPreKeyVersion: {type: integer}, newDeviceSignature: {type: string}, approverSignature: {type: string}}}}}}
-      responses: {'201': {description: 新设备 ID}}
+      responses: {'201': {description: 新设备 ID}, '401': {description: 挑战无效、已消费或签名错误}, '403': {description: 审批设备已撤销或账号不可用}, '503': {$ref: '#/components/responses/Error'}}
   /devices/{id}:
     delete:
       tags: [Device]
       summary: 撤销其他设备
       parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
-      responses: {'204': {description: 已撤销}}
-  /devices/{id}/prekeys:
-    put:
-      tags: [Device]
-      summary: 上传当前设备签名预密钥和一次性预密钥
-      parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
-      requestBody: {required: true, content: {application/json: {schema: {type: object, required: [signedPreKey, signature, keyVersion], properties: {signedPreKey: {type: string}, signature: {type: string}, keyVersion: {type: integer}, oneTimePreKeys: {type: array, maxItems: 100, items: {type: string}}, recoveryProtocolVersion: {type: integer, enum: [0, 2], description: 新恢复路径能力版本；省略为 legacy}, recoveryCapabilitySignature: {type: string, description: protocolVersion=2 时必需的设备 Ed25519 能力签名}}}}}}
-      responses: {'204': {description: 已保存}}
-  /users/{id}/prekey-bundle:
-    get:
-      tags: [Device]
-      summary: 好友或本人的公钥束；默认原子领取一次性预密钥，claim=false 仅查看
-      parameters:
-        - {name: id, in: path, required: true, schema: {type: string, format: uuid}}
-        - {name: claim, in: query, required: false, schema: {type: boolean, default: true}, description: false 时只检查已签名公钥，不消耗一次性预密钥}
-      responses: {'200': {description: 公钥束}}
+      responses: {'204': {description: 已撤销}, '403': {description: 操作者设备已撤销或账号不可用}}
   /devices/{id}/v4-prekeys:
     put:
       tags: [Device]
@@ -231,25 +216,17 @@ paths:
               properties:
                 messageID: {type: string, format: uuid}
                 conversationID: {type: string, format: uuid}
-                encryptionVersion: {type: integer, minimum: 3, description: v3 为客户端设备信封基础协议，未完成跨设备联调和安全审计}
+                encryptionVersion: {type: integer, const: 4, description: 仅允许当前 v4 在线写入；历史 v1/v2/v3 仍由客户端读取}
                 recipientEnvelopes: {type: array, items: {$ref: '#/components/schemas/Envelope'}}
                 attachmentIDs: {type: array, items: {type: string, format: uuid}}
       responses: {'201': {description: 已存储}, '200': {description: 幂等重放}, '409': {$ref: '#/components/responses/Error'}}
-  /messages/{id}:
-    delete: {tags: [Message], summary: 发送删除墓碑, parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}], responses: {'204': {description: 已删除}}}
-  /messages/edit:
-    post: {tags: [Message], summary: 用新的每设备密文信封编辑, requestBody: {required: true, content: {application/json: {schema: {type: object, required: [messageID, revision, recipientEnvelopes], properties: {messageID: {type: string}, revision: {type: integer}, recipientEnvelopes: {type: array, items: {$ref: '#/components/schemas/Envelope'}}}}}}}, responses: {'200': {description: 新版本}}}
-  /messages/read:
-    post: {tags: [Message], summary: 显式已读回执；遵守接收方隐私开关, requestBody: {required: true, content: {application/json: {schema: {type: object, required: [messageID], properties: {messageID: {type: string}}}}}}, responses: {'204': {description: 已处理}}}
   /messages/delivered:
-    post: {tags: [Message], summary: 显式送达回执, requestBody: {required: true, content: {application/json: {schema: {type: object, required: [messageID], properties: {messageID: {type: string}}}}}}, responses: {'204': {description: 已处理}}}
-  /messages/reaction:
-    post: {tags: [Message], summary: 逐设备密文回应事件, requestBody: {required: true, content: {application/json: {schema: {type: object, required: [messageID, recipientEnvelopes], properties: {messageID: {type: string}, recipientEnvelopes: {type: array, items: {$ref: '#/components/schemas/Envelope'}}}}}}}, responses: {'202': {description: 已接收}}}
+    post: {tags: [Message], summary: v4 传输送达提示；不代表端侧认证的已读, requestBody: {required: true, content: {application/json: {schema: {type: object, required: [messageID], properties: {messageID: {type: string}}}}}}, responses: {'204': {description: 已处理}}}
   /messages/v4/events:
     post:
       tags: [Message]
       summary: 发送 v4 逐设备认证加密控制事件
-      description: 支持编辑、删除、已读和 Reaction。旧控制接口拒绝 v4 消息；服务器只存逐设备密文及路由元数据。
+      description: 支持编辑、删除、已读和有序 Reaction。服务器只存逐设备密文及路由元数据；旧在线控制接口已移除。
       requestBody:
         required: true
         content:

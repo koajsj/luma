@@ -40,12 +40,29 @@ func (k Key) Sum(normalizedUserID string) []byte {
 // Backfill runs before HTTP starts. A changed secret fails closed instead of
 // silently making existing users undiscoverable or accepting mixed indexes.
 func (k Key) Backfill(ctx context.Context, db *pgxpool.Pool) error {
-	tx, err := db.BeginTx(ctx, pgx.TxOptions{})
+	return k.check(ctx, db, false)
+}
+
+// Verify checks secret continuity without row locks or backfill writes. The
+// separate migration process must finish legacy backfill before API startup.
+func (k Key) Verify(ctx context.Context, db *pgxpool.Pool) error {
+	return k.check(ctx, db, true)
+}
+
+func (k Key) check(ctx context.Context, db *pgxpool.Pool, readOnly bool) error {
+	options := pgx.TxOptions{}
+	query := "SELECT id,user_id,user_id_hash FROM users ORDER BY id"
+	if readOnly {
+		options.AccessMode = pgx.ReadOnly
+	} else {
+		query += " FOR UPDATE"
+	}
+	tx, err := db.BeginTx(ctx, options)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
-	rows, err := tx.Query(ctx, "SELECT id,user_id,user_id_hash FROM users ORDER BY id FOR UPDATE")
+	rows, err := tx.Query(ctx, query)
 	if err != nil {
 		return err
 	}
@@ -75,6 +92,9 @@ func (k Key) Backfill(ctx context.Context, db *pgxpool.Pool) error {
 				return errors.New("UserID index key mismatch; restore the original LUMA_USERID_HMAC_SECRET")
 			}
 			continue
+		}
+		if readOnly {
+			return errors.New("UserID index backfill required before API startup")
 		}
 		if _, err = tx.Exec(ctx, "UPDATE users SET user_id_hash=$1 WHERE id=$2", computed, row.id); err != nil {
 			return fmt.Errorf("UserID index backfill failed: %w", err)

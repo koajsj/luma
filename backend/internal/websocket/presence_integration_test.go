@@ -2,11 +2,13 @@ package websocket
 
 import (
 	"context"
+	"net/http/httptest"
 	"os"
 	"testing"
 
 	"github.com/google/uuid"
 	"luma/backend/internal/database"
+	"luma/backend/internal/middleware"
 )
 
 func TestPresenceBroadcastRespectsBlockAndVisibility(t *testing.T) {
@@ -41,6 +43,24 @@ func TestPresenceBroadcastRespectsBlockAndVisibility(t *testing.T) {
 		t.Fatal(err)
 	}
 	hub := New(db, nil)
+	request := httptest.NewRequest("GET", "/v1/ws", nil)
+	request = request.WithContext(middleware.WithIdentity(ctx, middleware.Identity{UserID: recipient, DeviceID: device}))
+	tokenHash := []byte(uuid.NewString())
+	if _, err := db.Exec(ctx, "INSERT INTO access_sessions(device_id,token_hash,family_id,expires_at) VALUES($1,$2,$3,now()+interval '1 minute')", device, tokenHash, uuid.NewString()); err != nil {
+		t.Fatal(err)
+	}
+	if !hub.active(request, tokenHash) {
+		t.Fatal("valid socket credentials rejected")
+	}
+	if _, err := db.Exec(ctx, "UPDATE devices SET revoked_at=now() WHERE id=$1", device); err != nil {
+		t.Fatal(err)
+	}
+	if hub.active(request, tokenHash) {
+		t.Fatal("revoked socket credentials accepted")
+	}
+	if _, err := db.Exec(ctx, "UPDATE devices SET revoked_at=NULL WHERE id=$1", device); err != nil {
+		t.Fatal(err)
+	}
 	frames := make(chan any, 1)
 	hub.clients[device] = map[chan any]struct{}{frames: {}}
 	hub.Presence(sender)

@@ -8,6 +8,25 @@ if [[ $(id -u) == 0 ]]; then SUDO=(); else SUDO=(sudo); fi
 die() { printf 'Luma：%s\n' "$*" >&2; exit 1; }
 root() { "${SUDO[@]}" "$@"; }
 compose() { root docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"; }
+resume_services() {
+    compose up -d --no-deps --wait backend &&
+        compose up -d --no-deps --wait caddy
+}
+start_services() {
+    # Explicit runs are necessary after a restore even if Compose remembers a
+    # previous successful one-shot container. Never start the API before grants.
+    compose up -d --wait postgres redis &&
+        compose run --rm --no-deps migrate &&
+        compose run --rm --no-deps db-grants && resume_services
+}
+require_split_database_version() {
+    local version=$1 definition
+    definition=$(git -C "$APP_DIR" show "$version:deploy/docker-compose.yml") || return 1
+    [[ $definition == *'LUMA_AUTO_MIGRATE: "false"'* && $definition == *'postgres://luma_api:'* ]] || {
+        printf '目标版本不支持独立运行角色；拒绝恢复为管理员 API。请先在隔离环境准备兼容代码。\n' >&2
+        return 1
+    }
+}
 env_value() { sed -n "s/^$1=//p" "$ENV_FILE" | head -1; }
 require_install() {
     [[ -f "$ENV_FILE" && -d "$APP_DIR/.git" && -f "$COMPOSE_FILE" ]] || die '未找到完整安装；请先运行 install.sh。'

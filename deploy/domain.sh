@@ -21,7 +21,7 @@ domain_cleanup() {
     set +e
     if (( swapped && ! committed )); then
         if cp "$old" "$ENV_FILE" && chmod 600 "$ENV_FILE" &&
-           compose config --quiet && compose up -d --wait && health >/dev/null; then
+           compose config --quiet && resume_services && health >/dev/null; then
             printf '新域名未生效；旧配置与服务已恢复并通过健康检查。\n' >&2
         else
             compose stop backend caddy || true
@@ -43,7 +43,7 @@ printf 'LUMA_MODE=domain\nLUMA_DOMAIN=%s\nLUMA_SITE=%s\n' "$domain" "$domain" >>
 chmod 600 "$tmp"
 swapped=1
 mv "$tmp" "$ENV_FILE"
-if compose config --quiet && compose up -d --wait && health >/dev/null; then
+if compose config --quiet && resume_services && health >/dev/null; then
     committed=1
     printf '域名已更换：https://%s\n' "$domain"
 else

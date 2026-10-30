@@ -91,8 +91,9 @@ struct BackupManager {
         }
         let hasOutgoing = try context.fetch(FetchDescriptor<OutgoingMessageQueueItem>()).contains { $0.ownerID == user.id }
         let hasV4Events = try context.fetch(FetchDescriptor<V4PendingEvent>()).contains { $0.ownerID == user.id }
+        let hasV4History = try hasRetainedV4History(ownerID: user.id)
         guard !messages.contains(where: { [3, 4].contains($0.transportEncryptionVersion ?? 0) }),
-              !hasSyncProgress, !hasOutgoing, !hasV4Events else {
+              !hasSyncProgress, !hasOutgoing, !hasV4Events, !hasV4History else {
             throw BackupError.onlineHistoryCannotExport
         }
         let messageIDs = Set(messages.map(\.id))
@@ -173,8 +174,9 @@ struct BackupManager {
         }
         let hasOutgoing = try context.fetch(FetchDescriptor<OutgoingMessageQueueItem>()).contains { $0.ownerID == user.id }
         let hasV4Events = try context.fetch(FetchDescriptor<V4PendingEvent>()).contains { $0.ownerID == user.id }
+        let hasV4History = try hasRetainedV4History(ownerID: user.id)
         guard !archive.messages.contains(where: { [3, 4].contains($0.transportEncryptionVersion ?? 0) }),
-              !hasOnlineMessages, !hasSyncProgress, !hasOutgoing, !hasV4Events else {
+              !hasOnlineMessages, !hasSyncProgress, !hasOutgoing, !hasV4Events, !hasV4History else {
             throw BackupError.onlineHistoryCannotRestore
         }
 
@@ -285,6 +287,11 @@ struct BackupManager {
         do { try Self.finishRestoreCleanup(marker, user: user, context: context, encryption: encryption,
                                            keychain: sessions?.keychain ?? KeychainManager()) }
         catch { marker.state = RecoveryState.failed.rawValue; try? context.save(); throw error }
+    }
+
+    private func hasRetainedV4History(ownerID: UUID) throws -> Bool {
+        try context.fetch(FetchDescriptor<MessageTombstone>()).contains { $0.ownerID == ownerID } ||
+            context.fetch(FetchDescriptor<V4SessionMetadata>()).contains { $0.ownerID == ownerID }
     }
 
     static func resumeRestoreCleanup(for user: User, context: ModelContext, encryption: EncryptionService,

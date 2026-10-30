@@ -15,6 +15,7 @@ enum RemoteError: LocalizedError {
         case .invalidResponse: "服务器响应格式无效"
         case .authenticationExpired: "设备会话已失效，请重新登录在线账号"
         case .deviceRevoked: "此设备已从服务器撤销，在线会话已清除"
+        case .server(426, _): "当前版本无法继续在线同步，请更新 Luma 后重试"
         case .server(409, "v4_prekeys_exhausted"): "对方设备的一次性安全密钥已用完，请对方打开 Luma 后重试"
         case let .server(code, reason): "服务器请求失败（\(code)：\(reason)）"
         case .onlineMessagesUnavailable: "线上消息协议尚未完成，不能发送本机密文"
@@ -314,7 +315,7 @@ final class RemoteAPIClient {
         let digest = Data(SHA256.hash(data: Data(token.utf8))).base64URLEncodedString()
         guard let url = request.url, let method = request.httpMethod else { throw RemoteError.invalidURL }
         let requestURI = (url.path.isEmpty ? "/" : url.path) + (url.query.map { "?" + $0 } ?? "")
-        let canonical = "luma.request.v1\n\(method)\n\(requestURI)\n\(timestamp)\n\(nonce)\n\(digest)"
+        let canonical = "luma.request.v2\n\(method)\n\(requestURI)\n\(timestamp)\n\(nonce)\n\(digest)"
         request.setValue(timestamp, forHTTPHeaderField: "X-Device-Timestamp")
         request.setValue(nonce, forHTTPHeaderField: "X-Device-Nonce")
         request.setValue(try signer.sign(canonical, userID: userID), forHTTPHeaderField: "X-Device-Signature")

@@ -2,7 +2,7 @@ import Foundation
 import SwiftData
 
 enum MessageStoreError: LocalizedError {
-    case locked, missingCiphertext, editNotAllowed, unsupportedEncryptionVersion
+    case locked, missingCiphertext, editNotAllowed, unsupportedEncryptionVersion, historyEvidenceMissing
 
     var errorDescription: String? {
         switch self {
@@ -10,6 +10,7 @@ enum MessageStoreError: LocalizedError {
         case .missingCiphertext: "消息数据不完整，无法显示"
         case .editNotAllowed: "只能编辑自己发送的文字消息"
         case .unsupportedEncryptionVersion: "此消息使用当前版本不支持的加密格式"
+        case .historyEvidenceMissing: "缺少可验证的历史消息记录，已暂停同步并保留恢复数据。请勿清除本地数据。"
         }
     }
 }
@@ -28,6 +29,130 @@ struct MessageStore {
     }
 
     private var encryptor: MessageEncryptor { MessageEncryptor(local: encryption, sessions: sessions) }
+
+    private struct TombstoneRecord: Codable {
+        let version: Int
+        let evidenceSource: String
+        let messageID: UUID
+        let conversationID: UUID
+        let remoteConversationID: UUID
+        let friendID: UUID
+        let friendFingerprint: String
+        let senderID: String
+        let isMine: Bool
+        let type: MessageType
+        let timestamp: Date
+        let deviceID: UUID?
+        let lastEventID: UUID?
+        let revision: Int
+        let deletedForEveryone: Bool
+        let deletedAt: Date?
+        let encryptedReactionState: Data?
+    }
+
+    private static func tombstoneBinding(_ item: MessageTombstone) -> Data {
+        Data("luma-message-tombstone-v1|\(item.ownerID.uuidString)|\(item.messageID.uuidString)".utf8)
+    }
+
+    private func tombstoneRecord(_ item: MessageTombstone) throws -> TombstoneRecord {
+        let data = try encryption.decrypt(EncryptedData(bytes: item.encryptedRecord),
+            authenticatedData: Self.tombstoneBinding(item))
+        let record = try JSONDecoder().decode(TombstoneRecord.self, from: data)
+        guard record.version == 1, record.evidenceSource == "retained-local-message",
+              record.messageID == item.messageID, record.revision >= 1 else {
+            throw MessageStoreError.historyEvidenceMissing
+        }
+        return record
+    }
+
+    /// Called within the same local save as deletion/revision updates. It attests
+    /// only to this device's retained record, never to an inferred remote delete.
+    func retainV4Tombstone(for message: Message, eraseContent: Bool = true) throws {
+        guard message.transportEncryptionVersion == 4, message.deleted else { return }
+        guard let conversation = try context.fetch(FetchDescriptor<Conversation>()).first(where: {
+            $0.id == message.conversationID
+        }) else { throw MessageStoreError.historyEvidenceMissing }
+        // An unsent local row has no authenticated remote route to preserve yet.
+        // Removing it must not invent a remote deletion fact or block offline use.
+        if conversation.remoteID == nil, message.isMine,
+           [.sending, .failed].contains(message.deliveryStatus) { return }
+        guard let remoteID = conversation.remoteID,
+              let owner = try context.fetch(FetchDescriptor<User>()).first(where: { $0.id == conversation.ownerID }),
+              let friend = try context.fetch(FetchDescriptor<Friend>()).first(where: {
+                  $0.id == conversation.friendID && $0.ownerID == owner.id
+              }), let fingerprint = friend.identityFingerprint,
+              let sender = message.senderID, sender == (message.isMine ? owner.userID : friend.userID),
+              let revision = message.remoteRevision, revision >= 1,
+              message.encryptionVersion == 1 else { throw MessageStoreError.historyEvidenceMissing }
+        _ = try displayContent(for: message) // Validate existing local ciphertext before migration.
+        let existing = try context.fetch(FetchDescriptor<MessageTombstone>()).first { $0.messageID == message.id }
+        if let existing {
+            let prior = try tombstoneRecord(existing)
+            guard existing.ownerID == owner.id, prior.conversationID == conversation.id,
+                  prior.remoteConversationID == remoteID, prior.friendID == friend.id,
+                  prior.friendFingerprint == fingerprint, prior.senderID == sender,
+                  prior.isMine == message.isMine, revision >= prior.revision else {
+                throw MessageStoreError.historyEvidenceMissing
+            }
+        }
+        let record = TombstoneRecord(version: 1, evidenceSource: "retained-local-message",
+            messageID: message.id, conversationID: conversation.id,
+            remoteConversationID: remoteID, friendID: friend.id, friendFingerprint: fingerprint,
+            senderID: sender, isMine: message.isMine, type: message.type, timestamp: message.timestamp,
+            deviceID: message.deviceID, lastEventID: message.lastEventID, revision: revision,
+            deletedForEveryone: message.deletedForEveryone, deletedAt: message.deletedAt,
+            encryptedReactionState: message.encryptedReactionState)
+        let item = existing ?? MessageTombstone(messageID: message.id, ownerID: owner.id, encryptedRecord: Data())
+        item.encryptedRecord = try encryption.encrypt(JSONEncoder().encode(record),
+            authenticatedData: Self.tombstoneBinding(item)).bytes
+        if existing == nil { context.insert(item) }
+        // Unlock migration is a database-only evidence copy. Preserve old protected
+        // content/files if any later row fails; do not fake a cross-store transaction.
+        guard eraseContent else { return }
+        message.ciphertext = try encryption.encrypt(Data(), authenticatedData: Self.binding(for: message)).bytes
+        message.content = ""; message.isFavorite = false; message.replyToID = nil
+        message.forwardedFrom = nil; message.expiresAt = nil
+        let attachments = try context.fetch(FetchDescriptor<Attachment>()).filter { $0.messageID == message.id }
+        let sourceIDs = Set(attachments.map(\.id)).union([message.id])
+        for attachment in attachments {
+            try FileTransferService(ownerID: owner.id, encryption: encryption).delete(attachmentID: attachment.id)
+            context.delete(attachment)
+        }
+        for reaction in try context.fetch(FetchDescriptor<Reaction>()).filter({ $0.messageID == message.id }) {
+            context.delete(reaction)
+        }
+        for entry in try context.fetch(FetchDescriptor<SearchIndexEntry>()).filter({
+            $0.ownerID == owner.id && sourceIDs.contains($0.sourceID)
+        }) { context.delete(entry) }
+    }
+
+    /// Reconstructs only an empty hidden row from authenticated local evidence.
+    /// Missing evidence is not evidence of deletion and must never be fabricated.
+    func restoreV4Tombstone(messageID: UUID, remoteConversationID: UUID, owner: User) throws -> Message? {
+        guard let item = try context.fetch(FetchDescriptor<MessageTombstone>()).first(where: {
+            $0.messageID == messageID && $0.ownerID == owner.id
+        }) else { return nil }
+        let record = try tombstoneRecord(item)
+        guard record.remoteConversationID == remoteConversationID,
+              let conversation = try context.fetch(FetchDescriptor<Conversation>()).first(where: {
+                  $0.id == record.conversationID && $0.ownerID == owner.id && $0.remoteID == remoteConversationID
+              }), let friend = try context.fetch(FetchDescriptor<Friend>()).first(where: {
+                  $0.id == record.friendID && $0.id == conversation.friendID && $0.ownerID == owner.id &&
+                  $0.identityFingerprint == record.friendFingerprint && $0.sessionStatus != "identityKeyChanged"
+              }), record.senderID == (record.isMine ? owner.userID : friend.userID) else {
+            throw MessageStoreError.historyEvidenceMissing
+        }
+        let message = Message(conversationID: conversation.id, type: record.type, isMine: record.isMine,
+            senderID: record.senderID, timestamp: record.timestamp)
+        message.id = messageID; message.transportEncryptionVersion = 4
+        message.deleted = true; message.deletedForEveryone = record.deletedForEveryone
+        message.deletedAt = record.deletedAt; message.remoteRevision = record.revision
+        message.encryptedReactionState = record.encryptedReactionState
+        message.deviceID = record.deviceID; message.lastEventID = record.lastEventID
+        message.ciphertext = try encryption.encrypt(Data(), authenticatedData: Self.binding(for: message)).bytes
+        context.insert(message)
+        return message
+    }
 
     @discardableResult
     func send(conversationID: UUID, senderID: String, type: MessageType, content: String, replyToID: UUID? = nil,
@@ -91,6 +216,9 @@ struct MessageStore {
                                in conversation: Conversation, at date: Date, senderDeviceID: UUID,
                                eventID: UUID, isMine: Bool, transportVersion: Int = 3,
                                attachmentDescriptor: V4AttachmentDescriptor? = nil) throws {
+        guard try !context.fetch(FetchDescriptor<MessageTombstone>()).contains(where: { $0.messageID == messageID }) else {
+            throw MessageStoreError.historyEvidenceMissing
+        }
         if try context.fetch(FetchDescriptor<Message>()).contains(where: { $0.id == messageID }) { return }
         let message = Message(conversationID: conversation.id, type: attachmentDescriptor?.type ?? .text, isMine: isMine,
                               senderID: senderID, timestamp: date)
@@ -128,10 +256,15 @@ struct MessageStore {
               [3, 4].contains(message.transportEncryptionVersion ?? 0) else { throw MessageRepositoryError.invalidEvent }
         if (message.remoteRevision ?? 1) >= revision { return }
         guard revision == (message.remoteRevision ?? 1) + 1 else { throw MessageRepositoryError.invalidEvent }
-        message.ciphertext = try encryption.encrypt(plaintext, authenticatedData: Self.binding(for: message)).bytes
+        // An authenticated late edit advances only the routing revision of a local
+        // tombstone. Never restore content the user already removed or expired.
+        if !message.deleted {
+            message.ciphertext = try encryption.encrypt(plaintext, authenticatedData: Self.binding(for: message)).bytes
+        }
         message.editedAt = date
         message.remoteRevision = revision
         message.lastEventID = eventID
+        try retainV4Tombstone(for: message)
         try context.save()
     }
 
@@ -208,10 +341,24 @@ struct MessageStore {
         for item in try context.fetch(FetchDescriptor<Attachment>()).filter({ ids.contains($0.messageID) }) {
             try FileTransferService(ownerID: conversation.ownerID, encryption: encryption)
                 .delete(attachmentID: item.id)
+            for entry in try context.fetch(FetchDescriptor<SearchIndexEntry>()).filter({
+                $0.ownerID == conversation.ownerID && $0.sourceID == item.id
+            }) { context.delete(entry) }
             context.delete(item)
         }
         for item in try context.fetch(FetchDescriptor<Reaction>()).filter({ ids.contains($0.messageID) }) { context.delete(item) }
-        for message in expired { context.delete(message) }
+        for message in expired {
+            if message.transportEncryptionVersion == 4 {
+                // Keep only the author/routing/revision needed to authenticate late
+                // controls and advance the existing receiving chain, not the content.
+                message.deleted = true
+                message.deletedAt = date
+                message.expiresAt = nil
+                message.isFavorite = false
+                message.replyToID = nil
+                try retainV4Tombstone(for: message)
+            } else { context.delete(message) }
+        }
         if !expired.isEmpty { try context.save() }
     }
 
@@ -244,6 +391,7 @@ struct MessageStore {
             }
             if message.encryptionVersion == nil { message.encryptionVersion = 1 }
             if message.status == nil || message.status == "local" { message.deliveryStatus = .sent }
+            try retainV4Tombstone(for: message, eraseContent: false)
         }
         try context.save()
     }

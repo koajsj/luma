@@ -58,7 +58,7 @@ backup_cleanup() {
     trap - EXIT INT TERM
     set +e
     if (( services_stopped )); then
-        if compose up -d --wait >/dev/null && health >/dev/null; then
+        if resume_services >/dev/null && health >/dev/null; then
             printf '备份退出前已恢复服务。\n' >&2
         else
             printf '备份退出时服务恢复或健康检查失败，请立即检查 luma status。\n' >&2
@@ -90,7 +90,7 @@ if (( verify_new_backup )); then
 fi
 chmod 600 "$target"/*
 mv "$target" "$complete"
-compose up -d --wait >/dev/null
+resume_services >/dev/null
 health >/dev/null || die '备份后服务健康检查失败。'
 services_stopped=0
 printf '备份完成：%s\n' "$complete"

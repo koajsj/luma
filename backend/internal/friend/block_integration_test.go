@@ -66,7 +66,6 @@ func TestBlockOverridesPendingRequestAndDirectoryAccess(t *testing.T) {
 		path, param string
 		want        int
 	}{
-		{"legacy bundle", (device.Service{DB: db}).Bundle, "/v1/users/" + b + "/prekey-bundle", "id", 403},
 		{"v4 bundle", (device.Service{DB: db}).V4Bundle, "/v1/users/" + b + "/v4-prekey-bundle", "id", 403},
 		{"presence", (presence.Service{DB: db}).Get, "/v1/presence/" + "block_" + b[:8], "userID", 404},
 	} {

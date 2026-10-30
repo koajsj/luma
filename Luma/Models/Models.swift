@@ -165,6 +165,8 @@ final class Message {
     /// At-rest encryption remains v1 for messages delivered over the v3 wire protocol.
     var transportEncryptionVersion: Int?
     var remoteRevision: Int?
+    /// Master-Key encrypted causal stamps and operation digests, including removals.
+    var encryptedReactionState: Data?
     var isFavorite: Bool?
     var forwardedFrom: String?
 
@@ -185,12 +187,26 @@ final class Message {
         self.encryptionVersion = 1
         self.sessionKeyVersion = nil
         self.messageKeyIndex = nil
+        self.encryptedReactionState = nil
         self.transportEncryptionVersion = nil; self.remoteRevision = nil
         self.isFavorite = false; self.forwardedFrom = nil
     }
 }
 
 enum OnlineStatus: String, Codable { case unknown, online, offline }
+
+/// Survives removal of a Message row. Only local Master-Key-authenticated routing
+/// evidence is stored here; this is not a server-verifiable deletion certificate.
+@Model
+final class MessageTombstone {
+    @Attribute(.unique) var messageID: UUID
+    var ownerID: UUID
+    var encryptedRecord: Data
+
+    init(messageID: UUID, ownerID: UUID, encryptedRecord: Data) {
+        self.messageID = messageID; self.ownerID = ownerID; self.encryptedRecord = encryptedRecord
+    }
+}
 
 @Model
 final class UserPresence {

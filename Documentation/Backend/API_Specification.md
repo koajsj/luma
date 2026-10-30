@@ -1,62 +1,17 @@
-# 未来 HTTPS API 规格
+# 后端 API 使用边界
 
-**状态：设计基线与现有端点并存。** 实际路径、请求字段和返回状态以 [OpenAPI](../../backend/openapi/openapi.yaml) 为准；下表含尚未实施的早期设计路径，不能直接作为客户端调用清单。iOS v4 文字与控制事件已通过本机隔离 HTTPS 后端和两个模拟器联调，双实体设备、附件完整链路与生产部署未验证。统一前缀 `/v1`，JSON 请求/响应，UTC RFC 3339 时间，UUID 标识；二进制密文用 Base64url。认证端点之外使用 `Authorization: Bearer` 和设备绑定证明；消息发送需 `Idempotency-Key`。错误体不得回显凭据或消息内容。
+实际路径、请求字段与返回状态以 [OpenAPI](../../backend/openapi/openapi.yaml) 为唯一接口清单。本文件只记录安全约束；历史早期 API 草案已移除，避免被当作当前服务调用。
 
-## 认证、用户与设备
+## 认证与设备
 
-| 方法与路径 | 用途 / 关键约束 |
-| --- | --- |
-| `POST /v1/auth/register/challenge` | 对规范化 UserID 与设备发短期随机挑战；限流。 |
-| `POST /v1/auth/register` | 上传 UserID、资料、身份公钥、设备认证公钥与设备签名证明；服务器不收密码。 |
-| `POST /v1/auth/challenge` | 已登记设备领取登录挑战。 |
-| `POST /v1/auth/token` | 验证设备签名后签发短期 access token 与可轮换 refresh token。 |
-| `POST /v1/auth/refresh` / `POST /v1/auth/revoke` | 刷新令牌轮换 / 撤销设备会话。 |
-| `GET /v1/users/me` / `PATCH /v1/users/me` | 当前资料与 `searchable` 开关；资料公开范围另按隐私策略控制。 |
-| `GET /v1/users/search?userID=...` | 仅精确搜索；不可搜索用户返回统一的不可发现结果，不给枚举信号。 |
-| `GET /v1/devices` / `POST /v1/devices/authorize` / `DELETE /v1/devices/{id}` | 设备列表、由现有可信设备授权新设备、撤销。无可信设备时恢复方案须另行设计。 |
-| `PUT /v1/devices/{id}/prekeys` / `GET /v1/users/{id}/prekey-bundle` | 上传签名公钥束、原子取用一次性预密钥；要验证签名与身份绑定。 |
+注册/登录使用设备签名与短期挑战，不上传本地密码或 PIN。受保护 HTTP 请求及 WebSocket 握手需 Bearer token 和已登记设备的 `luma.request.v2` 签名，绑定方法、原始 URI、时间戳、nonce 及 token 哈希；refresh 也需同域签名。旧 v1 请求证明不再接受。设备登记、授权、撤销和 v4 PreKey 公钥束接口见 OpenAPI。`claim=false` 只读公钥；正常领取一次性预密钥需事务处理。
 
-设备认证使用独立 Ed25519 签名键，不能把 P-256 `DeviceKeyManager` 的协商键直接当签名键。本地密码、PIN、Face ID 仅用于本机解锁。访问令牌当前为 15 分钟、刷新令牌为 30 天；刷新令牌只存哈希、每次使用轮换，并支持整设备撤销。
+## 消息与同步
 
-## 好友、会话与消息
+新消息只接受 `encryptionVersion=4`，`POST /v1/messages` 必须包含稳定 `messageID`、`Idempotency-Key` 和各活动目标设备的密文信封。编辑、删除、已读和有序 Reaction 只通过 `POST /v1/messages/v4/events` 发送逐设备密文；送达提示使用 `/v1/messages/delivered`，不表示端侧已读。握手冲突控制信封入口 `/v1/sessions/controls` 存储不透明密文；客户端 Recovery 默认关闭。WebSocket 只提示，持久真相是 `/v1/sync/events` 与连续游标 ack。
 
-| 方法与路径 | 用途 / 关键约束 |
-| --- | --- |
-| `POST /v1/friend/request` / `POST /v1/friend/accept` / `DELETE /v1/friend` | 发请求、接受、删除；双方权限校验、拉黑/限流/防骚扰。 |
-| `GET /v1/conversations` / `POST /v1/conversations` | 仅一对一会话及成员关系；服务器不读聊天正文。 |
-| `POST /v1/messages` | `messageID`、`conversationID`、`encryptionVersion`、各目标设备密文信封、附件引用；事务写入事件。 |
-| `GET /v1/messages/sync?cursor=...&limit=...` | 当前设备的增量事件；与 `/v1/sync/events` 同一持久源，最终实现可保留兼容别名。 |
-| `DELETE /v1/messages/{id}` | 授权范围内发删除墓碑；仅表示服务器与可达设备的删除意图，不能保证所有副本物理擦除。 |
-| `POST /v1/messages/read` | 提交被允许的已读事件；不得从客户端本机打开自动推断远端已读。 |
-| `POST /v1/messages/edit` | 提交新密文版本和编辑事件；不得上传明文差异。 |
-| `POST /v1/messages/reaction` | 提交回应事件；若回应内容属于隐私数据，应使用密文负载。 |
+服务端验证身份、设备、好友/block、会话与目标设备权限；无法解密消息正文或证明密文内的业务顺序。已存历史 v3 密文可继续在新客户端受限读取；旧 v3 在线写入和公钥补充/查询接口已移除。请求原样重试仅在同一已认证发送设备、同一消息 ID 与内容哈希匹配时返回已有结果；新写入仍须重新通过当前路由授权。旧后端回滚可能重新开放不安全接口，须单独评估。
 
-`POST /v1/messages` 示例的规范字段见[消息格式](../Protocol/Message_Format.md)。服务器必须验证发送者属于会话、目标设备属于成员、`messageID` 幂等、密文大小与版本限制。服务器不能解密以验证文本或文件内容。
+## 文件与可见性
 
-发送请求草案：
-
-```json
-{
-  "messageID": "78fda1d8-e1a5-4b83-9b8a-d28e8a72c801",
-  "conversationID": "42385010-7211-43a9-a147-4b36a218ea37",
-  "encryptionVersion": 3,
-  "recipientEnvelopes": [
-    { "recipientDeviceID": "cc14a4f0-5bba-4e43-b1d6-afcb33c38970", "ciphertext": "base64url-aead-envelope" }
-  ]
-}
-```
-
-v3 是需继续读取的历史设备信封格式，不能据此宣称完整前向保密。显式在线新消息和编辑、删除、已读、Reaction 使用 v4 逐设备认证密文；服务端验证路由、权限和外层版本，但不能解密事件正文。删除操作形成可同步的墓碑，无法保证已下载副本被擦除。实际 v4 事件路径与字段以 OpenAPI 为准。
-
-## 文件、同步、在线与推送
-
-| 方法与路径 | 用途 / 关键约束 |
-| --- | --- |
-| `POST /v1/files/upload/init` | 申请短时密文对象上传票据，声明大小/哈希；只接受密文。 |
-| `POST /v1/files/upload/complete` | 校验对象存在、大小及密文哈希，建立附件引用。 |
-| `GET /v1/files/{id}/download` / `DELETE /v1/files/{id}` | 授权下载票据 / 删除引用及按策略回收密文对象。 |
-| `GET /v1/sync/events?cursor=...&limit=...` / `POST /v1/sync/ack` | 每设备游标拉取与最高连续持久化序号确认。 |
-| `PUT /v1/presence/heartbeat` / `GET /v1/presence/{userID}` | TTL 心跳与获授权的在线状态；遵守隐私开关。 |
-| `PUT /v1/devices/{id}/push-token` | 关联 APNs token；撤销设备时删除。 |
-
-常见状态：`400` 格式错误、`401` 未认证、`403` 权限拒绝、`404` 不可发现/不存在、`409` 版本或幂等冲突、`429` 限流、`503` 暂不可用。避免返回不同细节泄露 UserID 存在性。文件对象使用短时限、限定对象键与大小的签名 URL；未来大文件可用分片上传。更多事件与重试规则见[同步协议](../Protocol/Sync_Protocol.md)。
+上传前在客户端加密附件，服务端只校验密文字节大小、哈希及权限。上传、完成、下载和删除的精确路径见 OpenAPI。服务端仍可见 UserID、好友/设备关系、会话路由、时间、大小、IP 和密文对象标识。当前未完成真实双设备、隔离服务故障注入和独立密码学审计，不启用生产 E2EE 标识。

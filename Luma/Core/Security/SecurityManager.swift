@@ -386,6 +386,9 @@ final class SecurityManager {
         for item in v4Devices { context.delete(item) }
         for item in outgoing { context.delete(item) }
         for item in v4Events { context.delete(item) }
+        for item in try context.fetch(FetchDescriptor<MessageTombstone>()).filter({ $0.ownerID == user.id }) {
+            context.delete(item)
+        }
         for item in cleanupMarkers { context.delete(item) }
         for item in messages { context.delete(item) }
         for item in conversations { context.delete(item) }

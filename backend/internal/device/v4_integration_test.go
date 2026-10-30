@@ -206,6 +206,19 @@ func TestV4PublicDirectoryAndRevokedHistory(t *testing.T) {
 	if w.Code != 204 {
 		t.Fatalf("revoke: %d", w.Code)
 	}
+	// Simulate authentication completed before the revocation transaction.
+	late := httptest.NewRequest(http.MethodPut, "/v1/devices/"+deviceB+"/v4-prekeys", bytes.NewReader(refillBody))
+	late.SetPathValue("id", deviceB)
+	late = late.WithContext(middleware.WithIdentity(late.Context(), middleware.Identity{UserID: userID, DeviceID: deviceB}))
+	lateWriter := httptest.NewRecorder()
+	(device.Service{DB: db}).PutV4Prekeys(lateWriter, late)
+	if lateWriter.Code != 403 {
+		t.Fatalf("revoked device republished prekeys: %d", lateWriter.Code)
+	}
+	var remaining int
+	if err = db.QueryRow(context.Background(), "SELECT count(*) FROM v4_one_time_prekeys WHERE device_id=$1", deviceB).Scan(&remaining); err != nil || remaining != 0 {
+		t.Fatalf("revocation resurrected OTP inventory: %d %v", remaining, err)
+	}
 	rows, code = lookup("/v1/users/" + userID + "/v4-prekey-bundle?claim=false")
 	if code != 200 || len(rows) != 1 {
 		t.Fatalf("active bundle: %d, %d", code, len(rows))

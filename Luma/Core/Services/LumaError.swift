@@ -42,6 +42,7 @@ enum LumaError: LocalizedError {
             }
         }
         if let error = error as? RemoteError {
+            if case .server(426, _) = error { return error.localizedDescription }
             if case .server = error { return LumaError.network.localizedDescription }
             if case .invalidResponse = error { return LumaError.network.localizedDescription }
             if case .onlineMessagesUnavailable = error { return "暂时无法发送在线消息，请稍后重试。" }

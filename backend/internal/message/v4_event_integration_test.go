@@ -18,6 +18,26 @@ import (
 	"luma/backend/internal/middleware"
 )
 
+// Reject obsolete wire versions before any database write.
+func TestSendRejectsObsoleteAndUnknownWireVersions(t *testing.T) {
+	for _, version := range []int{3, 5} {
+		body, _ := json.Marshal(map[string]any{
+			"messageID": uuid.NewString(), "conversationID": uuid.NewString(),
+			"encryptionVersion": version,
+			"recipientEnvelopes": []map[string]any{{"recipientDeviceID": uuid.NewString(),
+				"ciphertext": base64.RawURLEncoding.EncodeToString(make([]byte, 28)),
+				"keyVersion": 1, "messageKeyIndex": 0}},
+		})
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+		req.Header.Set("Idempotency-Key", uuid.NewString())
+		(message.Service{}).Send(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("wire version %d accepted: %d", version, w.Code)
+		}
+	}
+}
+
 // Exercises the real PostgreSQL transaction and two independently addressed
 // devices. Cryptographic opening is covered by the iOS ratchet test.
 func TestV4ControlEventsAreOpaqueIdempotentAndAuthorized(t *testing.T) {
@@ -144,39 +164,39 @@ func TestV4ControlEventsAreOpaqueIdempotentAndAuthorized(t *testing.T) {
 	if err = db.QueryRow(ctx, "SELECT message_id FROM attachments WHERE id=$1", newAttachmentID).Scan(&linked); err != nil || linked != newID {
 		t.Fatalf("v4 attachment not linked to message: %s %v", linked, err)
 	}
-	legacyID := uuid.NewString()
-	if _, err = db.Exec(ctx, "INSERT INTO messages(id,conversation_id,sender_user_id,sender_device_id,encryption_version,request_hash,idempotency_key) VALUES($1,$2,$3,$4,3,$5,$6)", legacyID, cid, a, ad, []byte{1}, uuid.NewString()); err != nil {
-		t.Fatal(err)
-	}
-	reactionBody, _ := json.Marshal(map[string]any{"messageID": legacyID, "recipientEnvelopes": []map[string]any{{
-		"recipientDeviceID": bd, "ciphertext": base64.RawURLEncoding.EncodeToString(opaque),
-		"keyVersion": 1, "messageKeyIndex": 3,
-	}}})
-	notifier := &countingNotifier{}
+	receiptBody, _ := json.Marshal(map[string]string{"messageID": newID})
 	for attempt := 0; attempt < 2; attempt++ {
-		req := httptest.NewRequest(http.MethodPost, "/v1/messages/reaction", bytes.NewReader(reactionBody))
-		req = req.WithContext(middleware.WithIdentity(req.Context(), middleware.Identity{UserID: a, DeviceID: ad}))
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages/delivered", bytes.NewReader(receiptBody))
+		req = req.WithContext(middleware.WithIdentity(req.Context(), middleware.Identity{UserID: b, DeviceID: bd}))
 		w := httptest.NewRecorder()
-		(message.Service{DB: db, Notify: notifier}).Reaction(w, req)
-		if w.Code != 202 {
-			t.Fatalf("legacy reaction retry %d: %d %s", attempt, w.Code, w.Body.String())
+		(message.Service{DB: db, Notify: noOpNotifier{}}).Delivered(w, req)
+		if w.Code != http.StatusNoContent {
+			t.Fatalf("v4 delivery attempt %d: %d %s", attempt, w.Code, w.Body.String())
 		}
 	}
-	if err = db.QueryRow(ctx, "SELECT count(*) FROM sync_events WHERE target_device_id=$1 AND type='reaction.added' AND routing->>'messageID'=$2", bd, legacyID).Scan(&count); err != nil || count != 1 {
-		t.Fatalf("duplicate legacy reaction events: %d %v", count, err)
+	if err = db.QueryRow(ctx, "SELECT count(*) FROM sync_events WHERE target_device_id=$1 AND type='message.delivered' AND routing->>'messageID'=$2", ad, newID).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("delivery retry added duplicate event: %d %v", count, err)
 	}
-	if notifier.calls != 1 {
-		t.Fatalf("duplicate reaction notification: %d", notifier.calls)
+	if _, err = db.Exec(ctx, "DELETE FROM friendships WHERE user_a=LEAST($1::uuid,$2::uuid) AND user_b=GREATEST($1::uuid,$2::uuid)", a, b); err != nil {
+		t.Fatal(err)
+	}
+	retry := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(sendBody))
+	retry.Header.Set("Idempotency-Key", newID)
+	retry = retry.WithContext(middleware.WithIdentity(retry.Context(), middleware.Identity{UserID: a, DeviceID: ad}))
+	w := httptest.NewRecorder()
+	(message.Service{DB: db, Notify: noOpNotifier{}}).Send(w, retry)
+	if w.Code != http.StatusOK {
+		t.Fatalf("stored request not acknowledged after friendship change: %d %s", w.Code, w.Body.String())
+	}
+	var stored int
+	if err = db.QueryRow(ctx, "SELECT count(*) FROM messages WHERE id=$1", newID).Scan(&stored); err != nil || stored != 1 {
+		t.Fatalf("retry changed stored message count: %d %v", stored, err)
 	}
 }
 
 type noOpNotifier struct{}
 
 func (noOpNotifier) Notify(string, int64) {}
-
-type countingNotifier struct{ calls int }
-
-func (n *countingNotifier) Notify(string, int64) { n.calls++ }
 
 func seedDirectConversation(t *testing.T, db *pgxpool.Pool) (a, b, ad, bd, cid string) {
 	t.Helper()

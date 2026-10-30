@@ -37,6 +37,7 @@ recover_previous() {
     [[ $saved_current =~ ^[0-9a-f]{40}$ &&
        $staged =~ ^/opt/luma/data/\.restore\.[A-Za-z0-9]{6}$ &&
        -f $state/previous-env && ! -L $state/previous-env ]] || return 1
+    require_split_database_version "$saved_current" || return 1
     compose stop backend caddy || return 1
     cp "$state/previous-env" "$ENV_FILE" && chmod 600 "$ENV_FILE" || return 1
     if [[ $(git -C "$APP_DIR" rev-parse HEAD) != "$saved_current" ]]; then
@@ -66,7 +67,7 @@ recover_previous() {
             root test -d "$STORAGE_DIR" || return 1
         fi
     fi
-    compose up -d --build --wait && health >/dev/null || return 1
+    compose build backend migrate && start_services && health >/dev/null || return 1
     root install -m 0755 "$APP_DIR/deploy/luma" /usr/local/bin/luma || return 1
     root rm -rf "$staged" || return 1
     rm -rf "$state"
@@ -78,8 +79,10 @@ if [[ ${1:-} == recover ]]; then
         printf '旧配置、代码、数据库和密文目录已恢复并通过就绪检查。\n'
         exit 0
     fi
-    compose stop backend caddy || true
-    die '自动补偿失败；对外服务已停止。保留恢复状态、原数据库加密快照和旧文件目录，请人工排查。'
+    if compose stop backend caddy; then
+        die '自动补偿失败；对外服务已停止。保留恢复状态、原数据库加密快照和旧文件目录，请人工排查。'
+    fi
+    die '自动补偿及停止服务失败，服务状态未知。请立即人工停止对外服务；保留恢复状态、原数据库快照和旧目录。'
 fi
 [[ ! -e $state ]] || die '存在未完成恢复；先运行 luma restore recover，不会覆盖残留数据。'
 [[ ! -e $old_storage ]] || die '存在没有恢复日志的旧密文目录；停止操作并人工核查，不会覆盖残留数据。'
@@ -137,6 +140,12 @@ if [[ $version != "$current" ]]; then
     git -C "$APP_DIR" merge-base --is-ancestor "$version" "$current" ||
         die '备份代码不是当前 main 的祖先版本。'
 fi
+# Old archive bytes remain usable, but old code must not restore administrator
+# API credentials. Keep current code only with explicit operator approval.
+if [[ ${LUMA_RESTORE_KEEP_CODE:-0} == 1 ]]; then
+    version=$current
+fi
+require_split_database_version "$version" || die '旧代码不支持权限分离。请在隔离验证后用 LUMA_RESTORE_KEEP_CODE=1 恢复数据并保留当前代码。'
 [[ $(env_value LUMA_STORAGE_DIR) == "$STORAGE_DIR" && -d $STORAGE_DIR ]] ||
     die '配置与密文目录不一致。'
 
@@ -164,7 +173,8 @@ if (min(storage, database, archive, data_free, config_free) < 0
 PY
 if [[ ${LUMA_RESTORE_CONFIRMED:-} != 1 ]]; then
     ( : </dev/tty ) 2>/dev/null || die '恢复会替换数据库和密文目录，需交互确认。'
-    if [[ $format == legacy ]]; then expected='RESTORE LEGACY'; else expected=RESTORE; fi
+    if [[ ${LUMA_RESTORE_KEEP_CODE:-0} == 1 ]]; then expected='RESTORE CURRENT CODE';
+    elif [[ $format == legacy ]]; then expected='RESTORE LEGACY'; else expected=RESTORE; fi
     printf '将替换当前数据库和密文文件。输入 %s 确认：' "$expected" > /dev/tty
     read -r answer < /dev/tty
     [[ $answer == "$expected" ]] || die '已取消恢复。'
@@ -184,7 +194,7 @@ restore_cleanup() {
         if [[ -d $state ]]; then
             recover_previous && recovered=1
         elif (( services_stopped )); then
-            compose up -d --wait && health >/dev/null && recovered=1
+            start_services && health >/dev/null && recovered=1
         else
             recovered=1
         fi
@@ -192,8 +202,11 @@ restore_cleanup() {
             [[ -z $stage ]] || root rm -rf "$stage"
             printf '恢复未完成，原服务已恢复或尚未改变。\n' >&2
         else
-            compose stop backend caddy || true
-            printf '补偿失败：对外服务已停止，恢复状态与原数据保留。运行 luma restore recover 或人工检查。\n' >&2
+            if compose stop backend caddy; then
+                printf '补偿失败：对外服务已停止，恢复状态与原数据保留。运行 luma restore recover 或人工检查。\n' >&2
+            else
+                printf '补偿和停止服务失败，状态未知；请立即人工停止对外服务。恢复状态与原数据保留。\n' >&2
+            fi
         fi
     fi
     exit "$result"
@@ -249,7 +262,8 @@ backup_data postgres.dump |
 root mv "$STORAGE_DIR" "$old_storage"
 root mv "$stage/storage" "$STORAGE_DIR"
 root chown -R 10001:10001 "$STORAGE_DIR"
-compose up -d --build --wait
+compose build backend migrate
+start_services
 health >/dev/null || die '恢复后的服务就绪检查失败。'
 root install -m 0755 "$APP_DIR/deploy/luma" /usr/local/bin/luma
 : > "$state/committed"

@@ -112,6 +112,10 @@ struct FriendProfileView: View {
                     }
                     for reaction in reactions where reaction.messageID == message.id { context.delete(reaction) }
                     for index in indexes where index.sourceID == message.id { context.delete(index) }
+                    if message.transportEncryptionVersion == 4 {
+                        message.deleted = true
+                        try MessageStore(context: context, encryption: security.encryptionService()).retainV4Tombstone(for: message)
+                    }
                     context.delete(message)
                 }
                 context.delete(conversation)

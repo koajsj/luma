@@ -50,9 +50,18 @@ if [[ ! -f "$ENV_FILE" ]]; then
     chmod 600 "$ENV_FILE"
 fi
 require_install
+# Existing volumes keep their owner. Add only a new API credential, never rotate
+# PostgreSQL/HMAC/backup keys or rewrite ownership automatically.
+if ! grep -q '^LUMA_DATABASE_RUNTIME_PASSWORD=' "$ENV_FILE"; then
+    config_next=$(mktemp /opt/luma/config/.env.database.XXXXXX)
+    cp "$ENV_FILE" "$config_next"
+    printf '\nLUMA_DATABASE_RUNTIME_PASSWORD=%s\n' "$(openssl rand -hex 32)" >> "$config_next"
+    chmod 600 "$config_next"
+    mv "$config_next" "$ENV_FILE"
+fi
 [[ $(env_value LUMA_STORAGE_DIR) == "$STORAGE_DIR" ]] || die '存储目录与部署配置不一致。'
 grep -Eq '^LUMA_USERID_HMAC_SECRET=[0-9a-fA-F]{64}$' "$ENV_FILE" || die 'UserID HMAC 密钥无效；不可重新生成已有数据库的密钥。'
-for key in POSTGRES_PASSWORD REDIS_PASSWORD LUMA_JWT_SECRET; do
+for key in POSTGRES_PASSWORD LUMA_DATABASE_RUNTIME_PASSWORD REDIS_PASSWORD LUMA_JWT_SECRET; do
     grep -Eq "^$key=[0-9a-fA-F]{64}$" "$ENV_FILE" || die "$key 缺失或无效。"
 done
 redis_password=$(env_value REDIS_PASSWORD)
@@ -108,7 +117,9 @@ if root docker volume inspect luma_pgdata >/dev/null 2>&1 &&
 fi
 compose config --quiet
 if [[ $redis_changed == 1 && -n $(compose ps -q redis) ]]; then compose restart redis; fi
-compose up -d --build --wait
+compose build backend migrate
+compose stop backend caddy
+start_services
 health >/dev/null || die '容器启动后健康检查失败，请检查 DNS、端口和 Caddy 日志。'
 root install -m 0755 "$APP_DIR/deploy/luma" /usr/local/bin/luma
 printf '部署完成：%s\n管理命令：luma status | logs | update | backup | restore | domain change | rollback\n' "$(show_address)"

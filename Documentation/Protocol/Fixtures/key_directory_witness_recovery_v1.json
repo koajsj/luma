@@ -1,0 +1,251 @@
+{
+  "version": 1,
+  "scope": "recovery-projection-only-not-cryptographic-proof-vectors",
+  "patchFormat": "RFC7396",
+  "base": {
+    "record": {
+      "version": 1,
+      "config": "1111111111111111111111111111111111111111111111111111111111111111",
+      "witness": "2222222222222222222222222222222222222222222222222222222222222222",
+      "keyEpoch": "1",
+      "generation": "8",
+      "previous": "7",
+      "decision": "4444444444444444444444444444444444444444444444444444444444444444",
+      "previousDecision": "3333333333333333333333333333333333333333333333333333333333333333",
+      "phase": "prepared",
+      "from": {
+        "size": "10",
+        "root": "5555555555555555555555555555555555555555555555555555555555555555"
+      },
+      "to": {
+        "size": "12",
+        "root": "6666666666666666666666666666666666666666666666666666666666666666"
+      }
+    },
+    "anchor": {
+      "status": "ready",
+      "config": "1111111111111111111111111111111111111111111111111111111111111111",
+      "witness": "2222222222222222222222222222222222222222222222222222222222222222",
+      "keyEpoch": "1",
+      "generation": "7",
+      "decision": "3333333333333333333333333333333333333333333333333333333333333333"
+    }
+  },
+  "cases": [
+    {
+      "name": "prepared_before_anchor",
+      "patch": {},
+      "next": "reverify_then_reserve"
+    },
+    {
+      "name": "anchor_response_lost",
+      "patch": {
+        "anchor": {
+          "generation": "8",
+          "decision": "4444444444444444444444444444444444444444444444444444444444444444"
+        }
+      },
+      "next": "reverify_then_fenced_sign_and_persist"
+    },
+    {
+      "name": "signature_persisted_or_publish_reply_lost",
+      "patch": {
+        "record": {
+          "phase": "signed"
+        },
+        "anchor": {
+          "generation": "8",
+          "decision": "4444444444444444444444444444444444444444444444444444444444444444"
+        }
+      },
+      "next": "reverify_then_publish_exact"
+    },
+    {
+      "name": "published_restart",
+      "patch": {
+        "record": {
+          "phase": "published"
+        },
+        "anchor": {
+          "generation": "8",
+          "decision": "4444444444444444444444444444444444444444444444444444444444444444"
+        }
+      },
+      "next": "reverify_then_resume_audit"
+    },
+    {
+      "name": "anchor_unavailable",
+      "patch": {
+        "anchor": {
+          "status": "unavailable"
+        }
+      },
+      "error": "anchor_not_ready"
+    },
+    {
+      "name": "unprovisioned_is_not_genesis",
+      "patch": {
+        "anchor": {
+          "status": "unprovisioned"
+        }
+      },
+      "error": "anchor_not_ready"
+    },
+    {
+      "name": "missing_record_is_not_genesis",
+      "patch": {
+        "record": null
+      },
+      "error": "record_missing"
+    },
+    {
+      "name": "local_backup_older_than_anchor",
+      "patch": {
+        "anchor": {
+          "generation": "9"
+        }
+      },
+      "error": "anchor_conflict_or_rollback"
+    },
+    {
+      "name": "anchor_backup_older_than_record",
+      "patch": {
+        "anchor": {
+          "generation": "6"
+        }
+      },
+      "error": "anchor_conflict_or_rollback"
+    },
+    {
+      "name": "same_generation_other_decision",
+      "patch": {
+        "anchor": {
+          "generation": "8",
+          "decision": "7777777777777777777777777777777777777777777777777777777777777777"
+        }
+      },
+      "error": "anchor_conflict_or_rollback"
+    },
+    {
+      "name": "signature_without_reservation",
+      "patch": {
+        "record": {
+          "phase": "signed"
+        }
+      },
+      "error": "unanchored_signature"
+    },
+    {
+      "name": "unknown_phase",
+      "patch": {
+        "record": {
+          "phase": "failed"
+        }
+      },
+      "error": "invalid_phase"
+    },
+    {
+      "name": "unknown_record_version",
+      "patch": {
+        "record": {
+          "version": 2
+        }
+      },
+      "error": "unsupported_record"
+    },
+    {
+      "name": "wrong_witness",
+      "patch": {
+        "anchor": {
+          "witness": "8888888888888888888888888888888888888888888888888888888888888888"
+        }
+      },
+      "error": "anchor_identity_mismatch"
+    },
+    {
+      "name": "wrong_config",
+      "patch": {
+        "anchor": {
+          "config": "8888888888888888888888888888888888888888888888888888888888888888"
+        }
+      },
+      "error": "anchor_identity_mismatch"
+    },
+    {
+      "name": "key_rotation_is_not_recovery",
+      "patch": {
+        "anchor": {
+          "keyEpoch": "2"
+        }
+      },
+      "error": "anchor_identity_mismatch"
+    },
+    {
+      "name": "same_size_different_root",
+      "patch": {
+        "record": {
+          "to": {
+            "size": "10"
+          }
+        }
+      },
+      "error": "checkpoint_rollback_or_fork"
+    },
+    {
+      "name": "smaller_checkpoint",
+      "patch": {
+        "record": {
+          "to": {
+            "size": "9"
+          }
+        }
+      },
+      "error": "checkpoint_rollback_or_fork"
+    },
+    {
+      "name": "noncanonical_counter",
+      "patch": {
+        "record": {
+          "generation": "08"
+        }
+      },
+      "error": "invalid_counter"
+    },
+    {
+      "name": "overflow_counter",
+      "patch": {
+        "record": {
+          "generation": "18446744073709551616"
+        }
+      },
+      "error": "invalid_counter"
+    },
+    {
+      "name": "skipped_generation",
+      "patch": {
+        "record": {
+          "generation": "9"
+        }
+      },
+      "error": "invalid_counter"
+    },
+    {
+      "name": "decision_replay",
+      "patch": {
+        "record": {
+          "decision": "3333333333333333333333333333333333333333333333333333333333333333"
+        }
+      },
+      "error": "reused_decision"
+    },
+    {
+      "name": "malformed_digest",
+      "patch": {
+        "record": {
+          "decision": "abcd"
+        }
+      },
+      "error": "invalid_digest"
+    }
+  ]
+}

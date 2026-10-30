@@ -26,6 +26,10 @@ import (
 )
 
 func main() {
+	migrateOnly := len(os.Args) == 2 && os.Args[1] == "migrate"
+	if len(os.Args) != 1 && !migrateOnly {
+		log.Fatal("usage: luma [migrate]")
+	}
 	cfg, e := config.Load()
 	if e != nil {
 		log.Fatal(e)
@@ -42,11 +46,26 @@ func main() {
 		log.Fatal("database unavailable; check DATABASE_URL and PostgreSQL")
 	}
 	defer db.Close()
-	if e = database.Migrate(ctx, db, cfg.MigrationsDir); e != nil {
-		log.Fatal(e)
+	if migrateOnly || cfg.AutoMigrate {
+		if e = database.Migrate(ctx, db, cfg.MigrationsDir); e != nil {
+			log.Fatal("database migration failed; inspect schema and migration files")
+		}
+		e = userIDIndexKey.Backfill(ctx, db)
+	} else {
+		if e = database.VerifySchema(ctx, db, cfg.MigrationsDir); e != nil {
+			log.Fatal("database schema incompatible; run the matching migration job before API startup")
+		}
+		if e = database.VerifyRuntimeRole(ctx, db); e != nil {
+			log.Fatal("unsafe API database role; use the reviewed runtime grants")
+		}
+		e = userIDIndexKey.Verify(ctx, db)
 	}
-	if e = userIDIndexKey.Backfill(ctx, db); e != nil {
+	if e != nil {
 		log.Fatal("UserID HMAC index unavailable; check secret continuity and database migration")
+	}
+	if migrateOnly {
+		log.Print("database migration and UserID index verification completed")
+		return
 	}
 	opt, e := redis.ParseURL(cfg.RedisURL)
 	if e != nil {
@@ -108,8 +127,6 @@ func main() {
 	private("POST /v1/devices/authorize/challenge", deviceSvc.AuthorizeChallenge, 10)
 	private("POST /v1/devices/authorize", deviceSvc.Authorize, 10)
 	private("DELETE /v1/devices/{id}", deviceSvc.Revoke, 10)
-	private("PUT /v1/devices/{id}/prekeys", deviceSvc.PutPrekeys, 10)
-	private("GET /v1/users/{id}/prekey-bundle", deviceSvc.Bundle, 30)
 	private("PUT /v1/devices/{id}/v4-prekeys", deviceSvc.PutV4Prekeys, 10)
 	private("GET /v1/devices/{id}/v4-prekeys/status", deviceSvc.V4PrekeyStatus, 30)
 	private("GET /v1/users/{id}/v4-prekey-bundle", deviceSvc.V4Bundle, 30)
@@ -123,17 +140,11 @@ func main() {
 	private("POST /v1/conversations", convSvc.Create, 30)
 	private("GET /v1/conversations", convSvc.List, 60)
 	private("POST /v1/messages", messageSvc.Send, 60)
-	private("DELETE /v1/messages/{id}", messageSvc.Delete, 30)
-	private("POST /v1/messages/edit", messageSvc.Edit, 30)
-	private("POST /v1/messages/read", messageSvc.Receipt, 60)
-	private("POST /v1/messages/delivered", messageSvc.Receipt, 60)
-	private("POST /v1/messages/reaction", messageSvc.Reaction, 60)
+	private("POST /v1/messages/delivered", messageSvc.Delivered, 60)
 	private("POST /v1/messages/v4/events", messageSvc.V4Event, 60)
 	private("POST /v1/sessions/controls", messageSvc.SessionControl, 120)
-	private("GET /v1/sync", syncSvc.Events, 120)
 	private("GET /v1/sync/events", syncSvc.Events, 120)
 	private("POST /v1/sync/ack", syncSvc.Ack, 120)
-	private("GET /v1/messages/sync", syncSvc.Events, 120)
 	private("POST /v1/files/upload/init", files.Init, 30)
 	private("POST /v1/files/upload/complete", files.Complete, 30)
 	private("PUT /v1/files/{id}/upload", files.Upload, 30)
@@ -142,7 +153,7 @@ func main() {
 	private("DELETE /v1/files/{id}", files.Delete, 30)
 	private("PUT /v1/presence/heartbeat", presenceSvc.Heartbeat, 120)
 	private("GET /v1/presence/{userID}", presenceSvc.Get, 60)
-	mux.Handle("GET /v1/ws", authSvc.Require(middleware.Limit(cache, "GET /v1/ws", 30, time.Minute, cfg.TrustedProxyIP, http.HandlerFunc(hub.Serve))))
+	private("GET /v1/ws", hub.Serve, 30)
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		middleware.JSON(w, 200, map[string]string{"status": "ok"})
 	})

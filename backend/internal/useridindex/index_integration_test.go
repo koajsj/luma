@@ -48,8 +48,14 @@ func TestLegacyBackfillSearchPrivacyAndFriendRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err = key.Verify(ctx, db); err == nil {
+		t.Fatal("runtime accepted a missing UserID index")
+	}
 	if err = key.Backfill(ctx, db); err != nil {
 		t.Fatal(err)
+	}
+	if err = key.Verify(ctx, db); err != nil {
+		t.Fatalf("runtime verification: %v", err)
 	}
 	var stored []byte
 	if err = db.QueryRow(ctx, "SELECT user_id_hash FROM users WHERE id=$1", bob).Scan(&stored); err != nil || !bytes.Equal(stored, key.Sum("bob")) {
@@ -84,6 +90,9 @@ func TestLegacyBackfillSearchPrivacyAndFriendRequest(t *testing.T) {
 		t.Fatalf("friend request not stored: %v", err)
 	}
 	otherKey, _ := useridindex.ParseKey(strings.Repeat("b2", 32))
+	if err = otherKey.Verify(ctx, db); err == nil {
+		t.Fatal("runtime accepted a changed index secret")
+	}
 	if err = otherKey.Backfill(ctx, db); err == nil {
 		t.Fatal("changed index secret accepted")
 	}

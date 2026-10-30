@@ -9,6 +9,7 @@
 | `Friend` | `id`、`ownerID`、对方 `userID`、`encryptedProfile`、身份指纹、会话状态、待核验指纹 | 昵称、头像、备注、私密笔记及本地限制标记经主密钥加密；旧资料与 `encryptedRemark` 仅供迁移。身份变更状态阻止旧在线信封继续发送。 |
 | `Conversation` | `id`、`ownerID`、`friendID`、`draft`、聊天锁、置顶、未读数 | `draft` 为加密字节；关系和计数仍是元数据。 |
 | `Message` | `id`、`conversationID`、`senderID`、类型、`ciphertext`、时间、状态、回执/编辑/删除时间、`deviceID`、`lastEventID`、`encryptionVersion`、`sessionKeyVersion`、`messageKeyIndex` | 正文在 `ciphertext`；`content` 仅供旧版迁移，新记录为空。 |
+| `MessageTombstone` | 唯一 `messageID`、`ownerID`、`encryptedRecord` | 独立于消息行的 Master Key AES-GCM 本机证据；内部版本 1，绑定会话、联系人指纹、原作者、revision 和来源 `retained-local-message`。不含正文、附件描述/密钥或历史 Reaction 内容；可保留嵌套加密的 Reaction 操作戳/摘要，不是远端删除证明。保留至账号清理，不进入便携备份。 |
 | `Attachment` | `id`、`messageID`、类型、`encryptedMetadata` | v4 附件描述（含附件密钥）经 Master Key 加密；磁盘缓存同样加密，后端只保存文件密文；旧路径字段仅供迁移。 |
 | `SessionKey` | `id`、`ownerID`、`friendID`、版本和时间 | 只存元数据，密钥在 Keychain。 |
 | `PreKeyMetadata` | `id`、`ownerID`、类型、公钥/签名/指纹、使用时间 | 私钥在 Keychain。 |
@@ -24,3 +25,13 @@
 当前关系主要靠 UUID 字段关联，而非 SwiftData 的显式 `@Relationship` 级联约束；删除时由服务层按 owner → friend → conversation → message → attachment/reaction 等范围清理。旧可选字段按默认值解释：旧消息缺少 `encryptionVersion` 时按 v1 读取。登录解锁阶段迁移旧明文消息与隐私字段，验证成功后清空兼容字段。迁移前的物理残留不能据此认定已彻底擦除。
 
 未来服务器的 `users`、`devices`、`messages` 等表是独立设计，不能把 SwiftData 模型直接当作后端 Schema。见[数据库设计](../Backend/Database_Schema.md)。
+
+### v4 历史墓碑兼容
+
+新增独立表，不变更 v1/v2/v3/v4 线格式或 Ratchet。已有已删 v4 行在授权解锁时验证本机密文及现存路由后补充加密证据；迁移本身不删除原加密正文、附件或 Reaction，以便失败时仅回滚数据库变更。后续现有删除/到期清理流程负责清理内容。完全物理缺失且没有证据的记录不补造墓碑；相关同步保持暂停。
+
+缺失消息行只有在墓碑 AEAD、账号、原会话和当前固定身份均验证后才能重建空隐藏行，随后仍须验证原 v4 事件、actor 和 revision。已有墓碑或 v4 Session 元数据的账号拒绝便携备份覆盖。旧应用对已升级库降级写入、历史实机库升级仍需单独验收，不能通过还原旧数据库绕过此门禁。
+
+### CA-01 Reaction 状态兼容
+
+`Message` 新增可选 `encryptedReactionState`；旧记录缺省为空，不改旧 Reaction 展示、不为旧事件伪造计数。账本与可见 Reaction 同库提交，记录认证操作的最大戳和摘要；移除后保留戳。删除证据内部增加同名可选字段，旧墓碑缺省仍可读取；新墓碑恢复空行时同时还原账本。具体顺序和受限 legacy 行为见[消息格式](../Protocol/Message_Format.md#v4-reaction-操作顺序ca-01-修复)。不增加服务端表/迁移，不改 Ratchet 状态格式；真实旧设备数据库升级和降级写入尚未验收。

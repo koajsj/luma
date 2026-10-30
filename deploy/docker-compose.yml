@@ -11,7 +11,8 @@ services:
       LUMA_TRUSTED_PROXY_IP: "172.31.251.2"
       # Only the private Docker network can reach this HTTP listener; Caddy terminates public TLS.
       LUMA_ALLOW_INSECURE_LOCAL: "true"
-      DATABASE_URL: "postgres://luma:${POSTGRES_PASSWORD}@postgres:5432/luma?sslmode=disable"
+      LUMA_AUTO_MIGRATE: "false"
+      DATABASE_URL: "postgres://luma_api:${LUMA_DATABASE_RUNTIME_PASSWORD:?Prepare a separate runtime password}@postgres:5432/luma?sslmode=disable"
       REDIS_URL: "redis://:${REDIS_PASSWORD:?Set REDIS_PASSWORD}@redis:6379/0"
       LUMA_USERID_HMAC_SECRET: ${LUMA_USERID_HMAC_SECRET:?Set a persistent 32-byte hex UserID HMAC secret}
       LOCAL_STORAGE_DIR: /app/storage
@@ -21,6 +22,7 @@ services:
     depends_on:
       postgres: {condition: service_healthy}
       redis: {condition: service_healthy}
+      db-grants: {condition: service_completed_successfully}
     networks: [private]
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/ready"]
@@ -28,6 +30,39 @@ services:
       timeout: 5s
       retries: 12
       start_period: 30s
+
+  # Administrator credentials exist only in PostgreSQL and short-lived jobs.
+  migrate:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: ["/app/luma", "migrate"]
+    restart: "no"
+    environment:
+      LUMA_ALLOW_INSECURE_LOCAL: "true"
+      DATABASE_URL: "postgres://luma:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/luma?sslmode=disable"
+      LUMA_USERID_HMAC_SECRET: ${LUMA_USERID_HMAC_SECRET:?Set the persistent HMAC secret}
+      MIGRATIONS_DIR: /app/migrations
+    depends_on:
+      postgres: {condition: service_healthy}
+    networks: [private]
+
+  db-grants:
+    image: postgres:17-alpine
+    restart: "no"
+    entrypoint: ["sh", "/app/database-role.sh"]
+    environment:
+      PGHOST: postgres
+      PGDATABASE: luma
+      PGUSER: luma
+      PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+      LUMA_DATABASE_RUNTIME_PASSWORD: ${LUMA_DATABASE_RUNTIME_PASSWORD:?Prepare a separate runtime password}
+    volumes:
+      - ./database-role.sh:/app/database-role.sh:ro
+      - ../backend/ops/runtime-grants.sql:/app/runtime-grants.sql:ro
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    networks: [private]
 
   postgres:
     image: postgres:17-alpine

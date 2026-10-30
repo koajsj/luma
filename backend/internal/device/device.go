@@ -2,8 +2,9 @@ package device
 
 import (
 	"bytes"
-	"encoding/base64"
+	"errors"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"luma/backend/internal/crypto"
 	"luma/backend/internal/middleware"
@@ -19,6 +20,50 @@ type Notifier interface {
 type Service struct {
 	DB     *pgxpool.Pool
 	Notify Notifier
+}
+
+// The parent row exists before any prekeys do. Serialize initial publication
+// and revocation so a previously authenticated upload cannot recreate inventory.
+func lockActiveDevice(w http.ResponseWriter, r *http.Request, tx pgx.Tx) bool {
+	i := middleware.Current(r)
+	var id string
+	err := tx.QueryRow(r.Context(), `SELECT d.id FROM devices d JOIN users u ON u.id=d.user_id
+        WHERE d.id=$1 AND d.user_id=$2 AND d.revoked_at IS NULL AND u.disabled_at IS NULL
+        FOR UPDATE OF d`, i.DeviceID, i.UserID).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		middleware.Fail(w, r, 403, "forbidden")
+		return false
+	}
+	if err != nil {
+		middleware.Fail(w, r, 503, "storage_unavailable")
+		return false
+	}
+	return true
+}
+
+// Serialize account roster mutations before checking the acting device. The
+// second statement sees revocations committed while the account lock waited.
+// Do not lock actor then target: mutual revocations could invert device locks.
+func lockDeviceAuthority(w http.ResponseWriter, r *http.Request, tx pgx.Tx) bool {
+	i := middleware.Current(r)
+	var user string
+	err := tx.QueryRow(r.Context(), "SELECT id FROM users WHERE id=$1 AND disabled_at IS NULL FOR UPDATE", i.UserID).Scan(&user)
+	if errors.Is(err, pgx.ErrNoRows) {
+		middleware.Fail(w, r, 403, "forbidden")
+		return false
+	}
+	var active bool
+	if err == nil {
+		err = tx.QueryRow(r.Context(), "SELECT EXISTS(SELECT 1 FROM devices WHERE id=$1 AND user_id=$2 AND revoked_at IS NULL)", i.DeviceID, i.UserID).Scan(&active)
+	}
+	if err != nil {
+		middleware.Fail(w, r, 503, "storage_unavailable")
+		return false
+	}
+	if !active {
+		middleware.Fail(w, r, 403, "forbidden")
+	}
+	return active
 }
 
 func (s Service) List(w http.ResponseWriter, r *http.Request) {
@@ -58,6 +103,9 @@ func (s Service) Revoke(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback(r.Context())
+	if !lockDeviceAuthority(w, r, tx) {
+		return
+	}
 	tag, e := tx.Exec(r.Context(), "UPDATE devices SET revoked_at=now() WHERE id=$1 AND user_id=$2 AND revoked_at IS NULL", id, i.UserID)
 	if e != nil || tag.RowsAffected() == 0 {
 		middleware.Fail(w, r, 404, "not_found")
@@ -121,114 +169,6 @@ func (s Service) Revoke(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(204)
 }
-func (s Service) PutPrekeys(w http.ResponseWriter, r *http.Request) {
-	i := middleware.Current(r)
-	if r.PathValue("id") != i.DeviceID {
-		middleware.Fail(w, r, 403, "forbidden")
-		return
-	}
-	var in struct {
-		SignedPreKey   string   `json:"signedPreKey"`
-		Signature      string   `json:"signature"`
-		KeyVersion     int      `json:"keyVersion"`
-		OneTimePreKeys []string `json:"oneTimePreKeys"`
-	}
-	if !middleware.Decode(w, r, &in) {
-		return
-	}
-	pre, e := crypto.DecodeKey(in.SignedPreKey)
-	sig, e2 := crypto.DecodeSignature(in.Signature)
-	if e != nil || e2 != nil || len(sig) == 0 || in.KeyVersion < 1 || len(in.OneTimePreKeys) > 100 {
-		middleware.Fail(w, r, 400, "invalid_prekeys")
-		return
-	}
-	var identity []byte
-	e = s.DB.QueryRow(r.Context(), "SELECT identity_public_key FROM users WHERE id=$1", i.UserID).Scan(&identity)
-	if e != nil || !crypto.VerifySignedPrekey(identity, pre, sig) {
-		middleware.Fail(w, r, 400, "invalid_prekey_signature")
-		return
-	}
-	tx, e := s.DB.Begin(r.Context())
-	if e != nil {
-		middleware.Fail(w, r, 503, "storage_unavailable")
-		return
-	}
-	defer tx.Rollback(r.Context())
-	_, e = tx.Exec(r.Context(), "INSERT INTO signed_prekeys(device_id,public_key,signature,key_version) VALUES($1,$2,$3,$4) ON CONFLICT(device_id,key_version) DO NOTHING", i.DeviceID, pre, sig, in.KeyVersion)
-	for _, v := range in.OneTimePreKeys {
-		if e != nil {
-			break
-		}
-		b, err := crypto.DecodeKey(v)
-		if err != nil {
-			middleware.Fail(w, r, 400, "invalid_prekeys")
-			return
-		}
-		_, e = tx.Exec(r.Context(), "INSERT INTO one_time_prekeys(device_id,public_key) VALUES($1,$2)", i.DeviceID, b)
-	}
-	if e != nil || tx.Commit(r.Context()) != nil {
-		middleware.Fail(w, r, 503, "storage_unavailable")
-		return
-	}
-	w.WriteHeader(204)
-}
-func (s Service) Bundle(w http.ResponseWriter, r *http.Request) {
-	target := r.PathValue("id")
-	me := middleware.Current(r).UserID
-	var allowed bool
-	e := s.DB.QueryRow(r.Context(), "SELECT ($1::uuid=$2::uuid OR EXISTS(SELECT 1 FROM friendships WHERE user_a=LEAST($1::uuid,$2::uuid) AND user_b=GREATEST($1::uuid,$2::uuid))) AND NOT EXISTS(SELECT 1 FROM blocks WHERE (blocker=$1 AND blocked=$2) OR (blocker=$2 AND blocked=$1))", me, target).Scan(&allowed)
-	if e != nil || !allowed {
-		middleware.Fail(w, r, 403, "forbidden")
-		return
-	}
-	var identity []byte
-	var identityVersion int
-	e = s.DB.QueryRow(r.Context(), "SELECT identity_public_key,identity_key_version FROM users WHERE id=$1", target).Scan(&identity, &identityVersion)
-	if e != nil {
-		middleware.Fail(w, r, 404, "not_found")
-		return
-	}
-	tx, e := s.DB.Begin(r.Context())
-	if e != nil {
-		middleware.Fail(w, r, 503, "storage_unavailable")
-		return
-	}
-	defer tx.Rollback(r.Context())
-	rows, e := tx.Query(r.Context(), "SELECT d.id,d.device_public_key,s.public_key,s.signature,s.key_version FROM devices d JOIN LATERAL (SELECT public_key,signature,key_version FROM signed_prekeys WHERE device_id=d.id ORDER BY key_version DESC LIMIT 1) s ON true WHERE d.user_id=$1 AND d.revoked_at IS NULL", target)
-	if e != nil {
-		middleware.Fail(w, r, 503, "storage_unavailable")
-		return
-	}
-	type info struct {
-		id               string
-		device, pre, sig []byte
-		version          int
-	}
-	list := []info{}
-	for rows.Next() {
-		var x info
-		if rows.Scan(&x.id, &x.device, &x.pre, &x.sig, &x.version) != nil {
-			rows.Close()
-			middleware.Fail(w, r, 503, "storage_unavailable")
-			return
-		}
-		list = append(list, x)
-	}
-	rows.Close()
-	out := []map[string]any{}
-	for _, x := range list {
-		var one []byte
-		if r.URL.Query().Get("claim") != "false" && x.id != middleware.Current(r).DeviceID {
-			_ = tx.QueryRow(r.Context(), "UPDATE one_time_prekeys SET claimed_at=now() WHERE id=(SELECT id FROM one_time_prekeys WHERE device_id=$1 AND claimed_at IS NULL ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING public_key", x.id).Scan(&one)
-		}
-		out = append(out, map[string]any{"identityPublicKey": base64.RawURLEncoding.EncodeToString(identity), "identityKeyVersion": identityVersion, "deviceID": x.id, "devicePublicKey": base64.RawURLEncoding.EncodeToString(x.device), "signedPreKey": base64.RawURLEncoding.EncodeToString(x.pre), "signature": base64.RawURLEncoding.EncodeToString(x.sig), "keyVersion": x.version, "oneTimePreKey": base64.RawURLEncoding.EncodeToString(one)})
-	}
-	if tx.Commit(r.Context()) != nil {
-		middleware.Fail(w, r, 503, "storage_unavailable")
-		return
-	}
-	middleware.JSON(w, 200, out)
-}
 func (s Service) AuthorizeChallenge(w http.ResponseWriter, r *http.Request) {
 	i := middleware.Current(r)
 	nonce, e := crypto.Random()
@@ -273,6 +213,9 @@ func (s Service) Authorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback(r.Context())
+	if !lockDeviceAuthority(w, r, tx) {
+		return
+	}
 	var identity, approver, nonceHash []byte
 	e = tx.QueryRow(r.Context(), "SELECT u.identity_public_key,d.auth_public_key,c.nonce_hash FROM users u JOIN devices d ON d.user_id=u.id JOIN auth_challenges c ON c.device_id=d.id WHERE u.id=$1 AND d.id=$2 AND d.revoked_at IS NULL AND c.id=$3 AND c.purpose='device_authorize' AND c.used_at IS NULL AND c.expires_at>now() FOR UPDATE OF c", i.UserID, i.DeviceID, in.ChallengeID).Scan(&identity, &approver, &nonceHash)
 	if e != nil || !bytes.Equal(nonceHash, crypto.Hash(in.Nonce)) || !crypto.VerifySignedPrekey(identity, pre, preSig) {

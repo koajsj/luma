@@ -117,6 +117,9 @@ func (s Service) PutV4Prekeys(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback(r.Context())
+	if !lockActiveDevice(w, r, tx) {
+		return
+	}
 	var oldAgreement, oldSigning, oldPrekey []byte
 	var oldVersion int
 	err = tx.QueryRow(r.Context(), "SELECT identity_agreement_public,identity_signing_public,signed_prekey_public,key_version FROM v4_device_prekeys WHERE device_id=$1 FOR UPDATE", deviceID).

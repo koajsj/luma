@@ -9,14 +9,16 @@ lock_operation
 require_no_incomplete_restore
 backup_require_recovery
 old=$(git -C "$APP_DIR" rev-parse HEAD)
+require_split_database_version "$old" || die '旧版本升级须先完成独立账号迁移预检，保留原服务。'
 bash "$APP_DIR/deploy/backup.sh"
 backup=$(find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d ! -name '*.partial' -print | sort | tail -1)
 [[ -n "$backup" && $(cat "$backup/VERSION") == "$old" ]] || die '更新前备份未完成。'
 git -C "$APP_DIR" fetch origin main
 new=$(git -C "$APP_DIR" rev-parse FETCH_HEAD)
+require_split_database_version "$new" || die '新版本不支持权限分离，当前服务和代码未更改。'
 if [[ $new == "$old" ]]; then printf '已是最新版本：%s\n' "$old"; exit 0; fi
 git -C "$APP_DIR" merge --ff-only "$new"
-if compose config --quiet && compose up -d --build --wait && health >/dev/null; then
+if compose config --quiet && compose build backend migrate && compose stop backend caddy && start_services && health >/dev/null; then
     root install -m 0755 "$APP_DIR/deploy/luma" /usr/local/bin/luma
     printf '更新完成：%s → %s\n' "$old" "$new"
     exit 0

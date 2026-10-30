@@ -19,9 +19,9 @@ curl -fsSL https://raw.githubusercontent.com/koajsj/luma/main/deploy/install.sh 
 
 脚本仅询问是否使用域名；选择使用域名时再输入域名。也可预先设置 `LUMA_DOMAIN=api.example.com`。不配置域名则进入 **IP 测试模式**，使用 `http://VPS_IP`；此模式没有 TLS，**不得用于真实用户、设备凭据或互联网公开服务**。正式使用前执行 `luma domain change`。
 
-脚本克隆 main 到 `/opt/luma/app`，创建 `/opt/luma/data/postgres`、`redis`、`storage` 和 `/opt/luma/backups`，生成权限为 600 的 `/opt/luma/config/.env`。数据库、Redis 和 UserID HMAC 密钥由系统随机数生成，**不会输出到终端或提交到 Git**。`LUMA_JWT_SECRET` 仅为未来 JWT 预留；当前后端使用数据库支持的不透明 Token，不能把此变量描述为当前认证密钥。
+脚本克隆 main 到 `/opt/luma/app`，创建 `/opt/luma/data/postgres`、`redis`、`storage` 和 `/opt/luma/backups`，生成权限为 600 的 `/opt/luma/config/.env`。数据库管理员/API 独立密码、Redis 和 UserID HMAC 密钥由系统随机数生成，**不会输出到终端或提交到 Git**。`LUMA_JWT_SECRET` 仅为未来 JWT 预留；当前后端使用数据库支持的不透明 Token，不能把此变量描述为当前认证密钥。
 
-服务由 Docker Compose 启动：PostgreSQL、Redis、Go Backend、Caddy。后端启动时自动运行版本化 PostgreSQL migration；Caddy 代理普通 HTTP 和 WebSocket。Redis 仅保存可重建的短期状态，不写持久化快照。客户端先加密附件，再上传到 `/opt/luma/data/storage/ciphertext`。服务器仍可见账号、设备、时间、大小等元数据。
+服务由 Docker Compose 启动：PostgreSQL、Redis、Go Backend、Caddy。先运行短时 `migrate` 和 `db-grants` 任务，再启动只读校验 schema 的 API；Caddy 代理普通 HTTP 和 WebSocket。Redis 仅保存可重建的短期状态，不写持久化快照。客户端先加密附件，再上传到 `/opt/luma/data/storage/ciphertext`。服务器仍可见账号、设备、时间、大小等元数据。
 
 部署网络固定使用 `172.31.251.0/24`，Caddy 在内部网络使用 `172.31.251.2`。后端只信任此地址转发的单个客户端 IP，Caddy 会覆盖客户端提供的 `X-Forwarded-For`。若 VPS 上已有重叠 Docker 网络，须在部署前同步修改 Compose 中的网段、Caddy 地址及 `LUMA_TRUSTED_PROXY_IP`，保持三处一致。
 
@@ -102,7 +102,7 @@ LUMA_BACKUP_IDENTITY=/run/luma-maintenance/identity luma restore recover
 
 恢复日志还保留了本次恢复所用的脚本副本。如果切换到旧代码后 `luma restore recover` 不可用，使用 `bash /opt/luma/config/restore-state/restore.sh recover`；不要先更新代码或删除日志。数据目录与配置目录位于同一文件系统时，空间预检会合并计算数据库快照、暂存目录和恢复空间。`recover` 完成后需再次核对服务和数据；无法通过就绪检查时保持停机并保留所有快照。
 
-旧版没有 `FORMAT` 的备份仍支持恢复，但它们是明文且 `SHA256SUMS` 不具备来源认证，必须来自可信位置，交互时需输入 `RESTORE LEGACY`。先运行 `luma backup migrate /opt/luma/backups/旧目录` 生成新的加密副本并验证，再考虑单独安全处置旧目录；脚本不会自动删除或覆盖。恢复要求备份的 `VERSION` 为当前 main 的祖先；跨版本时会切换到对应代码，避免只回退容器而保留新 schema。更新失败调用当前新版恢复脚本处理其备份，恢复旧代码、数据库、配置和文件。
+旧版没有 `FORMAT` 的备份仍支持恢复，但它们是明文且 `SHA256SUMS` 不具备来源认证，必须来自可信位置，交互时需输入 `RESTORE LEGACY`。先运行 `luma backup migrate /opt/luma/backups/旧目录` 生成新的加密副本并验证，再考虑单独安全处置旧目录；脚本不会自动删除或覆盖。恢复要求备份的 `VERSION` 为当前 main 的祖先；跨版本时仅切换到支持独立数据库账号的对应代码；更早的归档须按下文显式保留当前代码恢复，不能重新让 API 使用管理员。更新失败调用当前新版恢复脚本处理其备份，恢复旧代码、数据库、配置和文件。
 
 ## 更换服务器
 
@@ -123,3 +123,90 @@ LUMA_BACKUP_IDENTITY=/run/luma-maintenance/identity luma restore recover
 - 如曾使用旧版 `luma_pgdata` 命名卷，脚本发现新 PostgreSQL 目录为空时会停止，避免启动空数据库。先对旧卷做独立备份并迁移数据；不要直接删除旧卷。
 - 部署日志不得主动输出 Token、私钥、消息正文或附件内容；不要把实际日志贴到公开渠道。
 - 当前没有 APNs 正式推送、生产双真机验收或独立安全审计。应用安全状态仍以客户端可验证的实际能力为准。
+
+## 数据库权限拆分
+
+### 默认运行路径
+
+Compose 中长期 Backend 只收到 `luma_api` 的 `LUMA_DATABASE_RUNTIME_PASSWORD`，固定 `LUMA_AUTO_MIGRATE=false`；没有 PostgreSQL 管理员密码或备用迁移 URL。PostgreSQL 本身仍保留原初始化管理员 `luma`。短时 `migrate` 使用该账号执行迁移/HMAC 补齐，短时 `db-grants` 创建/校验独立运行角色并应用权限模板，再允许启动 API。保留原数据库/表所有权，不做 REASSIGN OWNED，不重建已有卷。
+
+新安装由脚本自动生成独立的 32 字节十六进制 API 密码，权限 `600`。已有 `.env` 仅在显式运行 `deploy.sh` 且字段缺失时补充新 API 密码；不会更换管理员、HMAC、age 密钥或旧密码。发现既有 `luma_api` 拥有对象、角色成员关系、管理权限或异常 ACL 时拒绝，不静默降权覆盖。不要将它用于其他应用共享的数据库。
+
+首次从旧部署迁入：先在隔离环境演练并用**原版本维护工具**完成可验证备份，妥善保管原 `.env`/age 材料；再经人工审核更新代码，执行 `bash deploy/deploy.sh`。新脚本会先构建、停止 API/代理，再迁移和授权；失败则保持停机，保留原数据/配置并人工排查，不退回管理员 API。旧版 `luma update` 不具有此迁移保证，不得将它当自动升级路径。未经隔离演练不要对现有生产卷执行。
+
+`start_services` 每次明确重跑迁移/授权，避免恢复后复用已退出容器的旧“成功”状态；失败阶段不会启动 API/代理。正常备份退出和域名切换仅恢复现有 API/代理，不在在线服务期间意外执行迁移。默认依赖链也支持首次 `docker compose up -d`；手工重启不能替代恢复后的重新授权。
+
+### 权限与恢复边界
+
+迁移账本只读，运行角色无 DDL、TRUNCATE、角色继承或所有权；不授权预留推送表、当前无需的序列及未来表。新 migration 须同步审阅 `backend/ops/runtime-grants.sql`。它是表级 DML 最小化，不是逐用户 RLS，API 对象权限检查仍不可缺少。
+
+备份仍由维护进程用 `luma` 管理员转储，不给 API 开放备份权限。恢复/补偿继续以 `luma` 还原 `--no-owner --no-acl`，随后必须重跑 `migrate`、`db-grants`，通过 API 和代理就绪检查后才清理旧快照。管理员/运行角色密码不在归档内，换 VPS 使用新随机密码；原 UserID HMAC 和 age 恢复材料继续单独保管。
+
+回滚/恢复在任何数据替换前检查目标 Compose 支持独立账号，拒绝回到管理员 API 的旧代码。补偿日志指向旧管理员版本时同样暂停，不先重写代码/配置/数据库；应保留原快照，在隔离环境审阅旧日志及对应工具后人工处理。停止命令失败会明确报告状态未知，不声称服务已停。旧归档不删除也不覆盖：如需从权限拆分前的归档恢复，在隔离环境先验证代码/schema 兼容，然后显式执行：
+
+```bash
+LUMA_RESTORE_KEEP_CODE=1 luma restore /opt/luma/backups/旧时间戳
+# 交互输入 RESTORE CURRENT CODE；跨服务器仍按原参数提供旧 env/离线私钥。
+```
+
+该选项仅保留当前代码，不跳过 age、哈希、HMAC、磁盘空间、备份版本格式或恢复确认；更高 schema 不能因它而被旧 API 接受。任何失败仍用原代码/配置/数据库快照/旧文件目录补偿；不得为了启动而改回管理员连接。恢复失败保留 `restore-state`，按原恢复步骤处理。
+
+已在临时 PostgreSQL 17 验证真实授权脚本、拒绝权限、dump/restore 后重新授权；脚本阶段失败有本地控制流回归。**尚未运行 Docker/Ubuntu 的完整 install/update/restore/rollback 故障注入，不能把静态 Compose 检查视为容器部署验收。** 对旧卷的实际切换继续保留人工门禁。
+
+### 自定义账号（非默认 Compose）
+
+直接运行二进制时，`luma migrate` 接收短时迁移连接；长期 API 仅传运行连接并设置 `LUMA_AUTO_MIGRATE=false`。可自行准备非超级用户的专用数据库所有者 `luma_migrator` 与无所有权/成员关系的 API LOGIN 角色；使用 `psql` 的 `\password` 或秘密管理器设置密码，不放命令参数或 Git。
+
+管理员显式应用同一模板：
+
+```sh
+psql -X -v ON_ERROR_STOP=1 -v database=luma \
+  -v migration_role=luma_migrator -v runtime_role=luma_api \
+  -f backend/ops/runtime-grants.sql
+```
+
+只有实际迁移角色拥有全部已知对象时才能使用此例；默认部署保持原所有者 `luma`，不要直接替换此参数或全局 REASSIGN。模板拒绝异常所有权、未知表和既有隐藏列级授权；当前 UUID schema 不需序列，新增对象必须另行审阅权限。自定义恢复也须恢复到正确所有者后再授权，不能把备用管理员 URL 传入 API。
+
+## 隔离 Ubuntu 生命周期验收（待执行）
+
+以下用于专门的可销毁 Ubuntu 22.04/24.04 VM，不是生产运维指令，也不表示已经通过。使用合成账号/文件/密钥、独立磁盘、网络及快照；不得挂载宿主机现有 `/opt/luma`、真实备份或生产 Docker socket。每个破坏性场景从 VM 快照重建，不能在唯一恢复副本上实验。
+
+**版本前提**：固定包含待验收修改的已评审提交和旧版对照提交，记录 SHA、Ubuntu/Docker/Compose/PostgreSQL 版本。当前未提交改动不能用远端 main 的安装结果替代验收；旧安装迁入必须先验证旧工具生成的备份，再切换到待验收代码。不要为绕过版本门禁把已有测试或生产目录 reset 为另一版本。
+
+在隔离 VM 中可定义下面的只读检查入口（不要使用 `compose config` 无参数或打印整个容器环境，避免泄露插值后的密码）：
+
+```bash
+dc() { sudo docker compose --env-file /opt/luma/config/.env -f /opt/luma/app/deploy/docker-compose.yml "$@"; }
+dc config --quiet
+dc ps -a
+dc exec -T backend sh -c 'test "$LUMA_AUTO_MIGRATE" = false && test -z "${POSTGRES_PASSWORD+x}" && case "$DATABASE_URL" in postgres://luma_api:*) exit 0;; *) exit 1;; esac'
+dc exec -T postgres psql -X -U luma -d luma -v ON_ERROR_STOP=1 <<'SQL'
+SELECT rolname,rolsuper,rolcreatedb,rolcreaterole,rolreplication,rolbypassrls
+FROM pg_roles WHERE rolname='luma_api';
+SELECT has_database_privilege('luma_api','luma','CREATE') AS database_create,
+       has_database_privilege('luma_api','luma','TEMP') AS database_temp,
+       has_schema_privilege('luma_api','public','CREATE') AS schema_create,
+       has_table_privilege('luma_api','public.schema_migrations','UPDATE') AS ledger_update;
+SELECT version FROM schema_migrations ORDER BY version;
+SQL
+```
+
+上面的角色属性及四个权限应全为 `false`，迁移集合应与固定提交的 migration 一致；不能只看 API 能启动就判权限正确。现有 `TestRuntimeRoleBoundary` 覆盖的实际 DML/禁止权限及 dump/restore 后重授权不需在每轮开发重复执行，但容器镜像与已有卷切换仍须如下验收。
+
+| 场景 | 隔离环境步骤 | 必须观察到的结果 |
+| --- | --- | --- |
+| 新安装 | 固定测试版本执行安装，选择 IP 模式仅做无凭据健康检查；另用隔离测试域名/受信测试 CA 检查 TLS/WSS | `migrate`、`db-grants` 成功退出后 API/代理才就绪；`/health`、`/ready` 均正常。IP HTTP 成功不算 HTTPS 或认证通过。 |
+| 旧数据卷迁入 | 旧版写入合成账号、密文消息/附件，验证备份可解密；保存数据卷/配置快照，再显式运行新版 deploy | 原账号/表所有权及 HMAC/age 材料不变；仅增加运行口令。相同密文/行数可读，API 为 `luma_api`；失败保持停机，不退回管理员 API。 |
+| 迁移/授权失败 | 在 VM 分别制造不可用迁移和异常运行角色 ACL；运行维护入口，检查进程退出码 | 任一步失败不启动后续 API/Caddy；原数据和可用备份保留，异常权限不静默覆盖。人工修复后从同一状态续办。 |
+| 更新与自动补偿 | 从支持权限拆分的旧测试提交运行 `luma update`；分别在构建、迁移、授权、readiness 阶段制造失败 | 新版成功须 ready；失败恢复同一旧代码/配置/数据库/附件组合，恢复后重新授权。比较行数、密文摘要、版本和 API 角色；失败仍返回非零。 |
+| local/offline 备份 | local 模式创建并独立解密；offline 模式只配置外部公钥创建新归档，维护时按本指南临时提供内存私钥 | 归档不含 `.env`/私钥；旧钥可恢复旧归档但不能解密新 offline 归档。offline 无私钥时 backup 可加密，update/restore/rollback 在破坏性操作前拒绝。 |
+| 恢复预检 | 在副本上分别用错误 identity、篡改密文、删必要文件、制造空间不足；执行 restore | 非零退出；现有数据库/storage/config 摘要不变；不删除原归档或旧钥，不进入破坏性阶段。 |
+| 恢复中断 | 在日志持久化、原库快照验证、`db-mutating`、`storage-mutating`、就绪检查后等边界分别发送 TERM；另从 VM 快照做 SIGKILL/重启 | 要么整体完成，要么完整补偿，要么对外停机并保留 `restore-state`、原库加密快照及旧 storage。按 `luma restore recover` 续办；缺离线密钥时保持门禁，不能半库半文件运行。 |
+| 回滚/旧归档 | 新版回滚到支持权限拆分的已备份测试提交；再尝试旧管理员 API 提交；单独验证 `LUMA_RESTORE_KEEP_CODE=1` 恢复旧归档 | 兼容回滚保持四者一致，重新授权并 ready；不兼容代码在数据替换前拒绝。保留代码恢复旧数据仍做版本/完整性/HMAC/空间检查。 |
+| 进程异常及服务依赖 | 单独暂停/恢复 PG、Redis、API，重启 VM；中断维护时再重启 | `/health` 只表示 API 进程，依赖失败 `/ready` 为通用 503、无内部错误；维护中断须先显式 recover，不能仅凭容器 running 判成功。 |
+| 网络与其他应用隔离 | VM 内另建合成服务和冲突网段/占用端口；外部测试节点扫描 VM 端口 | 拒绝网段冲突，不停止其他服务；PG/Redis/8080 不可从外部直连。发现端口冲突停止排查，不自动杀占用进程。 |
+| 文件、WebSocket 和恢复后认证 | 用隔离测试客户端发送密文文件、下载校验、未授权下载及撤销；建立 WSS、断网重连后 cursor sync | 密文哈希一致、未授权拒绝、撤销旧连接失效、无重复事件；新角色有必要 DML。日志/通知不得出现正文、文件名、密钥或 Token。 |
+
+只记录提交、阶段、退出码、行数、密文摘要及权限断言；不要把 `docker inspect` 完整输出、`.env`、dump、Token 或设备密钥贴进报告。Docker restart 不会执行 Shell 恢复日志；存在 `restore-state` 时继续维护前必须按恢复门禁处理，需检查对外停机是否实际维持。出现日志与服务状态不符、旧配置未恢复或任一数据组合不一致即阻塞发布，保留 VM 证据供排查。
+
+真实 iOS、Face ID、目录证明与独立审计的验收要求统一记录在[安全治理报告](../Documentation/Security/Privacy_Boundary_Governance_2026-10-22.md#外部安全验收门槛待执行)，不以本章的 VM/逻辑设备测试代替。

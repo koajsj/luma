@@ -133,6 +133,13 @@ func (h *Hub) typing(r *http.Request, typ, cid string) {
 		h.send(did, frame)
 	}
 }
+func (h *Hub) active(r *http.Request, tokenHash []byte) bool {
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+	var active bool
+	err := h.DB.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM access_sessions a JOIN devices d ON d.id=a.device_id JOIN users u ON u.id=d.user_id WHERE a.device_id=$1 AND a.token_hash=$2 AND a.expires_at>now() AND a.revoked_at IS NULL AND d.revoked_at IS NULL AND u.disabled_at IS NULL)", middleware.Current(r).DeviceID, tokenHash).Scan(&active)
+	return err == nil && active
+}
 func (h *Hub) Serve(w http.ResponseWriter, r *http.Request) {
 	device := middleware.Current(r).DeviceID
 	tokenHash := crypto.Hash(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
@@ -156,12 +163,27 @@ func (h *Hub) Serve(w http.ResponseWriter, r *http.Request) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
+		window, frames := time.Now(), 0
 		for {
 			var in struct {
 				Type           string `json:"type"`
 				ConversationID string `json:"conversationID"`
 			}
 			if e := conn.ReadJSON(&in); e != nil {
+				return
+			}
+			if time.Since(window) >= time.Second {
+				window, frames = time.Now(), 0
+			}
+			frames++
+			if frames > 4 {
+				_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "frame rate exceeded"), time.Now().Add(5*time.Second))
+				return
+			}
+			if in.Type != "typing.started" && in.Type != "typing.stopped" {
+				continue
+			}
+			if !h.active(r, tokenHash) {
 				return
 			}
 			h.typing(r, in.Type, in.ConversationID)
@@ -179,8 +201,7 @@ func (h *Hub) Serve(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		case <-tick.C:
-			var active bool
-			if h.DB.QueryRow(r.Context(), "SELECT EXISTS(SELECT 1 FROM access_sessions a JOIN devices d ON d.id=a.device_id JOIN users u ON u.id=d.user_id WHERE a.device_id=$1 AND a.token_hash=$2 AND a.expires_at>now() AND a.revoked_at IS NULL AND d.revoked_at IS NULL AND u.disabled_at IS NULL)", device, tokenHash).Scan(&active) != nil || !active {
+			if !h.active(r, tokenHash) {
 				return
 			}
 			if conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(5*time.Second)) != nil {

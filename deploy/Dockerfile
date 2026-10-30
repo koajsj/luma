@@ -1,11 +1,11 @@
-FROM golang:1.24-alpine AS build
+FROM golang:1.27.3-alpine3.24 AS build
 WORKDIR /src
 COPY backend/go.mod backend/go.sum ./
 RUN go mod download
 COPY backend/ ./
 RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /luma ./cmd/luma
 
-FROM alpine:3.21
+FROM alpine:3.24.2
 RUN adduser -D -u 10001 luma && mkdir -p /app/storage && chown luma:luma /app/storage
 WORKDIR /app
 COPY --from=build --chown=luma:luma /luma /app/luma

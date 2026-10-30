@@ -5,6 +5,33 @@ import XCTest
 
 @MainActor
 final class LocalFoundationTests: XCTestCase {
+    func testOnlineRequestSignsUpgradeProofWithDeviceKey() async throws {
+        let keychain = KeychainManager(service: "app.luma.proof-v2.\(UUID())")
+        let store = RemoteSessionStore(keychain: keychain)
+        let signer = RemoteDeviceSigner(keychain: keychain)
+        let userID = "proof-v2-test", token = "test-only-access-token"
+        defer { try? store.clearAll(for: userID) }
+        let publicKey = try Curve25519.Signing.PublicKey(rawRepresentation: signer.publicKey(for: userID))
+        try store.save(.init(accessToken: token, refreshToken: "test-only-refresh", expiresIn: 900), for: userID)
+        HeldResponseURLProtocol.reset(Data("{}".utf8), suffix: "/never")
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [HeldResponseURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let client = try RemoteAPIClient(baseURL: URL(string: "https://proof.example.invalid")!,
+            userID: userID, store: store, signer: signer, session: session)
+        _ = try await client.request("GET", path: "/sync/events?cursor=0")
+        let request = try XCTUnwrap(HeldResponseURLProtocol.lastRequest)
+        let signature = try XCTUnwrap(Data(base64URL: try XCTUnwrap(
+            request.value(forHTTPHeaderField: "X-Device-Signature"))))
+        let timestamp = try XCTUnwrap(request.value(forHTTPHeaderField: "X-Device-Timestamp"))
+        let nonce = try XCTUnwrap(request.value(forHTTPHeaderField: "X-Device-Nonce"))
+        let digest = Data(SHA256.hash(data: Data(token.utf8))).base64URLEncodedString()
+        let suffix = "GET\n/v1/sync/events?cursor=0\n\(timestamp)\n\(nonce)\n\(digest)"
+        XCTAssertTrue(publicKey.isValidSignature(signature, for: Data("luma.request.v2\n\(suffix)".utf8)))
+        XCTAssertFalse(publicKey.isValidSignature(signature, for: Data("luma.request.v1\n\(suffix)".utf8)))
+    }
+
     func testConcurrentRequestsShareTokenRefresh() async throws {
         let keychain = KeychainManager(service: "app.luma.refresh.\(UUID().uuidString)")
         let store = RemoteSessionStore(keychain: keychain)
@@ -253,10 +280,15 @@ final class LocalFoundationTests: XCTestCase {
         XCTAssertTrue(IdentitySafetyCode.matches(IdentitySafetyCode.grouped(code), code: code))
         XCTAssertFalse(IdentitySafetyCode.matches(IdentitySafetyCode.make(alice, mallory), code: code))
     }
-    private func makeContext() throws -> ModelContext {
-        let container = try ModelContainer(for: User.self, Device.self, Friend.self, Conversation.self, Message.self, Attachment.self, UserPresence.self, Reaction.self, SearchIndexEntry.self, SessionKey.self, PreKeyMetadata.self, ChainState.self, RemoteSyncCheckpoint.self, RemoteDeviceTrust.self, OutgoingMessageQueueItem.self, CleanupState.self, V4DeviceMetadata.self, V4SessionMetadata.self,
-                                           configurations: ModelConfiguration(isStoredInMemoryOnly: true))
-        return ModelContext(container)
+    private func makeContext(url: URL? = nil, allowsSave: Bool = true) throws -> ModelContext {
+        let configuration: ModelConfiguration
+        if let url { configuration = ModelConfiguration(url: url, allowsSave: allowsSave) }
+        else { configuration = ModelConfiguration(isStoredInMemoryOnly: true) }
+        let container = try ModelContainer(for: User.self, Device.self, Friend.self, Conversation.self, Message.self, MessageTombstone.self, Attachment.self, UserPresence.self, Reaction.self, V4PendingEvent.self, SearchIndexEntry.self, SessionKey.self, PreKeyMetadata.self, ChainState.self, RemoteSyncCheckpoint.self, RemoteDeviceTrust.self, OutgoingMessageQueueItem.self, CleanupState.self, V4DeviceMetadata.self, V4SessionMetadata.self,
+                                           configurations: configuration)
+        let context = ModelContext(container)
+        context.autosaveEnabled = false
+        return context
     }
 
     func testPrivateProfileMigrationAndEncryptedPersistence() throws {
@@ -462,6 +494,18 @@ final class LocalFoundationTests: XCTestCase {
         }
         XCTAssertThrowsError(try manager.restore(backup, password: "backup-secret", into: user))
         XCTAssertEqual(try chat.displayContent(for: restored), "备份消息")
+        // A physically missing row must not make an old portable backup safe to
+        // restore over independently retained online deletion evidence.
+        restored.transportEncryptionVersion = 4; restored.remoteRevision = 1
+        restoredConversation.remoteID = UUID()
+        restoredFriend.identityFingerprint = String(repeating: "a", count: 64)
+        restored.deleted = true
+        try MessageStore(context: context, encryption: security.encryptionService()).migrateLegacyMessages(owner: user)
+        context.delete(restored)
+        try context.save()
+        XCTAssertEqual(try context.fetch(FetchDescriptor<MessageTombstone>()).count, 1)
+        XCTAssertThrowsError(try manager.restore(backup, password: "backup-secret", into: user))
+        XCTAssertThrowsError(try manager.export(user: user, password: "backup-secret"))
         let interrupted = CleanupState(ownerID: user.id, userID: user.userID, operation: "backupRestore")
         interrupted.dataCommitted = true; interrupted.state = RecoveryState.failed.rawValue
         let obsolete = "session-key.obsolete.\(UUID().uuidString)"
@@ -476,6 +520,7 @@ final class LocalFoundationTests: XCTestCase {
         XCTAssertNil(try keychain.read(obsolete))
         XCTAssertTrue(try context.fetch(FetchDescriptor<CleanupState>()).isEmpty)
         try security.deleteAccount(password: "password123", user: user, context: context)
+        XCTAssertTrue(try context.fetch(FetchDescriptor<MessageTombstone>()).isEmpty)
     }
 
     func testEncryptedOutboxRetriesSameRequestAfterOfflineFailure() async throws {
@@ -791,6 +836,388 @@ final class LocalFoundationTests: XCTestCase {
             if scenario == "locked" { try security.verifyPIN("123456", context: context) }
         }
     }
+    func testV4TombstoneSchemaMigrationPreservesDeletionEvidence() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("luma-tombstone-\(UUID())")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        // SwiftData retains SQLite handles beyond container deinit. Keep this
+        // isolated fixture in system tmp until process exit; never unlink a live store.
+        let url = directory.appendingPathComponent("test.store")
+        let encryption = EncryptionService(key: SymmetricKey(size: .bits256))
+        let legacyTypes: [any PersistentModel.Type] = [User.self, Friend.self, Conversation.self, Message.self,
+            Attachment.self, Reaction.self, SearchIndexEntry.self, SessionKey.self, ChainState.self]
+        let remoteID = UUID()
+        var removedID = UUID()
+        try autoreleasepool {
+            let container = try ModelContainer(for: Schema(legacyTypes), configurations: ModelConfiguration(url: url))
+            let context = ModelContext(container)
+            let user = User(userID: "alice", nickname: "", passwordHash: "fixture")
+            let friend = Friend(ownerID: user.id, userID: "bob", nickname: "")
+            friend.identityFingerprint = String(repeating: "a", count: 64)
+            let conversation = Conversation(ownerID: user.id, friendID: friend.id)
+            conversation.remoteID = remoteID
+            let message = Message(conversationID: conversation.id, type: .text, isMine: false, senderID: "bob")
+            removedID = message.id
+            message.transportEncryptionVersion = 4; message.remoteRevision = 3
+            message.deleted = true; message.lastEventID = UUID()
+            message.ciphertext = try encryption.encrypt(Data("removed secret".utf8), authenticatedData:
+                Data("luma-message-v1|\(message.id.uuidString)|\(conversation.id.uuidString)".utf8)).bytes
+            context.insert(user); context.insert(friend); context.insert(conversation); context.insert(message)
+            context.insert(Reaction(messageID: message.id, emoji: "👍", reactorID: "bob"))
+            try context.save()
+        }
+        try autoreleasepool {
+            let container = try ModelContainer(for: Schema(legacyTypes + [MessageTombstone.self]),
+                configurations: ModelConfiguration(url: url))
+            let context = ModelContext(container)
+            let owner = try XCTUnwrap(context.fetch(FetchDescriptor<User>()).first)
+            let conversation = try XCTUnwrap(context.fetch(FetchDescriptor<Conversation>()).first)
+            let message = try XCTUnwrap(context.fetch(FetchDescriptor<Message>()).first)
+            let store = MessageStore(context: context, encryption: encryption)
+            let invalid = Message(conversationID: conversation.id, type: .text, isMine: false, senderID: "bob")
+            invalid.transportEncryptionVersion = 4; invalid.remoteRevision = 1; invalid.deleted = true
+            invalid.ciphertext = Data([0])
+            invalid.expiresAt = .distantPast
+            context.insert(invalid); try context.save()
+            XCTAssertThrowsError(try store.purgeExpired(in: conversation), "Corrupt content cannot be laundered into a trusted tombstone")
+            context.rollback()
+            XCTAssertTrue(try context.fetch(FetchDescriptor<MessageTombstone>()).isEmpty)
+            XCTAssertThrowsError(try store.migrateLegacyMessages(owner: owner))
+            context.rollback()
+            XCTAssertTrue(try context.fetch(FetchDescriptor<MessageTombstone>()).isEmpty)
+            let durable = ModelContext(container)
+            let durableOriginal = try XCTUnwrap(durable.fetch(FetchDescriptor<Message>()).first { $0.id == removedID })
+            XCTAssertEqual(try MessageStore(context: durable, encryption: encryption).displayContent(for: durableOriginal),
+                "removed secret", "Failed migration must retain the durable original")
+            context.delete(invalid); try context.save()
+            try store.migrateLegacyMessages(owner: owner)
+            try store.migrateLegacyMessages(owner: owner) // Idempotent authenticated-unlock migration.
+            XCTAssertEqual(try context.fetch(FetchDescriptor<MessageTombstone>()).count, 1)
+            XCTAssertEqual(try store.displayContent(for: message), "removed secret", "Migration must not erase legacy protected data")
+            XCTAssertEqual(try context.fetch(FetchDescriptor<Reaction>()).count, 1)
+            try store.retainV4Tombstone(for: message) // Existing deletion cleanup, separate from migration.
+            try context.save()
+            XCTAssertEqual(try store.displayContent(for: message), "")
+            XCTAssertTrue(try context.fetch(FetchDescriptor<Reaction>()).isEmpty)
+            context.delete(message); try context.save()
+            let reopened = ModelContext(container)
+            let reopenedOwner = try XCTUnwrap(reopened.fetch(FetchDescriptor<User>()).first)
+            let recoveredStore = MessageStore(context: reopened, encryption: encryption)
+            let record = try XCTUnwrap(reopened.fetch(FetchDescriptor<MessageTombstone>()).first)
+            let intact = record.encryptedRecord
+            record.encryptedRecord[record.encryptedRecord.count - 1] ^= 1
+            XCTAssertThrowsError(try recoveredStore.restoreV4Tombstone(messageID: removedID,
+                remoteConversationID: remoteID, owner: reopenedOwner))
+            record.encryptedRecord = intact
+            XCTAssertThrowsError(try recoveredStore.restoreV4Tombstone(messageID: removedID,
+                remoteConversationID: UUID(), owner: reopenedOwner))
+            XCTAssertTrue(try reopened.fetch(FetchDescriptor<Message>()).isEmpty)
+            let hidden = try XCTUnwrap(recoveredStore.restoreV4Tombstone(messageID: removedID,
+                remoteConversationID: remoteID, owner: reopenedOwner))
+            XCTAssertTrue(hidden.deleted); XCTAssertFalse(hidden.deletedForEveryone)
+            XCTAssertEqual(hidden.remoteRevision, 3)
+            XCTAssertEqual(try recoveredStore.displayContent(for: hidden), "")
+            XCTAssertThrowsError(try recoveredStore.receiveVerifiedRemote(messageID: removedID,
+                plaintext: Data("must not return".utf8), from: "bob", in: conversation, at: .now,
+                senderDeviceID: UUID(), eventID: UUID(), isMine: false, transportVersion: 3))
+            XCTAssertEqual(try recoveredStore.displayContent(for: hidden), "")
+        }
+    }
+
+    func testV4ReactionOrderPersistenceAndCompatibility() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("luma-reactions-\(UUID())")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("test.store")
+        let context = try makeContext(url: url)
+        let keychain = KeychainManager(service: "app.luma.reaction-order.\(UUID())")
+        let security = SecurityManager(keychain: keychain)
+        let name = "react_" + UUID().uuidString.prefix(8).lowercased()
+        try security.register(userID: name, nickname: "Alice", password: "password123", context: context)
+        try security.setPIN("123456", context: context)
+        defer { try? keychain.deleteAccounts(prefix: "") }
+        let user = try XCTUnwrap(LocalRepository(context: context).user(name))
+        let friend = Friend(ownerID: user.id, userID: "bob", nickname: "Bob")
+        friend.remoteUserID = UUID(); friend.identityFingerprint = "test-pinned-identity"
+        let conversation = Conversation(ownerID: user.id, friendID: friend.id)
+        conversation.remoteID = UUID()
+        let message = Message(conversationID: conversation.id, type: .text, isMine: true, senderID: name)
+        message.transportEncryptionVersion = 4; message.remoteRevision = 1
+        message.ciphertext = try security.encryptionService().encrypt(Data("original".utf8), authenticatedData:
+            Data("luma-message-v1|\(message.id.uuidString)|\(conversation.id.uuidString)".utf8)).bytes
+        context.insert(friend); context.insert(conversation); context.insert(message); try context.save()
+        let registration = RemoteRegistration(backendUserID: UUID(), backendDeviceID: UUID(),
+            baseURL: URL(string: "https://reaction.example.invalid")!)
+        let client = try RemoteAPIClient(baseURL: registration.baseURL, userID: name,
+            store: RemoteSessionStore(keychain: keychain), signer: RemoteDeviceSigner(keychain: keychain))
+        func repository(_ context: ModelContext) throws -> RemoteMessageRepository {
+            .init(context: context, user: try XCTUnwrap(LocalRepository(context: context).user(name)),
+                security: security, client: client, registration: registration)
+        }
+        let repo = try repository(context)
+        func event(_ counter: UInt64?, _ action: String, emoji: String = "👍",
+                   actor: UUID? = nil, device: UUID? = nil, id: UUID = UUID(), version: Int = 1) -> V4EventEnvelope {
+            .init(eventID: id, messageID: message.id, conversationID: conversation.remoteID!,
+                actorUserID: actor ?? registration.backendUserID, actorDeviceID: device ?? registration.backendDeviceID,
+                kind: .reaction, revision: 1, text: emoji, reactionAction: action,
+                occurredAt: Date(timeIntervalSince1970: 123),
+                reactionOrder: counter.map { .init(version: version, counter: $0) })
+        }
+        func visible(_ context: ModelContext, _ reactor: String) throws -> String? {
+            (try context.fetch(FetchDescriptor<Reaction>())).first { $0.messageID == message.id && $0.reactorID == reactor }?.emoji
+        }
+        let add = event(1, "add"), remove = event(2, "remove")
+        try repo.applyOwnV4Event(add); XCTAssertEqual(try visible(context, name), "👍")
+        try repo.applyOwnV4Event(remove); XCTAssertNil(try visible(context, name))
+        // Replay the old add after disk reopen; the remove's causal stamp survives.
+        let reopened = try makeContext(url: url), restarted = try repository(reopened)
+        try restarted.applyOwnV4Event(add); XCTAssertNil(try visible(reopened, name))
+        let unseenAdd = event(3, "add"), unseenRemove = event(4, "remove")
+        try restarted.applyOwnV4Event(unseenRemove); try restarted.applyOwnV4Event(unseenAdd)
+        XCTAssertNil(try visible(reopened, name))
+        let newer = event(5, "add", emoji: "❤️")
+        try restarted.applyOwnV4Event(newer); try restarted.applyOwnV4Event(remove)
+        XCTAssertEqual(try visible(reopened, name), "❤️")
+        try restarted.applyOwnV4Event(event(2, "add", emoji: "😂"))
+        XCTAssertEqual(try visible(reopened, name), "❤️")
+        XCTAssertThrowsError(try restarted.applyOwnV4Event(event(5, "remove", emoji: "❤️", id: newer.eventID)))
+        XCTAssertEqual(try visible(reopened, name), "❤️")
+        try restarted.applyOwnV4Event(event(nil, "remove", emoji: "❤️"))
+        XCTAssertEqual(try visible(reopened, name), "❤️", "Legacy v4 operations are authenticated no-ops")
+        XCTAssertThrowsError(try restarted.applyOwnV4Event(event(4, "remove", version: 2)))
+        try restarted.applyOwnV4Event(event(1, "add", emoji: "😂", actor: friend.remoteUserID))
+        XCTAssertEqual(try visible(reopened, "bob"), "😂")
+        XCTAssertEqual(try visible(reopened, name), "❤️")
+        // Both delivery orders must select the same concurrent device operation.
+        let low = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
+        let high = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
+        for (counter, reverse) in [(UInt64(6), false), (7, true)] {
+            let a = event(counter, "remove", device: low), b = event(counter, "add", emoji: "😂", device: high)
+            for item in reverse ? [b, a] : [a, b] { try restarted.applyOwnV4Event(item) }
+            XCTAssertEqual(try visible(reopened, name), "😂")
+        }
+        let concurrent = [event(12, "add", device: low), event(12, "remove", device: high)]
+        var forward = V4ReactionLedger(), backward = V4ReactionLedger()
+        for item in concurrent { _ = try forward.accept(item) }
+        for item in concurrent.reversed() { _ = try backward.accept(item) }
+        XCTAssertEqual(forward.winners, backward.winners)
+        XCTAssertEqual(forward.receipts, backward.receipts)
+        // Local Lamport allocation includes encrypted offline work, not server time.
+        var saved = try XCTUnwrap(reopened.fetch(FetchDescriptor<Message>()).first { $0.id == message.id })
+        let savedConversation = try XCTUnwrap(reopened.fetch(FetchDescriptor<Conversation>()).first { $0.id == conversation.id })
+        let next = try restarted.makeV4ReactionEvent("😂", message: saved, conversation: savedConversation)
+        XCTAssertEqual(next.reactionOrder?.counter, 8); XCTAssertEqual(next.reactionAction, "remove")
+        let pending = V4PendingEvent(eventID: next.eventID, ownerID: user.id,
+            backendDeviceID: registration.backendDeviceID, messageID: message.id, encryptedRequest: Data())
+        pending.encryptedPayload = try security.encryptionService().encrypt(JSONEncoder().encode(next), authenticatedData:
+            Data("luma-v4-event-outbox|\(user.id.uuidString)|\(registration.backendDeviceID.uuidString)|\(next.eventID.uuidString)".utf8)).bytes
+        reopened.insert(pending); try reopened.save()
+        let afterPending = try restarted.makeV4ReactionEvent("😂", message: saved, conversation: savedConversation)
+        XCTAssertEqual(afterPending.reactionOrder?.counter, 9); XCTAssertEqual(afterPending.reactionAction, "add")
+        // Real read-only SwiftData save failure must roll back both row and ledger.
+        let readonly = try makeContext(url: url, allowsSave: false), refusing = try repository(readonly)
+        XCTAssertThrowsError(try refusing.applyOwnV4Event(event(9, "remove")))
+        XCTAssertEqual(try visible(try makeContext(url: url), name), "😂")
+        let originalState = saved.encryptedReactionState
+        // A failed authentication leaves the encrypted operation state untouched.
+        var damaged = try XCTUnwrap(saved.encryptedReactionState); damaged[damaged.count - 1] ^= 1
+        saved.encryptedReactionState = damaged
+        XCTAssertThrowsError(try restarted.applyOwnV4Event(event(10, "remove")))
+        reopened.rollback()
+        saved = try XCTUnwrap(reopened.fetch(FetchDescriptor<Message>()).first { $0.id == message.id })
+        XCTAssertEqual(saved.encryptedReactionState, originalState)
+        // Expiration before periodic cleanup cannot recreate a visible reaction.
+        saved.expiresAt = .distantPast; try reopened.save()
+        try restarted.applyOwnV4Event(event(10, "add"))
+        XCTAssertNil(try visible(reopened, name)); XCTAssertNil(try visible(reopened, "bob"))
+        try MessageStore(context: reopened, encryption: security.encryptionService()).purgeExpired(in: savedConversation)
+        let retainedState = saved.encryptedReactionState
+        reopened.delete(saved); try reopened.save()
+        let hidden = try XCTUnwrap(MessageStore(context: reopened, encryption: security.encryptionService())
+            .restoreV4Tombstone(messageID: message.id, remoteConversationID: conversation.remoteID!, owner: user))
+        XCTAssertEqual(hidden.encryptedReactionState, retainedState)
+        try reopened.save()
+        try restarted.applyOwnV4Event(event(11, "add"))
+        XCTAssertTrue(hidden.deleted); XCTAssertNil(try visible(reopened, name))
+        XCTAssertEqual(try MessageStore(context: reopened, encryption: security.encryptionService()).displayContent(for: hidden), "")
+    }
+
+    func testV4ReactionSyncReorderingAndRecovery() async throws {
+        struct Request: Decodable {
+            struct Recipient: Decodable { let ciphertext: String }
+            let recipientEnvelopes: [Recipient]
+        }
+        let directoryURL = FileManager.default.temporaryDirectory.appendingPathComponent("luma-reaction-sync-\(UUID())")
+        try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directoryURL) }
+        let url = directoryURL.appendingPathComponent("test.store")
+        var context = try makeContext(url: url)
+        let keychain = KeychainManager(service: "app.luma.reaction-sync.\(UUID())")
+        let security = SecurityManager(keychain: keychain)
+        let name = "rsync_" + UUID().uuidString.prefix(8).lowercased()
+        try security.register(userID: name, nickname: "Alice", password: "password123", context: context)
+        try security.setPIN("123456", context: context)
+        let user = try XCTUnwrap(LocalRepository(context: context).user(name))
+        let peerAccount = P256.Signing.PrivateKey(), peerUser = UUID(), peerDevice = UUID()
+        let friend = Friend(ownerID: user.id, userID: "bob", nickname: "Bob")
+        friend.remoteUserID = peerUser
+        friend.identityFingerprint = IdentityFingerprint.make(publicKey: peerAccount.publicKey.x963Representation)
+        let conversation = Conversation(ownerID: user.id, friendID: friend.id); conversation.remoteID = UUID()
+        let message = Message(conversationID: conversation.id, type: .text, isMine: false, senderID: "bob")
+        message.transportEncryptionVersion = 4; message.remoteRevision = 1
+        message.ciphertext = try security.encryptionService().encrypt(Data("original".utf8), authenticatedData:
+            Data("luma-message-v1|\(message.id.uuidString)|\(conversation.id.uuidString)".utf8)).bytes
+        context.insert(friend); context.insert(conversation); context.insert(message); try context.save()
+        let registration = RemoteRegistration(backendUserID: UUID(), backendDeviceID: UUID(),
+            baseURL: URL(string: "https://reaction-sync.example.invalid")!)
+        let store = RemoteSessionStore(keychain: keychain), signer = RemoteDeviceSigner(keychain: keychain)
+        _ = try signer.publicKey(for: name)
+        try store.save(.init(accessToken: "test-access", refreshToken: "test-refresh", expiresIn: 900), for: name)
+        let configuration = URLSessionConfiguration.ephemeral; configuration.protocolClasses = [HeldResponseURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        let client = try RemoteAPIClient(baseURL: registration.baseURL, userID: name, store: store, signer: signer, session: session)
+        let vault = V4SessionVault(), senderVault = V4SessionVault(keychain: keychain)
+        defer {
+            session.invalidateAndCancel()
+            try? vault.purgeAccount(userID: name)
+            try? keychain.deleteAccounts(prefix: "")
+        }
+        let own = V4IdentityKeys(), ownSigned = Curve25519.KeyAgreement.PrivateKey(), otp = Curve25519.KeyAgreement.PrivateKey()
+        let ownBundle = try V4Handshake.bundle(deviceID: registration.backendDeviceID, version: 1,
+            identity: own, signedPreKey: ownSigned, oneTimePreKey: otp)
+        try vault.saveDevice(.init(formatVersion: 1, deviceID: registration.backendDeviceID, keyVersion: 1,
+            identityAgreement: own.agreement.rawRepresentation, identitySigning: own.signing.rawRepresentation,
+            signedPreKey: ownSigned.rawRepresentation,
+            oneTimePreKeys: [otp.publicKey.rawRepresentation.base64EncodedString(): otp.rawRepresentation]), userID: name)
+        let peer = V4IdentityKeys(), peerSigned = Curve25519.KeyAgreement.PrivateKey()
+        let bundle = try V4Handshake.bundle(deviceID: peerDevice, version: 1, identity: peer,
+            signedPreKey: peerSigned, oneTimePreKey: nil)
+        try senderVault.saveDevice(.init(formatVersion: 1, deviceID: peerDevice, keyVersion: 1,
+            identityAgreement: peer.agreement.rawRepresentation, identitySigning: peer.signing.rawRepresentation,
+            signedPreKey: peerSigned.rawRepresentation, oneTimePreKeys: [:]), userID: "sender")
+        let binding = V4Handshake.fields("luma.v4.binding", [Data(peerDevice.uuidString.lowercased().utf8),
+            Data("1".utf8), bundle.identityAgreementPublicKey, bundle.identitySigningPublicKey])
+        let directory = try JSONSerialization.data(withJSONObject: [[
+            "accountIdentityPublicKey": peerAccount.publicKey.x963Representation.base64URLEncodedString(),
+            "deviceID": peerDevice.uuidString, "keyVersion": 1,
+            "identityAgreementPublicKey": bundle.identityAgreementPublicKey.base64URLEncodedString(),
+            "identitySigningPublicKey": bundle.identitySigningPublicKey.base64URLEncodedString(),
+            "identityBindingSignature": try peerAccount.signature(for: binding).derRepresentation.base64URLEncodedString(),
+            "signedPreKeyPublicKey": bundle.signedPreKeyPublicKey.base64URLEncodedString(),
+            "signedPreKeySignature": bundle.signedPreKeySignature.base64URLEncodedString(), "oneTimePreKeyPublicKey": ""]])
+        let sender = V4MessageSessionService(vault: senderVault, userID: "sender", localDeviceID: peerDevice)
+        func repository(_ context: ModelContext) throws -> RemoteMessageRepository {
+            .init(context: context, user: try XCTUnwrap(LocalRepository(context: context).user(name)), security: security,
+                client: client, registration: registration)
+        }
+        func event(_ counter: UInt64?, _ action: String, id: UUID = UUID(), emoji: String = "👍", version: Int = 1) -> V4EventEnvelope {
+            .init(eventID: id, messageID: message.id, conversationID: conversation.remoteID!,
+                actorUserID: peerUser, actorDeviceID: peerDevice, kind: .reaction, revision: 1,
+                text: emoji, reactionAction: action, occurredAt: Date(timeIntervalSince1970: 456),
+                reactionOrder: counter.map { .init(version: version, counter: $0) })
+        }
+        func seal(_ body: V4EventEnvelope) throws -> V4RatchetMessage {
+            let request = try sender.prepareEvent(body, targets: [.init(remoteUserID: registration.backendUserID, bundle: ownBundle)])
+            try sender.commitPreparedSend(messageID: body.eventID)
+            let bytes = try XCTUnwrap(Data(base64URL: XCTUnwrap(JSONDecoder().decode(Request.self, from: request).recipientEnvelopes.first).ciphertext))
+            return try JSONDecoder().decode(V4RatchetMessage.self, from: bytes)
+        }
+        func remote(_ body: V4EventEnvelope, _ sealed: V4RatchetMessage, seq: Int64) throws -> RemoteSyncEvent {
+            .init(eventID: UUID(), deviceSeq: seq, type: body.kind.rawValue,
+                payloadCiphertext: try JSONEncoder().encode(sealed).base64URLEncodedString(),
+                routing: .init(messageID: message.id, conversationID: conversation.remoteID,
+                    senderDeviceID: peerDevice, senderUserID: peerUser, encryptionVersion: 4, keyVersion: 1,
+                    messageKeyIndex: Int64(sealed.messageIndex), revision: 1, recipientDeviceID: registration.backendDeviceID,
+                    revokedDeviceID: nil, mutationEventID: body.eventID), createdAt: "2026-10-23T00:00:00Z")
+        }
+        func responses(_ item: RemoteSyncEvent) throws {
+            let page = try JSONSerialization.data(withJSONObject: ["nextCursor": item.deviceSeq, "events": [[
+                "eventID": item.eventID.uuidString, "deviceSeq": item.deviceSeq, "type": item.type,
+                "payloadCiphertext": item.payloadCiphertext, "createdAt": item.createdAt,
+                "routing": ["messageID": message.id.uuidString, "conversationID": conversation.remoteID!.uuidString,
+                    "senderDeviceID": peerDevice.uuidString, "senderUserID": peerUser.uuidString,
+                    "encryptionVersion": 4, "keyVersion": 1, "messageKeyIndex": item.routing.messageKeyIndex!, "revision": 1,
+                    "recipientDeviceID": registration.backendDeviceID.uuidString,
+                    "mutationEventID": item.routing.mutationEventID!.uuidString]]]])
+            HeldResponseURLProtocol.reset(Data(), suffix: "/never", responses: ["/v1/sync/events": page,
+                "/v1/users/\(peerUser.uuidString.lowercased())/v4-prekey-bundle": directory])
+        }
+        func sync(_ item: RemoteSyncEvent) async throws {
+            try responses(item)
+            let count = try await RemoteSyncCoordinator(repository: repository(context)).sync()
+            XCTAssertEqual(count, 1)
+            XCTAssertEqual(try context.fetch(FetchDescriptor<RemoteSyncCheckpoint>()).first?.cursor, item.deviceSeq)
+            XCTAssertNil(try vault.incomingPending(userID: name, deviceID: registration.backendDeviceID))
+        }
+        func visible() throws -> String? { (try context.fetch(FetchDescriptor<Reaction>())).first { $0.messageID == message.id }?.emoji }
+        // Establish the actual session; the old unversioned event is a no-op.
+        let seed = event(nil, "add"), seedWire = try seal(seed)
+        try await sync(remote(seed, seedWire, seq: 1)); XCTAssertNil(try visible())
+        let add = event(1, "add"), addWire = try seal(add)
+        let remove = event(2, "remove"), removeWire = try seal(remove)
+        try await sync(remote(remove, removeWire, seq: 2)); XCTAssertNil(try visible())
+        // Force a bidirectional DH ratchet before the old chain's add arrives.
+        let recipient = V4MessageSessionService(vault: vault, userID: name, localDeviceID: registration.backendDeviceID)
+        let replyID = UUID(), reply = try recipient.prepare(Data("reply".utf8), messageID: replyID,
+            conversationID: conversation.remoteID!, targets: [.init(remoteUserID: peerUser, bundle: bundle)])
+        try recipient.commitPreparedSend(messageID: replyID)
+        let replyBytes = try XCTUnwrap(Data(base64URL: XCTUnwrap(JSONDecoder().decode(Request.self, from: reply).recipientEnvelopes.first).ciphertext))
+        let replyEnvelope = try JSONDecoder().decode(V4RatchetMessage.self, from: replyBytes), replySync = UUID()
+        _ = try sender.decrypt(replyEnvelope, wire: replyBytes, eventID: replySync, deviceSeq: 1,
+            senderUserID: registration.backendUserID, senderBundle: ownBundle)
+        try sender.finishReceived(eventID: replySync)
+        let newer = event(3, "add", emoji: "❤️"), newerWire = try seal(newer)
+        XCTAssertEqual(newerWire.messageIndex, 0)
+        XCTAssertNotEqual(newerWire.ratchetPublicKey, addWire.ratchetPublicKey)
+        let incoming = try remote(newer, newerWire, seq: 3)
+        // Persist application, interrupt before cursor/ratchet commit, then reopen.
+        try responses(incoming)
+        try await repository(context).applyV4(incoming)
+        XCTAssertNotNil(try vault.incomingPending(userID: name, deviceID: registration.backendDeviceID))
+        context = try makeContext(url: url)
+        try await sync(incoming); XCTAssertEqual(try visible(), "❤️")
+        let version = try XCTUnwrap(vault.loadSession(userID: name, local: registration.backendDeviceID, remote: peerDevice)).stateVersion
+        try await sync(remote(add, addWire, seq: 4))
+        XCTAssertEqual(try visible(), "❤️", "Old chain index 1 cannot beat new chain index 0 / operation 3")
+        XCTAssertEqual(try vault.loadSession(userID: name, local: registration.backendDeviceID, remote: peerDevice)?.stateVersion, version + 1)
+        // Already processed ciphertext must fail without cursor/ratchet advancement.
+        try responses(remote(add, addWire, seq: 5))
+        do { _ = try await RemoteSyncCoordinator(repository: repository(context)).sync(); XCTFail("Replay accepted") }
+        catch {
+            // A spent old DH-chain envelope may reject while validating its chain
+            // length, before the same-chain replay check. Neither may mutate state.
+            XCTAssertTrue([V4ProtocolError.replay, .tooManySkipped].contains { $0 == error as? V4ProtocolError })
+        }
+        XCTAssertEqual(try context.fetch(FetchDescriptor<RemoteSyncCheckpoint>()).first?.cursor, 4)
+        XCTAssertEqual(try vault.loadSession(userID: name, local: registration.backendDeviceID, remote: peerDevice)?.stateVersion, version + 1)
+        let finalRemove = event(4, "remove", emoji: "❤️"), finalWire = try seal(finalRemove)
+        var altered = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(finalWire)) as? [String: Any])
+        altered["authenticationTag"] = Data(repeating: 0, count: 16).base64EncodedString()
+        let invalid = try JSONDecoder().decode(V4RatchetMessage.self, from: JSONSerialization.data(withJSONObject: altered))
+        try responses(remote(finalRemove, invalid, seq: 5))
+        do { _ = try await RemoteSyncCoordinator(repository: repository(context)).sync(); XCTFail("Bad tag accepted") } catch { }
+        XCTAssertEqual(try context.fetch(FetchDescriptor<RemoteSyncCheckpoint>()).first?.cursor, 4)
+        XCTAssertNil(try vault.incomingPending(userID: name, deviceID: registration.backendDeviceID))
+        let last = try remote(finalRemove, finalWire, seq: 5)
+        // A real read-only persistent-store failure leaves the receive journal intact.
+        try responses(last)
+        let readonly = try makeContext(url: url, allowsSave: false)
+        do { _ = try await RemoteSyncCoordinator(repository: repository(readonly)).sync(); XCTFail("Save unexpectedly succeeded") } catch { }
+        XCTAssertEqual(try makeContext(url: url).fetch(FetchDescriptor<RemoteSyncCheckpoint>()).first?.cursor, 4)
+        XCTAssertNotNil(try vault.incomingPending(userID: name, deviceID: registration.backendDeviceID))
+        try await sync(last); XCTAssertNil(try visible())
+        // Fresh ciphertext carrying the exact same operation is business-idempotent.
+        let duplicateWire = try seal(finalRemove)
+        try await sync(remote(finalRemove, duplicateWire, seq: 6)); XCTAssertNil(try visible())
+        let conflicting = event(4, "add", id: finalRemove.eventID, emoji: "😂")
+        let conflictWire = try seal(conflicting)
+        try responses(remote(conflicting, conflictWire, seq: 7))
+        do { _ = try await RemoteSyncCoordinator(repository: repository(context)).sync(); XCTFail("ID equivocation accepted") }
+        catch { XCTAssertEqual(error as? V4ProtocolError, .invalidMessage) }
+        XCTAssertEqual(try context.fetch(FetchDescriptor<RemoteSyncCheckpoint>()).first?.cursor, 6)
+        XCTAssertNotNil(try vault.incomingPending(userID: name, deviceID: registration.backendDeviceID))
+        XCTAssertNil(try visible())
+    }
+
     func testV4ReceiveRechecksTrustAfterDirectoryLookup() async throws {
         struct Request: Decodable {
             struct Recipient: Decodable { let ciphertext: String }
@@ -830,13 +1257,17 @@ final class LocalFoundationTests: XCTestCase {
             store: store, signer: signer, session: session)
         let repository = RemoteMessageRepository(context: context, user: user, security: security,
             client: client, registration: registration)
+        let accountIdentity = try P256.Signing.PrivateKey(rawRepresentation:
+            keychain.readRequired("identity-private.\(name)"))
         let ownIdentity = V4IdentityKeys(), ownSigned = Curve25519.KeyAgreement.PrivateKey()
         let ownBundle = try V4Handshake.bundle(deviceID: registration.backendDeviceID, version: 1,
             identity: ownIdentity, signedPreKey: ownSigned, oneTimePreKey: nil)
         // A distinct initial session per scenario avoids replacing any committed ratchet.
         for kind in ["message.created", "message.edited"] {
-            for scenario in ["identityChanged", "fingerprintChanged", "locked", "accountChanged", "available", "relabeledEdit"] {
-                if scenario == "relabeledEdit" && kind != "message.created" { continue }
+            for scenario in ["missingHistory", "identityChanged", "fingerprintChanged", "locked", "accountChanged", "available", "relabeledEdit", "legacyMissingCreation", "deletedPendingCreation", "expired", "expiredMissingRow", "legacyTombstone", "ownDevice", "ownDeviceLegacyMetadata"] {
+                if ["relabeledEdit", "legacyMissingCreation", "deletedPendingCreation"].contains(scenario) && kind != "message.created" { continue }
+                if scenario == "missingHistory" && kind != "message.edited" { continue }
+                if (scenario.hasPrefix("expired") || scenario == "legacyTombstone") && kind != "message.edited" { continue }
                 try vault.saveDevice(.init(formatVersion: 1, deviceID: registration.backendDeviceID, keyVersion: 1,
                     identityAgreement: ownIdentity.agreement.rawRepresentation,
                     identitySigning: ownIdentity.signing.rawRepresentation,
@@ -848,33 +1279,56 @@ final class LocalFoundationTests: XCTestCase {
                     identityAgreement: peerIdentity.agreement.rawRepresentation,
                     identitySigning: peerIdentity.signing.rawRepresentation,
                     signedPreKey: peerSigned.rawRepresentation, oneTimePreKeys: [:]), userID: "sender")
+                let fromOwnDevice = scenario.hasPrefix("ownDevice")
+                let actorAccount = fromOwnDevice ? accountIdentity : peerAccount
+                let actorUser = fromOwnDevice ? registration.backendUserID : peerUser
+                let actorName = fromOwnDevice ? name : friend.userID
+                if scenario == "ownDeviceLegacyMetadata" {
+                    // Older clients incorrectly associated a same-account device with a chat's friend.
+                    context.insert(V4SessionMetadata(ownerID: user.id, friendID: friend.id,
+                        localDeviceID: registration.backendDeviceID, remoteDeviceID: peerDevice))
+                }
                 let binding = V4Handshake.fields("luma.v4.binding", [Data(peerDevice.uuidString.lowercased().utf8),
                     Data("1".utf8), bundle.identityAgreementPublicKey, bundle.identitySigningPublicKey])
-                let directory: [[String: Any]] = [["accountIdentityPublicKey": peerAccount.publicKey.x963Representation.base64URLEncodedString(),
+                let directory: [[String: Any]] = [["accountIdentityPublicKey": actorAccount.publicKey.x963Representation.base64URLEncodedString(),
                     "deviceID": peerDevice.uuidString, "keyVersion": 1,
                     "identityAgreementPublicKey": bundle.identityAgreementPublicKey.base64URLEncodedString(),
                     "identitySigningPublicKey": bundle.identitySigningPublicKey.base64URLEncodedString(),
-                    "identityBindingSignature": try peerAccount.signature(for: binding).derRepresentation.base64URLEncodedString(),
+                    "identityBindingSignature": try actorAccount.signature(for: binding).derRepresentation.base64URLEncodedString(),
                     "signedPreKeyPublicKey": bundle.signedPreKeyPublicKey.base64URLEncodedString(),
                     "signedPreKeySignature": bundle.signedPreKeySignature.base64URLEncodedString(), "oneTimePreKeyPublicKey": ""]]
-                let message = Message(conversationID: conversation.id, type: .text, isMine: false, senderID: friend.userID)
+                let message = Message(conversationID: conversation.id, type: .text, isMine: fromOwnDevice, senderID: actorName)
                 message.transportEncryptionVersion = 4; message.remoteRevision = 1
                 message.ciphertext = try security.encryptionService().encrypt(Data("original".utf8), authenticatedData:
                     Data("luma-message-v1|\(message.id.uuidString)|\(conversation.id.uuidString)".utf8)).bytes
                 let eventID = UUID(), mutationID = UUID()
                 let payload: Data
                 if kind == "message.edited" {
-                    context.insert(message)
+                    if scenario != "missingHistory" { context.insert(message) }
                     payload = try JSONEncoder().encode(V4EventEnvelope(eventID: mutationID, messageID: message.id,
-                        conversationID: conversation.remoteID!, actorUserID: peerUser, actorDeviceID: peerDevice,
+                        conversationID: conversation.remoteID!, actorUserID: actorUser, actorDeviceID: peerDevice,
                         kind: .edit, revision: 2, text: "changed", reactionAction: nil, occurredAt: .now))
                 } else {
-                    var body: [String: Any] = ["kind": "text", "senderUserID": friend.userID,
-                        "targetUserID": name, "text": "received"]
+                    var body: [String: Any] = ["kind": "text", "senderUserID": actorName,
+                        "targetUserID": fromOwnDevice ? friend.userID : name, "text": "received"]
                     if scenario == "relabeledEdit" { body["revision"] = 2 }
                     payload = try JSONSerialization.data(withJSONObject: body)
                 }
                 try context.save()
+                if scenario.hasPrefix("expired") {
+                    message.expiresAt = .distantPast
+                    try MessageStore(context: context, encryption: security.encryptionService()).purgeExpired(in: conversation)
+                    XCTAssertTrue(try context.fetch(FetchDescriptor<Message>()).contains { $0.id == message.id && $0.deleted },
+                        "Expired v4 content needs a routing tombstone for delayed authenticated events")
+                }
+                if scenario == "legacyTombstone" {
+                    message.deleted = true
+                    try MessageStore(context: context, encryption: security.encryptionService()).migrateLegacyMessages(owner: user)
+                }
+                if scenario == "expiredMissingRow" || scenario == "legacyTombstone" {
+                    context.delete(message)
+                    try context.save()
+                }
                 let sender = V4MessageSessionService(vault: senderVault, userID: "sender", localDeviceID: peerDevice)
                 let request = try sender.prepare(payload, messageID: kind == "message.created" ? message.id : mutationID,
                     conversationID: conversation.remoteID!, targets: [.init(remoteUserID: registration.backendUserID, bundle: ownBundle)])
@@ -883,11 +1337,42 @@ final class LocalFoundationTests: XCTestCase {
                 let envelope = try JSONDecoder().decode(V4RatchetMessage.self, from: XCTUnwrap(Data(base64URL: wire)))
                 let event = RemoteSyncEvent(eventID: eventID, deviceSeq: 1, type: kind, payloadCiphertext: wire,
                     routing: .init(messageID: message.id, conversationID: conversation.remoteID, senderDeviceID: peerDevice,
-                        senderUserID: peerUser, encryptionVersion: 4, keyVersion: 1, messageKeyIndex: Int64(envelope.messageIndex),
+                        senderUserID: actorUser, encryptionVersion: 4, keyVersion: 1, messageKeyIndex: Int64(envelope.messageIndex),
                         revision: kind == "message.created" ? 1 : 2, recipientDeviceID: registration.backendDeviceID,
                         revokedDeviceID: nil, mutationEventID: kind == "message.created" ? nil : mutationID), createdAt: "2026-10-23T00:00:00Z")
-                HeldResponseURLProtocol.reset(try JSONSerialization.data(withJSONObject: directory), suffix: "/v4-prekey-bundle")
-                let receive = Task { try await repository.applyV4(event) }
+                let page = try JSONSerialization.data(withJSONObject: ["nextCursor": 1, "events": [[
+                    "eventID": eventID.uuidString, "deviceSeq": 1, "type": kind, "payloadCiphertext": wire,
+                    "createdAt": event.createdAt, "routing": ["messageID": message.id.uuidString,
+                        "conversationID": conversation.remoteID!.uuidString, "senderDeviceID": peerDevice.uuidString,
+                        "senderUserID": actorUser.uuidString, "encryptionVersion": 4, "keyVersion": 1,
+                        "messageKeyIndex": envelope.messageIndex, "revision": 2,
+                        "recipientDeviceID": registration.backendDeviceID.uuidString, "mutationEventID": mutationID.uuidString]
+                ]]])
+                if scenario == "missingHistory" {
+                    // Authenticated pending bytes alone do not prove the original
+                    // message author/revision or a local deletion. Keep cursor/journal.
+                    _ = try V4MessageSessionService(vault: vault, userID: name, localDeviceID: registration.backendDeviceID)
+                        .decrypt(envelope, wire: XCTUnwrap(Data(base64URL: wire)), eventID: eventID,
+                            deviceSeq: 1, senderUserID: actorUser, senderBundle: bundle)
+                    HeldResponseURLProtocol.reset(Data(), suffix: "/not-requested", responses: ["/v1/sync/events": page])
+                    do { _ = try await RemoteSyncCoordinator(repository: repository).sync(); XCTFail("Missing history must pause") }
+                    catch { XCTAssertEqual(error as? MessageStoreError, .historyEvidenceMissing) }
+                    XCTAssertEqual(try context.fetch(FetchDescriptor<RemoteSyncCheckpoint>()).first?.cursor, 0)
+                    XCTAssertFalse(HeldResponseURLProtocol.paths.contains("/v1/sync/ack"))
+                    XCTAssertFalse(try context.fetch(FetchDescriptor<Message>()).contains { $0.id == message.id })
+                    XCTAssertEqual(try vault.incomingPending(userID: name, deviceID: registration.backendDeviceID)?.eventID, eventID)
+                    XCTAssertNil(try vault.loadSession(userID: name, local: registration.backendDeviceID, remote: peerDevice))
+                    try vault.purgeAccount(userID: name)
+                    continue
+                }
+                HeldResponseURLProtocol.reset(try JSONSerialization.data(withJSONObject: directory), suffix: "/v4-prekey-bundle",
+                    responses: ["/v1/sync/events": page])
+                let receive = Task {
+                    if scenario == "expiredMissingRow" {
+                        let applied = try await RemoteSyncCoordinator(repository: repository).sync()
+                        XCTAssertEqual(applied, 1)
+                    } else { try await repository.applyV4(event) }
+                }
                 for _ in 0..<100 where !HeldResponseURLProtocol.isWaiting { try await Task.sleep(for: .milliseconds(10)) }
                 XCTAssertTrue(HeldResponseURLProtocol.isWaiting)
                 if scenario == "identityChanged" { friend.sessionStatus = "identityKeyChanged" }
@@ -900,9 +1385,36 @@ final class LocalFoundationTests: XCTestCase {
                     } else { try security.login(userID: otherName, password: "password123", context: context) }
                 }
                 HeldResponseURLProtocol.complete()
-                if scenario == "available" {
+                if scenario == "available" || fromOwnDevice || scenario.hasPrefix("expired") || scenario == "legacyTombstone" || scenario == "legacyMissingCreation" || scenario == "deletedPendingCreation" {
                     try await receive.value
+                    if fromOwnDevice {
+                        let metadata = try XCTUnwrap(context.fetch(FetchDescriptor<V4SessionMetadata>()).first {
+                            $0.ownerID == user.id && $0.remoteDeviceID == peerDevice
+                        })
+                        XCTAssertNil(metadata.friendID, "A same-account device session must be independent of chat recipients")
+                    }
                     if kind == "message.created" {
+                        if scenario == "legacyMissingCreation" {
+                            let pending = try XCTUnwrap(vault.incomingPending(userID: name, deviceID: registration.backendDeviceID))
+                            var legacy = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(pending)) as? [String: Any])
+                            legacy.removeValue(forKey: "localPersistenceVersion")
+                            try vault.stageIncoming(JSONDecoder().decode(V4SessionVault.IncomingPending.self,
+                                from: JSONSerialization.data(withJSONObject: legacy)), userID: name, deviceID: registration.backendDeviceID)
+                            let original = try XCTUnwrap(context.fetch(FetchDescriptor<Message>()).first { $0.id == message.id })
+                            context.delete(original); try context.save()
+                            do { try await repository.applyV4(event); XCTFail("Ambiguous legacy persistence must not restore content") }
+                            catch { XCTAssertEqual(error as? MessageStoreError, .historyEvidenceMissing) }
+                            XCTAssertFalse(try context.fetch(FetchDescriptor<Message>()).contains { $0.id == message.id })
+                            XCTAssertEqual(try vault.incomingPending(userID: name, deviceID: registration.backendDeviceID)?.eventID, eventID)
+                            try vault.purgeAccount(userID: name)
+                            continue
+                        }
+                        if scenario == "deletedPendingCreation" {
+                            let original = try XCTUnwrap(context.fetch(FetchDescriptor<Message>()).first { $0.id == message.id })
+                            original.expiresAt = .distantPast
+                            try MessageStore(context: context, encryption: security.encryptionService()).purgeExpired(in: conversation)
+                            context.delete(original); try context.save()
+                        }
                         try await repository.applyV4(event)
                         var altered = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(Data(base64URL: wire))) as? [String: Any])
                         altered["ciphertext"] = Data(repeating: 0, count: 32).base64EncodedString()
@@ -921,8 +1433,54 @@ final class LocalFoundationTests: XCTestCase {
                         .finishReceived(eventID: eventID)
                     let saved = try XCTUnwrap(context.fetch(FetchDescriptor<Message>()).first { $0.id == message.id })
                     XCTAssertEqual(try MessageStore(context: context, encryption: security.encryptionService()).displayContent(for: saved),
-                        kind == "message.created" ? "received" : "changed")
-                    if kind == "message.created" {
+                        (scenario.hasPrefix("expired") || scenario == "legacyTombstone" || scenario == "deletedPendingCreation") ? "" : (kind == "message.created" ? "received" : "changed"))
+                    if scenario == "expiredMissingRow" {
+                        XCTAssertEqual(try context.fetch(FetchDescriptor<RemoteSyncCheckpoint>()).first?.cursor, 1)
+                        XCTAssertTrue(HeldResponseURLProtocol.paths.contains("/v1/sync/ack"))
+                        XCTAssertNil(try vault.incomingPending(userID: name, deviceID: registration.backendDeviceID))
+                    }
+                    if scenario.hasPrefix("expired") || scenario == "legacyTombstone" {
+                        XCTAssertTrue(saved.deleted)
+                        XCTAssertEqual(saved.remoteRevision, 2)
+                        for (sequence, controlKind, revision, text, action) in [
+                            (2, V4EventEnvelope.Kind.reaction, 2, "👍", "add"),
+                            (3, .reaction, 2, "👍", "remove"),
+                            (4, .delete, 3, nil, nil),
+                            (5, .reaction, 3, "👍", "add")
+                        ] {
+                            let controlID = UUID(), syncID = UUID()
+                            let body = V4EventEnvelope(eventID: controlID, messageID: saved.id,
+                                conversationID: conversation.remoteID!, actorUserID: peerUser, actorDeviceID: peerDevice,
+                                kind: controlKind, revision: revision, text: text, reactionAction: action, occurredAt: .now)
+                            let request = try sender.prepareEvent(body,
+                                targets: [.init(remoteUserID: registration.backendUserID, bundle: ownBundle)])
+                            try sender.commitPreparedSend(messageID: controlID)
+                            let wire = try XCTUnwrap(JSONDecoder().decode(Request.self, from: request).recipientEnvelopes.first).ciphertext
+                            let sealed = try JSONDecoder().decode(V4RatchetMessage.self, from: XCTUnwrap(Data(base64URL: wire)))
+                            let control = RemoteSyncEvent(eventID: syncID, deviceSeq: Int64(sequence), type: controlKind.rawValue,
+                                payloadCiphertext: wire, routing: .init(messageID: saved.id, conversationID: conversation.remoteID,
+                                    senderDeviceID: peerDevice, senderUserID: peerUser, encryptionVersion: 4, keyVersion: 1,
+                                    messageKeyIndex: Int64(sealed.messageIndex), revision: revision,
+                                    recipientDeviceID: registration.backendDeviceID, revokedDeviceID: nil, mutationEventID: controlID),
+                                createdAt: "2026-10-23T00:00:00Z")
+                            HeldResponseURLProtocol.reset(try JSONSerialization.data(withJSONObject: directory), suffix: "/v4-prekey-bundle")
+                            let receiving = Task { try await repository.applyV4(control) }
+                            for _ in 0..<100 where !HeldResponseURLProtocol.isWaiting { try await Task.sleep(for: .milliseconds(10)) }
+                            XCTAssertTrue(HeldResponseURLProtocol.isWaiting)
+                            HeldResponseURLProtocol.complete()
+                            try await receiving.value
+                            try V4MessageSessionService(vault: vault, userID: name, localDeviceID: registration.backendDeviceID)
+                                .finishReceived(eventID: syncID)
+                            XCTAssertTrue(saved.deleted)
+                            XCTAssertEqual(try MessageStore(context: context, encryption: security.encryptionService()).displayContent(for: saved), "")
+                            XCTAssertFalse(try context.fetch(FetchDescriptor<Reaction>()).contains { $0.messageID == saved.id })
+                        }
+                        XCTAssertEqual(saved.remoteRevision, 3)
+                        XCTAssertTrue(saved.deletedForEveryone)
+                        XCTAssertEqual(try vault.loadSession(userID: name, local: registration.backendDeviceID,
+                            remote: peerDevice)?.stateVersion, 5, "Every authenticated late control must commit its original ratchet advance")
+                    }
+                    if kind == "message.created" && !fromOwnDevice {
                         let prekeys = V4PreKeyService(context: context, user: user, registration: registration,
                             client: client, vault: vault)
                         for hasOneTimeKey in [false, true] {
@@ -993,7 +1551,6 @@ final class LocalFoundationTests: XCTestCase {
             try? keychain.deleteAccounts(prefix: "")
             try? wireKeychain.delete("device-private.\(device.id.uuidString)")
             try? wireKeychain.deleteAccounts(prefix: "prekey.\(user.id.uuidString).")
-            try? wireKeychain.delete("identity-private.\(name)")
         }
         let peer = P256.Signing.PrivateKey()
         let friend = Friend(ownerID: user.id, userID: "bob", nickname: "Bob")
@@ -1009,8 +1566,9 @@ final class LocalFoundationTests: XCTestCase {
             devicePublicKey: deviceKey.publicKey.x963Representation, signedPreKey: signed.publicKey,
             oneTimePreKey: nil, keyVersion: 1)
         let messageID = UUID(), senderDevice = UUID()
-        func event(_ type: String, signedRevision: Int?, routingRevision: Int?) throws -> RemoteSyncEvent {
-            var body: [String: Any] = ["kind": "text", "senderUserID": "bob", "targetUserID": name, "text": "content"]
+        func event(_ type: String, signedRevision: Int?, routingRevision: Int?,
+                   kind: String = "text", text: String = "content") throws -> RemoteSyncEvent {
+            var body: [String: Any] = ["kind": kind, "senderUserID": "bob", "targetUserID": name, "text": text]
             if let signedRevision { body["revision"] = signedRevision }
             let envelope = try DeviceSessionManager().encrypt(JSONSerialization.data(withJSONObject: body),
                 messageID: messageID, conversationID: conversation.remoteID!, senderDeviceID: senderDevice,
@@ -1038,65 +1596,62 @@ final class LocalFoundationTests: XCTestCase {
         let saved = try XCTUnwrap(context.fetch(FetchDescriptor<Message>()).first { $0.id == messageID })
         XCTAssertEqual(saved.remoteRevision, 2)
         XCTAssertNotNil(saved.editedAt)
+        context.insert(Reaction(messageID: messageID, emoji: "😂", reactorID: "bob"))
+        try context.save()
+        let oldReaction = try event("reaction.added", signedRevision: nil, routingRevision: nil,
+                                    kind: "reaction", text: "👍")
+        try repository.apply(oldReaction)
+        let repeatedReaction = RemoteSyncEvent(eventID: UUID(), deviceSeq: oldReaction.deviceSeq + 1,
+            type: oldReaction.type, payloadCiphertext: oldReaction.payloadCiphertext,
+            routing: oldReaction.routing, createdAt: oldReaction.createdAt)
+        try repository.apply(repeatedReaction)
+        XCTAssertEqual(try context.fetch(FetchDescriptor<Reaction>()).first {
+            $0.messageID == messageID && $0.reactorID == "bob"
+        }?.emoji, "😂", "An old signed v3 reaction cannot overwrite a newer local snapshot")
+        saved.deleted = true
+        try context.save()
+        try repository.apply(event("reaction.added", signedRevision: nil, routingRevision: nil,
+                                   kind: "reaction", text: "❤️"))
+        XCTAssertTrue(saved.deleted)
+        XCTAssertEqual(try context.fetch(FetchDescriptor<Reaction>()).first {
+            $0.messageID == messageID && $0.reactorID == "bob"
+        }?.emoji, "😂", "A late legacy event cannot recreate deleted content")
+        try repository.apply(event("message.edited", signedRevision: 3, routingRevision: 3))
+        XCTAssertTrue(saved.deleted)
+        XCTAssertEqual(saved.remoteRevision, 3,
+            "A signed late edit should advance a retained tombstone without restoring plaintext")
+        saved.transportEncryptionVersion = 4
+        try context.save()
+        XCTAssertThrowsError(try repository.apply(oldReaction),
+            "A v3 reaction must not target a v4 message")
+        context.delete(saved)
+        try context.save()
+        try repository.apply(repeatedReaction)
+        XCTAssertFalse(try context.fetch(FetchDescriptor<Message>()).contains { $0.id == messageID },
+            "A late reaction must not recreate a physically removed legacy message")
+        var tamperedReaction = try XCTUnwrap(JSONSerialization.jsonObject(with:
+            XCTUnwrap(Data(base64URL: oldReaction.payloadCiphertext))) as? [String: Any])
+        tamperedReaction["ciphertext"] = Data([0]).base64EncodedString()
+        let unauthenticatedReaction = RemoteSyncEvent(eventID: UUID(), deviceSeq: 3,
+            type: oldReaction.type,
+            payloadCiphertext: try JSONSerialization.data(withJSONObject: tamperedReaction).base64URLEncodedString(),
+            routing: oldReaction.routing, createdAt: oldReaction.createdAt)
+        XCTAssertThrowsError(try repository.apply(unauthenticatedReaction),
+            "Restricted legacy events still require signature and AEAD verification")
 
-        // Exercise both remaining legacy send operations while the directory is
-        // suspended. Reuse the same network fixture and real account/key material.
-        let peerUser = UUID()
-        friend.remoteUserID = peerUser
-        try wireKeychain.save(keychain.readRequired("identity-private.\(name)"), account: "identity-private.\(name)")
+        // Online mutations have one v4 path. Historical v3 contents remain readable,
+        // but cannot create new unordered or unverified remote state.
         let own = Message(conversationID: conversation.id, type: .text, isMine: true, senderID: name)
         own.transportEncryptionVersion = 3; own.remoteRevision = 1
-        own.ciphertext = try security.encryptionService().encrypt(Data("original".utf8),
-            authenticatedData: Data("luma-message-v1|\(own.id.uuidString)|\(conversation.id.uuidString)".utf8)).bytes
         context.insert(own); try context.save()
-        let sessionStore = RemoteSessionStore(keychain: keychain), signer = RemoteDeviceSigner(keychain: keychain)
-        _ = try signer.publicKey(for: name)
-        try sessionStore.save(.init(accessToken: "test-access", refreshToken: "test-refresh", expiresIn: 900), for: name)
-        let config = URLSessionConfiguration.ephemeral
-        config.protocolClasses = [HeldResponseURLProtocol.self]
-        let network = URLSession(configuration: config)
-        defer { network.invalidateAndCancel() }
-        let online = RemoteMessageRepository(context: context, user: user, security: security,
-            client: try RemoteAPIClient(baseURL: registration.baseURL, userID: name,
-                store: sessionStore, signer: signer, session: network), registration: registration)
-        func directory(_ account: P256.Signing.PrivateKey, deviceID: UUID) throws -> Data {
-            let prekey = P256.KeyAgreement.PrivateKey().publicKey.x963Representation
-            return try JSONSerialization.data(withJSONObject: [[
-                "identityPublicKey": account.publicKey.x963Representation.base64URLEncodedString(),
-                "identityKeyVersion": 1, "deviceID": deviceID.uuidString,
-                "devicePublicKey": deviceKey.publicKey.x963Representation.base64URLEncodedString(),
-                "signedPreKey": prekey.base64URLEncodedString(), "signature": try account.signature(for: prekey).derRepresentation.base64URLEncodedString(),
-                "keyVersion": 1, "oneTimePreKey": signedKey.publicKey.x963Representation.base64URLEncodedString()
-            ]])
-        }
-        let peerPath = "/v1/users/\(peerUser.uuidString.lowercased())/prekey-bundle"
-        let peerDirectory = try directory(peer, deviceID: senderDevice)
-        let responses = ["/v1/friends": try JSONSerialization.data(withJSONObject: [[
-            "id": peerUser.uuidString, "userID": friend.userID, "nickname": "Bob"]]),
-            "/v1/users/\(registration.backendUserID.uuidString.lowercased())/prekey-bundle":
-                try directory(P256.Signing.PrivateKey(rawRepresentation: keychain.readRequired("identity-private.\(name)")),
-                    deviceID: registration.backendDeviceID),
-            "/v1/messages/edit": Data("{\"revision\":2}".utf8), "/v1/messages/reaction": Data("{}".utf8)]
-        for operation in ["edit", "reaction"] {
-            for scenario in ["identityChanged", "locked", "available"] {
-                HeldResponseURLProtocol.reset(peerDirectory, suffix: peerPath,
-                    responses: responses)
-                let mutation = Task {
-                    if operation == "edit" { try await online.editText("updated", message: own, friend: friend, conversation: conversation) }
-                    else { try await online.react("👍", to: own, friend: friend, conversation: conversation) }
-                }
-                for _ in 0..<100 where !HeldResponseURLProtocol.isWaiting { try await Task.sleep(for: .milliseconds(10)) }
-                XCTAssertTrue(HeldResponseURLProtocol.isWaiting)
-                if scenario == "identityChanged" { friend.sessionStatus = "identityKeyChanged" }
-                if scenario == "locked" { security.lock() }
-                HeldResponseURLProtocol.complete()
-                if scenario == "available" { try await mutation.value }
-                else { do { try await mutation.value; XCTFail("Legacy send accepted stale authorization") } catch { } }
-                XCTAssertEqual(HeldResponseURLProtocol.paths.contains("/v1/messages/\(operation)"), scenario == "available")
-                friend.sessionStatus = "none"
-                if scenario == "locked" { try security.verifyPIN("123456", context: context) }
-            }
-        }
+        do {
+            try await repository.editText("updated", message: own, friend: friend, conversation: conversation)
+            XCTFail("Historical v3 edit was sent online")
+        } catch MessageStoreError.editNotAllowed { }
+        do {
+            try await repository.react("👍", to: own, friend: friend, conversation: conversation)
+            XCTFail("Historical v3 reaction was sent online")
+        } catch MessageRepositoryError.invalidEvent { }
     }
 
     func testV3DistinctDeviceEnvelopesAndTamperRejection() throws {
@@ -1524,12 +2079,14 @@ private final class HeldResponseURLProtocol: URLProtocol, @unchecked Sendable {
     private static var statusCode = 200
     private static var responses: [String: Data] = [:]
     private static var requestedPaths: [String] = []
+    private static var observedRequest: URLRequest?
     static var paths: [String] { lock.withLock { requestedPaths } }
+    static var lastRequest: URLRequest? { lock.withLock { observedRequest } }
     static var isWaiting: Bool { lock.withLock { pending != nil } }
     static func reset(_ bytes: Data, suffix: String = "/content", responses: [String: Data] = [:], statusCode: Int = 200) {
         lock.withLock {
             payload = bytes; pending = nil; Self.suffix = suffix
-            Self.responses = responses; requestedPaths = []
+            Self.responses = responses; requestedPaths = []; observedRequest = nil
             Self.statusCode = statusCode
         }
     }
@@ -1544,7 +2101,7 @@ private final class HeldResponseURLProtocol: URLProtocol, @unchecked Sendable {
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
-        Self.lock.withLock { Self.requestedPaths.append(request.url!.path) }
+        Self.lock.withLock { Self.requestedPaths.append(request.url!.path); Self.observedRequest = request }
         if Self.lock.withLock({ request.url!.path.hasSuffix(Self.suffix) }) {
             Self.lock.withLock { Self.pending = self }
         } else {

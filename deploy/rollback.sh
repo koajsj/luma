@@ -19,6 +19,7 @@ fi
 backup=$(realpath "$backup")
 [[ $backup == "$BACKUP_DIR/"* && -f "$backup/VERSION" ]] || die '备份路径无效。'
 old=$(cat "$backup/VERSION")
+require_split_database_version "$old" || die '目标代码不兼容最小权限模式；数据可通过显式保留当前代码的恢复流程处理。'
 git -C "$APP_DIR" cat-file -e "$old^{commit}" || die '本地仓库缺少备份版本的代码。'
 if [[ ${LUMA_ROLLBACK_CONFIRMED:-} != 1 ]]; then
     ( : </dev/tty ) 2>/dev/null || die '回滚会替换数据库，需要交互确认。'

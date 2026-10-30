@@ -47,40 +47,6 @@ struct DeviceMessageEnvelope: Codable {
     }
 }
 
-struct RemoteDevicePreKeyBundle: Decodable {
-    let identityPublicKey: String
-    let identityKeyVersion: Int
-    let deviceID: UUID
-    let devicePublicKey: String
-    let signedPreKey: String
-    let signature: String
-    let keyVersion: Int
-    let oneTimePreKey: String
-
-    func verified(expectedFingerprint: String) throws -> VerifiedDeviceBundle {
-        guard identityKeyVersion > 0, keyVersion > 0,
-              let identity = Data(base64URL: identityPublicKey),
-              let device = Data(base64URL: devicePublicKey),
-              let prekey = Data(base64URL: signedPreKey),
-              let signature = Data(base64URL: signature),
-              let identityVerifier = try? P256.Signing.PublicKey(x963Representation: identity),
-              let parsed = try? P256.Signing.ECDSASignature(derRepresentation: signature),
-              identityVerifier.isValidSignature(parsed, for: prekey),
-              (try? P256.KeyAgreement.PublicKey(x963Representation: device)) != nil,
-              (try? P256.KeyAgreement.PublicKey(x963Representation: prekey)) != nil,
-              IdentityFingerprint.make(publicKey: identity) == expectedFingerprint else {
-            throw DeviceSessionError.untrustedIdentity
-        }
-        let oneTime = oneTimePreKey.isEmpty ? nil : Data(base64URL: oneTimePreKey)
-        if !oneTimePreKey.isEmpty && (oneTime.flatMap { try? P256.KeyAgreement.PublicKey(x963Representation: $0) } == nil) {
-            throw DeviceSessionError.invalidEnvelope
-        }
-        return VerifiedDeviceBundle(deviceID: deviceID, identityPublicKey: identity,
-                                    devicePublicKey: device, signedPreKey: prekey,
-                                    oneTimePreKey: oneTime, keyVersion: keyVersion)
-    }
-}
-
 struct VerifiedDeviceBundle {
     let deviceID: UUID
     let identityPublicKey: Data

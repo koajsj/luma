@@ -135,6 +135,9 @@ struct LocalMessageRepository: MessageRepository {
         if let message, message.lastEventID == event.id { return }
         try EventVerifier(context: context).verify(event, message: message)
         if event.kind == .newMessage {
+            guard try !context.fetch(FetchDescriptor<MessageTombstone>()).contains(where: { $0.messageID == event.messageID }) else {
+                throw MessageStoreError.historyEvidenceMissing
+            }
             guard message == nil, let payload = event.payload,
                   let data = try? JSONDecoder().decode(NewMessagePayload.self, from: payload),
                   let conversation = try context.fetch(FetchDescriptor<Conversation>()).first(where: { $0.id == data.conversationID })
@@ -209,6 +212,7 @@ struct LocalMessageRepository: MessageRepository {
             message.editedAt = event.timestamp
         }
         message.lastEventID = event.id
+        try store.retainV4Tombstone(for: message)
         try context.save()
     }
 

@@ -41,7 +41,7 @@ private extension RemoteMessageRepository {
             JSONEncoder().encode(event), authenticatedData: eventBinding(item)).bytes
         item.encryptedPayload = item.encryptedRequest
         context.insert(item)
-        try context.save()
+        do { try context.save() } catch { context.rollback(); throw error }
         if sendImmediately { try await retryV4Events() }
     }
 
@@ -169,47 +169,55 @@ private extension RemoteMessageRepository {
         return try JSONDecoder().decode(V4EventEnvelope.self, from: bytes)
     }
 
-    func applyOwnV4Event(_ event: V4EventEnvelope) throws {
-        guard try security.currentUserID() == user.userID else { throw MessageStoreError.locked }
-        guard let message = try context.fetch(FetchDescriptor<Message>()).first(where: { $0.id == event.messageID }),
-              message.transportEncryptionVersion == 4 else { throw V4ProtocolError.invalidMessage }
-        switch event.kind {
-        case .edit:
-            guard let text = event.text, let revision = event.revision else { throw V4ProtocolError.invalidMessage }
-            try MessageStore(context: context, encryption: security.encryptionService())
-                .applyVerifiedRemoteEdit(messageID: message.id, plaintext: Data(text.utf8),
-                    revision: revision, at: event.occurredAt, eventID: event.eventID)
-        case .delete:
-            guard let revision = event.revision else { throw V4ProtocolError.invalidMessage }
-            if revision == (message.remoteRevision ?? 1) + 1 {
-                message.deleted = true; message.deletedForEveryone = true
-                message.deletedAt = event.occurredAt; message.remoteRevision = revision
-                try purgeAttachment(for: message)
-            } else if revision != message.remoteRevision { throw V4ProtocolError.invalidMessage }
-        case .read:
-            // The local reader's state is handled by markConversationRead.
-            break
-        case .reaction:
-            try applyV4Reaction(event)
-        }
-        try context.save()
+    func reactionStateBinding(_ message: Message) -> Data {
+        Data("luma-v4-reaction-state-v1|\(user.id.uuidString)|\(message.conversationID.uuidString)|\(message.id.uuidString)".utf8)
     }
 
-    func applyV4Reaction(_ event: V4EventEnvelope) throws {
+    func reactionLedger(_ message: Message) throws -> V4ReactionLedger {
+        guard let bytes = message.encryptedReactionState else { return V4ReactionLedger() }
+        let plaintext = try security.encryptionService().decrypt(EncryptedData(bytes: bytes),
+            authenticatedData: reactionStateBinding(message))
+        let ledger = try JSONDecoder().decode(V4ReactionLedger.self, from: plaintext)
+        guard ledger.version == 1 else { throw V4ProtocolError.invalidMessage }
+        return ledger
+    }
+
+    func applyV4Reaction(_ event: V4EventEnvelope, to message: Message) throws {
         guard let emoji = event.text, ["👍", "❤️", "😂", "‼️"].contains(emoji),
               ["add", "remove"].contains(event.reactionAction ?? "") else { throw V4ProtocolError.invalidMessage }
+        // Legacy payloads have no causal order. Authenticate and commit them, but
+        // do not let an unorderable remote operation change even a legacy snapshot.
+        guard event.reactionOrder != nil else { return }
+        var ledger = try reactionLedger(message)
+        let replaces = try ledger.accept(event)
+        let bytes = try security.encryptionService().encrypt(JSONEncoder().encode(ledger),
+            authenticatedData: reactionStateBinding(message)).bytes
         let reactorID = event.actorUserID == registration.backendUserID ? user.userID :
             try context.fetch(FetchDescriptor<Friend>()).first(where: {
                 $0.ownerID == user.id && $0.remoteUserID == event.actorUserID
             })?.userID
         guard let reactorID else { throw V4ProtocolError.untrustedIdentity }
-        let existing = try context.fetch(FetchDescriptor<Reaction>()).first(where: {
+        message.encryptedReactionState = bytes
+        // Expiration is checked here too: cleanup might not have run before sync.
+        if message.deleted || message.expiresAt.map({ $0 <= .now }) == true {
+            for row in try context.fetch(FetchDescriptor<Reaction>()).filter({ $0.messageID == message.id }) {
+                context.delete(row)
+            }
+            if message.deleted {
+                try MessageStore(context: context, encryption: security.encryptionService()).retainV4Tombstone(for: message)
+            }
+            return
+        }
+        guard replaces else { return }
+        let rows = try context.fetch(FetchDescriptor<Reaction>()).filter {
             $0.messageID == event.messageID && $0.reactorID == reactorID
-        })
+        }
         if event.reactionAction == "remove" {
-            if let existing { context.delete(existing) }
-        } else if let existing { existing.emoji = emoji }
-        else { context.insert(Reaction(messageID: event.messageID, emoji: emoji, reactorID: reactorID)) }
+            for row in rows { context.delete(row) }
+        } else if let existing = rows.first {
+            existing.emoji = emoji
+            for row in rows.dropFirst() { context.delete(row) }
+        } else { context.insert(Reaction(messageID: event.messageID, emoji: emoji, reactorID: reactorID)) }
     }
 
     func applyV4Control(_ event: RemoteSyncEvent) async throws {
@@ -218,9 +226,18 @@ private extension RemoteMessageRepository {
               let sourceUser = event.routing.senderUserID,
               let sourceDevice = event.routing.senderDeviceID,
               let wire = Data(base64URL: event.payloadCiphertext),
-              let envelope = try? JSONDecoder().decode(V4RatchetMessage.self, from: wire),
-              let message = try context.fetch(FetchDescriptor<Message>()).first(where: { $0.id == messageID }),
-              message.transportEncryptionVersion == 4,
+              let envelope = try? JSONDecoder().decode(V4RatchetMessage.self, from: wire) else {
+            throw V4ProtocolError.invalidMessage
+        }
+        let verifier = V4EventVerifier()
+        let kind = try verifier.verifyRouting(event, envelope: envelope,
+            localDeviceID: registration.backendDeviceID)
+        let store = MessageStore(context: context, encryption: try security.encryptionService())
+        guard let message = try context.fetch(FetchDescriptor<Message>()).first(where: { $0.id == messageID }) ??
+                store.restoreV4Tombstone(messageID: messageID, remoteConversationID: envelope.conversationID, owner: user) else {
+            throw MessageStoreError.historyEvidenceMissing
+        }
+        guard message.transportEncryptionVersion == 4,
               let conversation = try context.fetch(FetchDescriptor<Conversation>()).first(where: {
                   $0.id == message.conversationID && $0.ownerID == user.id &&
                   $0.remoteID == envelope.conversationID
@@ -228,9 +245,6 @@ private extension RemoteMessageRepository {
                   $0.id == conversation.friendID && $0.ownerID == user.id &&
                   $0.sessionStatus != "identityKeyChanged"
               }) else { throw V4ProtocolError.invalidMessage }
-        let verifier = V4EventVerifier()
-        let kind = try verifier.verifyRouting(event, envelope: envelope,
-            localDeviceID: registration.backendDeviceID)
         let isMine = sourceUser == registration.backendUserID
         let expectedUser = isMine ? registration.backendUserID : friend.remoteUserID
         guard sourceUser == expectedUser else { throw V4ProtocolError.untrustedIdentity }
@@ -240,8 +254,7 @@ private extension RemoteMessageRepository {
             deviceID: sourceDevice, expectedAccountFingerprint: fingerprint)
         try verifyV4PeerAccess(remoteUserID: sourceUser, fingerprint: fingerprint)
         guard try context.fetch(FetchDescriptor<Message>()).contains(where: {
-            $0.id == messageID && $0.conversationID == conversation.id &&
-            (!$0.deleted || kind == .delete)
+            $0.id == messageID && $0.conversationID == conversation.id
         }), try context.fetch(FetchDescriptor<Friend>()).contains(where: {
             $0.id == friend.id && $0.ownerID == user.id && $0.sessionStatus != "identityKeyChanged"
         }) else { throw V4ProtocolError.invalidMessage }
@@ -249,7 +262,6 @@ private extension RemoteMessageRepository {
             deviceSeq: event.deviceSeq, senderUserID: sourceUser, senderBundle: sender)
         let body = try JSONDecoder().decode(V4EventEnvelope.self, from: plaintext)
         try verifier.verifyAuthenticated(body, routing: event.routing, kind: kind, envelope: envelope)
-        guard !message.deleted || kind == .delete else { throw V4ProtocolError.invalidMessage }
         if let pending = try v4Vault.incomingPending(userID: user.userID,
             deviceID: registration.backendDeviceID) {
             try ensureV4Metadata(pending.session, friendID: isMine ? nil : friend.id)
@@ -261,6 +273,9 @@ private extension RemoteMessageRepository {
             guard sourceUser == (message.isMine ? registration.backendUserID : friend.remoteUserID),
                   let text = body.text, !text.isEmpty, text.utf8.count <= 16_384,
                   let revision = body.revision else { throw V4ProtocolError.invalidMessage }
+            guard !message.deletedForEveryone || revision <= (message.remoteRevision ?? 1) else {
+                throw V4ProtocolError.invalidMessage
+            }
             try MessageStore(context: context, encryption: security.encryptionService())
                 .applyVerifiedRemoteEdit(messageID: messageID, plaintext: Data(text.utf8),
                     revision: revision, at: body.occurredAt, eventID: mutationID)
@@ -272,12 +287,14 @@ private extension RemoteMessageRepository {
                 message.deletedAt = body.occurredAt; message.remoteRevision = revision
                 message.lastEventID = mutationID
                 try purgeAttachment(for: message)
+                try store.retainV4Tombstone(for: message)
             } else if revision != message.remoteRevision { throw V4ProtocolError.replay }
         case .read:
             guard sourceUser != (message.isMine ? registration.backendUserID : friend.remoteUserID),
                   body.text == nil, let eventRevision = body.revision,
                   eventRevision >= 1,
                   eventRevision <= (message.remoteRevision ?? 1) else { throw V4ProtocolError.invalidMessage }
+            if message.deleted { break }
             if message.isMine {
                 guard security.preferences.readReceipts else { break }
                 message.readAt = message.readAt ?? body.occurredAt
@@ -294,28 +311,77 @@ private extension RemoteMessageRepository {
             guard let eventRevision = body.revision,
                   eventRevision >= 1,
                   eventRevision <= (message.remoteRevision ?? 1) else { throw V4ProtocolError.invalidMessage }
-            try applyV4Reaction(body)
+            try applyV4Reaction(body, to: message)
         }
         try context.save()
     }
 }
 
-private struct V3RecipientEnvelope: Encodable {
-    let recipientDeviceID: String
-    let ciphertext: String
-    let keyVersion: Int
-    let messageKeyIndex: Int64
-}
+extension RemoteMessageRepository {
+    func applyOwnV4Event(_ event: V4EventEnvelope) throws {
+        guard try security.currentUserID() == user.userID else { throw MessageStoreError.locked }
+        guard let message = try context.fetch(FetchDescriptor<Message>()).first(where: { $0.id == event.messageID }),
+              message.transportEncryptionVersion == 4 else { throw V4ProtocolError.invalidMessage }
+        switch event.kind {
+        case .edit:
+            guard let text = event.text, let revision = event.revision else { throw V4ProtocolError.invalidMessage }
+            try MessageStore(context: context, encryption: security.encryptionService())
+                .applyVerifiedRemoteEdit(messageID: message.id, plaintext: Data(text.utf8),
+                    revision: revision, at: event.occurredAt, eventID: event.eventID)
+        case .delete:
+            guard let revision = event.revision else { throw V4ProtocolError.invalidMessage }
+            if revision == (message.remoteRevision ?? 1) + 1 {
+                message.deleted = true; message.deletedForEveryone = true
+                message.deletedAt = event.occurredAt; message.remoteRevision = revision
+                try purgeAttachment(for: message)
+                try MessageStore(context: context, encryption: security.encryptionService()).retainV4Tombstone(for: message)
+            } else if revision != message.remoteRevision { throw V4ProtocolError.invalidMessage }
+        case .read:
+            // The local reader's state is handled by markConversationRead.
+            break
+        case .reaction:
+            try applyV4Reaction(event, to: message)
+        }
+        do { try context.save() } catch { context.rollback(); throw error }
+    }
 
-private struct V3SendRequest: Encodable {
-    let messageID: UUID
-    let conversationID: UUID
-    let encryptionVersion: Int
-    let recipientEnvelopes: [V3RecipientEnvelope]
+    /// Includes locally queued operations so offline clicks never reuse a counter.
+    /// Called synchronously with enqueue; no network suspension separates them.
+    func makeV4ReactionEvent(_ emoji: String, message: Message,
+                                     conversation: Conversation) throws -> V4EventEnvelope {
+        let ledger = try reactionLedger(message)
+        var latest = ledger.winners[registration.backendUserID]
+        var currentEmoji = try context.fetch(FetchDescriptor<Reaction>()).first(where: {
+            $0.messageID == message.id && $0.reactorID == user.userID
+        })?.emoji
+        for item in try context.fetch(FetchDescriptor<V4PendingEvent>()).filter({
+            $0.ownerID == user.id && $0.messageID == message.id
+        }) {
+            let event = try localEvent(from: item)
+            guard event.kind == .reaction, event.actorUserID == registration.backendUserID,
+                  let order = event.reactionOrder else { continue }
+            try order.validate()
+            let stamp = V4ReactionLedger.Stamp(counter: order.counter,
+                deviceID: event.actorDeviceID, eventID: event.eventID)
+            if latest.map({ $0.precedes(stamp) }) ?? true {
+                latest = stamp
+                currentEmoji = event.reactionAction == "add" ? event.text : nil
+            }
+        }
+        let counter = latest?.counter ?? 0
+        guard counter < UInt64.max - 1, let remote = conversation.remoteID else {
+            throw V4ProtocolError.invalidMessage
+        }
+        return V4EventEnvelope(eventID: UUID(), messageID: message.id, conversationID: remote,
+            actorUserID: registration.backendUserID, actorDeviceID: registration.backendDeviceID,
+            kind: .reaction, revision: message.remoteRevision ?? 1, text: emoji,
+            reactionAction: currentEmoji == emoji ? "remove" : "add", occurredAt: .now,
+            reactionOrder: .init(counter: counter + 1))
+    }
+
 }
 
 private struct V3ConversationResponse: Decodable { let id: UUID }
-private struct V3EditResponse: Decodable { let revision: Int }
 
 /// Online message boundary. Transport envelopes never become SwiftData ciphertext;
 /// verified plaintext is re-encrypted by MessageStore with the local Master Key.
@@ -577,6 +643,9 @@ struct RemoteMessageRepository {
         for attachment in try context.fetch(FetchDescriptor<Attachment>()).filter({ $0.messageID == message.id }) {
             try FileTransferService(ownerID: user.id, encryption: security.encryptionService())
                 .delete(attachmentID: attachment.id)
+            for entry in try context.fetch(FetchDescriptor<SearchIndexEntry>()).filter({
+                $0.ownerID == user.id && $0.sourceID == attachment.id
+            }) { context.delete(entry) }
             context.delete(attachment)
         }
     }
@@ -605,102 +674,40 @@ struct RemoteMessageRepository {
     }
 
     func editText(_ text: String, message: Message, friend: Friend, conversation: Conversation) async throws {
-        if message.transportEncryptionVersion == 4 {
-            guard message.isMine, message.conversationID == conversation.id,
-                  !message.deleted, conversation.remoteID != nil else { throw MessageStoreError.editNotAllowed }
-            let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !value.isEmpty, value.utf8.count <= 16_384 else { throw MessageStoreError.editNotAllowed }
-            try await submitV4Event(.init(eventID: UUID(), messageID: message.id,
-                conversationID: conversation.remoteID!, actorUserID: registration.backendUserID,
-                actorDeviceID: registration.backendDeviceID, kind: .edit,
-                revision: (message.remoteRevision ?? 1) + 1, text: value,
-                reactionAction: nil, occurredAt: .now), friend: friend)
-            return
-        }
-        guard message.isMine, message.transportEncryptionVersion == 3,
+        guard message.isMine, message.transportEncryptionVersion == 4,
               message.conversationID == conversation.id,
-              let remoteID = conversation.remoteID else { throw MessageStoreError.editNotAllowed }
+              !message.deleted, let remoteID = conversation.remoteID else { throw MessageStoreError.editNotAllowed }
         let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty, value.utf8.count <= 16_384 else { throw MessageStoreError.editNotAllowed }
-        guard let pinned = friend.identityFingerprint else { throw DeviceSessionError.untrustedIdentity }
-        try verifyLegacyMutation(message, friend: friend, conversation: conversation, fingerprint: pinned)
-        let currentRevision = message.remoteRevision ?? 1
-        let envelopes = try await makeEnvelopes(messageID: message.id, conversationID: remoteID,
-                                                 friend: friend, kind: "text", text: value,
-                                                 revision: currentRevision + 1)
-        struct EditRequest: Encodable {
-            let messageID: UUID
-            let revision: Int
-            let recipientEnvelopes: [V3RecipientEnvelope]
-        }
-        let response = try await client.json(V3EditResponse.self, method: "POST", path: "/messages/edit",
-            body: JSONEncoder().encode(EditRequest(messageID: message.id,
-                revision: currentRevision, recipientEnvelopes: envelopes)), beforeTransmission: {
-                    try verifyLegacyMutation(message, friend: friend, conversation: conversation, fingerprint: pinned)
-                })
-        try verifyLegacyMutation(message, friend: friend, conversation: conversation, fingerprint: pinned)
-        guard response.revision == currentRevision + 1 else { throw DeviceSessionError.invalidEnvelope }
-        try MessageStore(context: context, encryption: security.encryptionService())
-            .applyVerifiedRemoteEdit(messageID: message.id, plaintext: Data(value.utf8),
-                                     revision: response.revision, at: .now, eventID: UUID())
+        try await submitV4Event(.init(eventID: UUID(), messageID: message.id,
+            conversationID: remoteID, actorUserID: registration.backendUserID,
+            actorDeviceID: registration.backendDeviceID, kind: .edit,
+            revision: (message.remoteRevision ?? 1) + 1, text: value,
+            reactionAction: nil, occurredAt: .now), friend: friend)
     }
 
     func deleteForEveryone(_ message: Message) async throws {
-        guard message.isMine, [3, 4].contains(message.transportEncryptionVersion ?? 0) else {
+        guard message.isMine, message.transportEncryptionVersion == 4 else {
             throw MessageRepositoryError.invalidEvent
         }
-        if message.transportEncryptionVersion == 4 {
-            guard let conversation = try context.fetch(FetchDescriptor<Conversation>()).first(where: {
-                $0.id == message.conversationID && $0.ownerID == user.id
-            }), let friend = try context.fetch(FetchDescriptor<Friend>()).first(where: {
-                $0.id == conversation.friendID && $0.ownerID == user.id
-            }), let remote = conversation.remoteID, !message.deleted else { throw MessageRepositoryError.invalidEvent }
-            try await submitV4Event(.init(eventID: UUID(), messageID: message.id,
-                conversationID: remote, actorUserID: registration.backendUserID,
-                actorDeviceID: registration.backendDeviceID, kind: .delete,
-                revision: (message.remoteRevision ?? 1) + 1, text: nil,
-                reactionAction: nil, occurredAt: .now), friend: friend)
-            return
-        }
-        // Legacy v3 has no authenticated deletion payload. Keep local deletion
-        // available, but do not promise deletion on another device via server hints.
-        throw DeviceSessionError.unsupportedVersion
+        guard let conversation = try context.fetch(FetchDescriptor<Conversation>()).first(where: {
+            $0.id == message.conversationID && $0.ownerID == user.id
+        }), let friend = try context.fetch(FetchDescriptor<Friend>()).first(where: {
+            $0.id == conversation.friendID && $0.ownerID == user.id
+        }), let remote = conversation.remoteID, !message.deleted else { throw MessageRepositoryError.invalidEvent }
+        try await submitV4Event(.init(eventID: UUID(), messageID: message.id,
+            conversationID: remote, actorUserID: registration.backendUserID,
+            actorDeviceID: registration.backendDeviceID, kind: .delete,
+            revision: (message.remoteRevision ?? 1) + 1, text: nil,
+            reactionAction: nil, occurredAt: .now), friend: friend)
     }
 
     func react(_ emoji: String, to message: Message, friend: Friend, conversation: Conversation) async throws {
-        if message.transportEncryptionVersion == 4 {
-            guard message.conversationID == conversation.id, let remote = conversation.remoteID,
-                  !message.deleted, ["👍", "❤️", "😂", "‼️"].contains(emoji) else { throw MessageRepositoryError.invalidEvent }
-            let existing = try context.fetch(FetchDescriptor<Reaction>()).first(where: {
-                $0.messageID == message.id && $0.reactorID == user.userID
-            })
-            let remove = existing?.emoji == emoji
-            try await submitV4Event(.init(eventID: UUID(), messageID: message.id,
-                conversationID: remote, actorUserID: registration.backendUserID,
-                actorDeviceID: registration.backendDeviceID, kind: .reaction,
-                revision: message.remoteRevision ?? 1, text: emoji,
-                reactionAction: remove ? "remove" : "add", occurredAt: .now), friend: friend)
-            return
-        }
-        guard message.transportEncryptionVersion == 3, message.conversationID == conversation.id,
-              let remoteID = conversation.remoteID,
-              ["👍", "❤️", "😂", "‼️"].contains(emoji) else { throw MessageRepositoryError.invalidEvent }
-        guard let pinned = friend.identityFingerprint else { throw DeviceSessionError.untrustedIdentity }
-        try verifyLegacyMutation(message, friend: friend, conversation: conversation, fingerprint: pinned)
-        let envelopes = try await makeEnvelopes(messageID: message.id, conversationID: remoteID,
-                                                 friend: friend, kind: "reaction", text: emoji)
-        struct ReactionRequest: Encodable {
-            let messageID: UUID
-            let recipientEnvelopes: [V3RecipientEnvelope]
-        }
-        _ = try await client.request("POST", path: "/messages/reaction",
-            body: JSONEncoder().encode(ReactionRequest(messageID: message.id, recipientEnvelopes: envelopes)),
-            beforeTransmission: {
-                try verifyLegacyMutation(message, friend: friend, conversation: conversation, fingerprint: pinned)
-            })
-        try verifyLegacyMutation(message, friend: friend, conversation: conversation, fingerprint: pinned)
-        _ = try LocalMessageRepository(context: context, encryption: security.encryptionService())
-            .react(emoji, to: message, reactorID: user.userID)
+        guard message.transportEncryptionVersion == 4,
+              message.conversationID == conversation.id, conversation.remoteID != nil,
+              !message.deleted, ["👍", "❤️", "😂", "‼️"].contains(emoji) else { throw MessageRepositoryError.invalidEvent }
+        let event = try makeV4ReactionEvent(emoji, message: message, conversation: conversation)
+        try await submitV4Event(event, friend: friend)
     }
 
     func markRead(_ conversation: Conversation) async throws {
@@ -723,44 +730,12 @@ struct RemoteMessageRepository {
                         sendImmediately: false)
                     continue
                 }
-                // v3 has no authenticated read event. Reading legacy history remains local.
+                // Historical v3 messages remain locally readable; no v3 read event is emitted.
             }
         }
         _ = try LocalMessageRepository(context: context, encryption: security.encryptionService())
             .markConversationRead(conversation, preferences: security.preferences)
         if security.preferences.readReceipts { try await retryV4Events() }
-    }
-
-    private func makeEnvelopes(messageID: UUID, conversationID: UUID, friend: Friend,
-                               kind: String, text: String, revision: Int? = nil) async throws -> [V3RecipientEnvelope] {
-        try verifyIdentityLookup(for: friend)
-        guard friend.sessionStatus != "identityKeyChanged" else { throw DeviceSessionError.identityKeyChanged }
-        guard let pinned = friend.identityFingerprint,
-              let contact = try await RemoteAccountRepository(client: client).confirmedFriends()
-                .first(where: { $0.userID == friend.userID }) else { throw DeviceSessionError.untrustedIdentity }
-        let peer = try await bundles(for: contact.id, fingerprint: pinned)
-        let own = try await bundles(for: registration.backendUserID, fingerprint: requiredOwnFingerprint())
-        try verifyIdentityLookup(for: friend)
-        guard friend.sessionStatus != "identityKeyChanged", friend.identityFingerprint == pinned else {
-            throw DeviceSessionError.untrustedIdentity
-        }
-        let targets = (peer + own).filter { $0.deviceID != registration.backendDeviceID }
-        guard !targets.isEmpty, targets.count <= 32,
-              Set(targets.map(\.deviceID)).count == targets.count else { throw DeviceSessionError.invalidEnvelope }
-        let identity = try P256.Signing.PrivateKey(rawRepresentation:
-            keychain.readRequired("identity-private.\(user.userID)"))
-        guard identity.publicKey.x963Representation == user.identityPublicKey else { throw AsymmetricKeyError.publicKeyMismatch }
-        let payload = try JSONEncoder().encode(V3TextPayload(kind: kind, senderUserID: user.userID,
-                                                               targetUserID: friend.userID, text: text,
-                                                               revision: revision))
-        return try targets.map { target in
-            let envelope = try MessageEncryptor.encryptV3(payload, messageID: messageID,
-                conversationID: conversationID, senderDeviceID: registration.backendDeviceID,
-                identity: identity, recipient: target)
-            return V3RecipientEnvelope(recipientDeviceID: target.deviceID.uuidString.lowercased(),
-                ciphertext: try JSONEncoder().encode(envelope).base64URLEncodedString(),
-                keyVersion: target.keyVersion, messageKeyIndex: envelope.messageKeyIndex)
-        }
     }
 
     /// Identity pinning is an explicit user action. A server-supplied first key is not silently trusted.
@@ -771,14 +746,8 @@ struct RemoteMessageRepository {
         try verifyIdentityLookup(for: friend)
         friend.remoteUserID = contact.id
         try context.save()
-        let raw: [RemoteDevicePreKeyBundle] = try await client.json([RemoteDevicePreKeyBundle].self,
-            path: "/users/\(contact.id.uuidString.lowercased())/prekey-bundle?claim=false")
+        let (fingerprint, _) = try await verifiedIdentityDirectory(for: contact.id)
         try verifyIdentityLookup(for: friend)
-        guard let first = raw.first, let identity = Data(base64URL: first.identityPublicKey) else {
-            throw DeviceSessionError.invalidEnvelope
-        }
-        let fingerprint = IdentityFingerprint.make(publicKey: identity)
-        for item in raw { _ = try item.verified(expectedFingerprint: fingerprint) }
         if let saved = friend.identityFingerprint, saved != fingerprint {
             try markIdentityChanged(friend, candidate: fingerprint)
         } else if friend.identityFingerprint == nil {
@@ -792,14 +761,25 @@ struct RemoteMessageRepository {
         let fingerprint = try await identityFingerprint(for: friend)
         guard let remoteID = friend.remoteUserID,
               let own = user.identityPublicKey else { throw V4ProtocolError.untrustedIdentity }
-        let raw: [RemoteDevicePreKeyBundle] = try await client.json([RemoteDevicePreKeyBundle].self,
-            path: "/users/\(remoteID.uuidString.lowercased())/prekey-bundle?claim=false")
+        let (current, peer) = try await verifiedIdentityDirectory(for: remoteID)
         try verifyIdentityLookup(for: friend)
-        guard let first = raw.first, let peer = Data(base64URL: first.identityPublicKey),
-              IdentityFingerprint.make(publicKey: peer) == fingerprint else {
+        guard current == fingerprint else {
             throw V4ProtocolError.untrustedIdentity
         }
         return (fingerprint, IdentitySafetyCode.make(own, peer))
+    }
+
+    private func verifiedIdentityDirectory(for remoteID: UUID) async throws -> (String, Data) {
+        let raw: [V4RemoteBundle] = try await client.json([V4RemoteBundle].self,
+            path: "/users/\(remoteID.uuidString.lowercased())/v4-prekey-bundle?claim=false")
+        guard let first = raw.first, raw.count <= 32,
+              Set(raw.map(\.deviceID)).count == raw.count,
+              let identity = Data(base64URL: first.accountIdentityPublicKey) else {
+            throw V4ProtocolError.untrustedIdentity
+        }
+        let fingerprint = IdentityFingerprint.make(publicKey: identity)
+        for item in raw { _ = try item.verified(expectedAccountFingerprint: fingerprint) }
+        return (fingerprint, identity)
     }
 
     private func verifyIdentityLookup(for friend: Friend) throws {
@@ -876,6 +856,14 @@ struct RemoteMessageRepository {
             }, afterPrepared: { item, body in
                 guard let trust = sendTrust[item.messageID] else { throw V4ProtocolError.untrustedIdentity }
                 try verifyV4PeerAccess(remoteUserID: trust.userID, fingerprint: trust.fingerprint)
+                if let hidden = try context.fetch(FetchDescriptor<Message>()).first(where: {
+                    $0.id == item.messageID && $0.deleted
+                }) {
+                    // A local delete may predate creation of the remote route.
+                    // Persist its evidence before this request can be transmitted.
+                    try MessageStore(context: context, encryption: security.encryptionService()).retainV4Tombstone(for: hidden)
+                    try context.save()
+                }
                 if let pending = try v4Vault.outgoingPending(userID: user.userID,
                     deviceID: registration.backendDeviceID), pending.messageID == item.messageID {
                     guard pending.request == body else { throw V4VaultError.damaged }
@@ -1048,6 +1036,22 @@ struct RemoteMessageRepository {
                 guard let friend else { throw DeviceSessionError.untrustedIdentity }
                 localFriend = friend
             }
+            if event.type == "reaction.added" {
+                guard ["👍", "❤️", "😂", "‼️"].contains(body.text) else {
+                    throw DeviceSessionError.invalidEnvelope
+                }
+                if let target = try context.fetch(FetchDescriptor<Message>()).first(where: { $0.id == messageID }) {
+                    guard target.transportEncryptionVersion == 3,
+                          try context.fetch(FetchDescriptor<Conversation>()).contains(where: {
+                              $0.id == target.conversationID && $0.ownerID == user.id &&
+                              $0.remoteID == envelope.conversationID && $0.friendID == localFriend.id
+                          }) else { throw DeviceSessionError.invalidEnvelope }
+                }
+                // Signed v3 reactions have neither a durable operation ID nor an
+                // authenticated causal order. Consume valid late events without
+                // replacing a newer snapshot or recreating a removed message.
+                return
+            }
             let remoteConversationID = envelope.conversationID
             let conversation = try localConversation(remoteID: remoteConversationID, friend: localFriend)
             let store = MessageStore(context: context, encryption: try security.encryptionService())
@@ -1061,22 +1065,12 @@ struct RemoteMessageRepository {
                 }
                 guard try context.fetch(FetchDescriptor<Message>()).contains(where: {
                     $0.id == messageID && $0.conversationID == conversation.id &&
-                    $0.senderID == body.senderUserID && $0.transportEncryptionVersion == 3 && !$0.deleted
+                    $0.senderID == body.senderUserID && $0.transportEncryptionVersion == 3
                 }) else { throw DeviceSessionError.invalidEnvelope }
+                // A retained local deletion may receive a signed late revision.
+                // MessageStore advances its revision without restoring plaintext.
                 try store.applyVerifiedRemoteEdit(messageID: messageID, plaintext: Data(body.text.utf8),
                     revision: revision, at: time, eventID: event.eventID)
-            } else {
-                guard ["👍", "❤️", "😂", "‼️"].contains(body.text) else { throw DeviceSessionError.invalidEnvelope }
-                guard try context.fetch(FetchDescriptor<Message>()).contains(where: {
-                    $0.id == messageID && $0.conversationID == conversation.id &&
-                    $0.transportEncryptionVersion == 3 && !$0.deleted
-                }) else { throw DeviceSessionError.invalidEnvelope }
-                let existing = try context.fetch(FetchDescriptor<Reaction>()).first(where: {
-                    $0.messageID == messageID && $0.reactorID == body.senderUserID
-                })
-                if let existing { existing.emoji = body.text }
-                else { context.insert(Reaction(messageID: messageID, emoji: body.text, reactorID: body.senderUserID)) }
-                try context.save()
             }
         case "message.delivered", "message.read":
             if event.type == "message.read" {
@@ -1136,6 +1130,7 @@ struct RemoteMessageRepository {
     /// v4 events are authenticated against the pinned account identity and the
     /// authenticated device bundle before any plaintext reaches MessageStore.
     func applyV4(_ event: RemoteSyncEvent) async throws {
+        guard try security.currentUserID() == user.userID else { throw MessageStoreError.locked }
         if event.type == "session.control" {
             try await applySessionControl(event)
             return
@@ -1157,21 +1152,51 @@ struct RemoteMessageRepository {
               event.routing.messageKeyIndex.map({ $0 == envelope.messageIndex }) ?? true else {
             throw V4ProtocolError.invalidMessage
         }
-        if event.type == "message.created",
-           let existing = try context.fetch(FetchDescriptor<Message>()).first(where: { $0.id == messageID }) {
+        let store = MessageStore(context: context, encryption: try security.encryptionService())
+        let existing = try context.fetch(FetchDescriptor<Message>()).first(where: { $0.id == messageID }) ??
+            store.restoreV4Tombstone(messageID: messageID, remoteConversationID: envelope.conversationID, owner: user)
+        if let existing {
             let digest = Data(SHA256.hash(data: wire))
             let pending = try v4Vault.incomingPending(userID: user.userID,
                 deviceID: registration.backendDeviceID)
             let recoveryPending = try v4Sessions.recovery.vault.pendingForOperation(event.eventID)
             guard existing.transportEncryptionVersion == 4,
-                  existing.lastEventID == event.eventID,
+                  (existing.lastEventID == event.eventID || existing.deleted),
                   (pending.map { $0.eventID == event.eventID && $0.deviceSeq == event.deviceSeq &&
                       $0.envelopeDigest == digest } == true ||
                       recoveryPending.contains { $0.1.incomingSequence == event.deviceSeq &&
                           $0.1.envelopeDigest == digest }) else {
                 throw V4ProtocolError.replay
             }
+            guard let conversation = try context.fetch(FetchDescriptor<Conversation>()).first(where: {
+                $0.id == existing.conversationID && $0.ownerID == user.id && $0.remoteID == envelope.conversationID
+            }), let friend = try context.fetch(FetchDescriptor<Friend>()).first(where: {
+                $0.id == conversation.friendID && $0.ownerID == user.id
+            }), senderUserID == (existing.isMine ? registration.backendUserID : friend.remoteUserID) else {
+                throw V4ProtocolError.untrustedIdentity
+            }
+            let fingerprint = try existing.isMine ? requiredOwnFingerprint() :
+                (friend.identityFingerprint ?? { throw V4ProtocolError.untrustedIdentity }())
+            try verifyV4PeerAccess(remoteUserID: senderUserID, fingerprint: fingerprint)
+            // A deleted row may have a newer local lastEventID. Only an exact
+            // authenticated creation journal can complete that earlier receive.
+            struct CreationIdentity: Decodable {
+                let kind: String; let senderUserID: String; let targetUserID: String; let revision: Int?
+            }
+            guard let cached = pending?.plaintext ?? recoveryPending.first?.1.output,
+                  let original = try? JSONDecoder().decode(CreationIdentity.self, from: cached),
+                  ["text", "attachment"].contains(original.kind), original.revision == nil,
+                  original.senderUserID == existing.senderID,
+                  original.targetUserID == (existing.isMine ? friend.userID : user.userID) else {
+                throw V4ProtocolError.invalidMessage
+            }
             return
+        }
+        if let pending = try v4Vault.incomingPending(userID: user.userID,
+            deviceID: registration.backendDeviceID), pending.localPersistenceVersion != 1 {
+            // Older journals cannot distinguish a failed first save from a row
+            // physically removed after saving. Do not resurrect their plaintext.
+            throw MessageStoreError.historyEvidenceMissing
         }
         let isMine = senderUserID == registration.backendUserID
         let senderFriend: Friend?
@@ -1220,12 +1245,11 @@ struct RemoteMessageRepository {
         }
         if let pending = try v4Vault.incomingPending(userID: user.userID,
             deviceID: registration.backendDeviceID) {
-            try ensureV4Metadata(pending.session, friendID: friend.id)
+            try ensureV4Metadata(pending.session, friendID: isMine ? nil : friend.id)
         } else if let pending = try v4Sessions.recovery.vault.pendingForOperation(event.eventID).first?.1 {
             try ensureRecoveryMetadata(pending.next, remote: senderDeviceID, friendID: isMine ? nil : friend.id)
         }
         let conversation = try localConversation(remoteID: envelope.conversationID, friend: friend)
-        let store = MessageStore(context: context, encryption: try security.encryptionService())
         let parser = ISO8601DateFormatter()
         parser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         guard let time = parser.date(from: event.createdAt) ?? ISO8601DateFormatter().date(from: event.createdAt) else {
@@ -1343,7 +1367,15 @@ struct RemoteMessageRepository {
             $0.ownerID == user.id && $0.localDeviceID == session.localDeviceID &&
             $0.remoteDeviceID == session.remoteDeviceID
         }) {
-            guard existing.friendID == friendID else { throw V4ProtocolError.untrustedIdentity }
+            if existing.friendID != friendID {
+                // Older receivers associated own-device sessions with the first chat's
+                // friend. Only an authenticated same-account session can repair this
+                // routing metadata; peer bindings and the ratchet remain untouched.
+                guard session.remoteUserID == registration.backendUserID, friendID == nil else {
+                    throw V4ProtocolError.untrustedIdentity
+                }
+                existing.friendID = nil
+            }
             existing.updatedAt = .now
             return
         }
@@ -1385,61 +1417,6 @@ struct RemoteMessageRepository {
         context.insert(conversation)
         try context.save()
         return conversation
-    }
-
-    private func bundles(for id: UUID, fingerprint: String) async throws -> [VerifiedDeviceBundle] {
-        let raw: [RemoteDevicePreKeyBundle] = try await client.json([RemoteDevicePreKeyBundle].self,
-            path: "/users/\(id.uuidString.lowercased())/prekey-bundle")
-        guard !raw.isEmpty else { throw DeviceSessionError.missingPreKey }
-        guard let first = raw.first, let identity = Data(base64URL: first.identityPublicKey) else {
-            throw DeviceSessionError.invalidEnvelope
-        }
-        let candidate = IdentityFingerprint.make(publicKey: identity)
-        let verified = try raw.map { try $0.verified(expectedFingerprint: candidate) }
-        // Directory requests suspend; do not mutate trust records for a locked or
-        // switched account, nor pin a device for an identity no longer trusted.
-        try verifyV4PeerAccess(remoteUserID: id, fingerprint: fingerprint)
-        if candidate != fingerprint {
-            if let friend = try context.fetch(FetchDescriptor<Friend>()).first(where: {
-                $0.ownerID == user.id && $0.remoteUserID == id
-            }) { try markIdentityChanged(friend, candidate: candidate) }
-            throw DeviceSessionError.identityKeyChanged
-        }
-        guard verified.allSatisfy({ $0.deviceID == registration.backendDeviceID || $0.oneTimePreKey != nil }) else {
-            throw DeviceSessionError.missingPreKey
-        }
-        for bundle in verified {
-            if let trusted = try context.fetch(FetchDescriptor<RemoteDeviceTrust>()).first(where: {
-                $0.ownerID == user.id && $0.peerUserID == id && $0.backendDeviceID == bundle.deviceID
-            }) {
-                guard trusted.devicePublicKey == bundle.devicePublicKey,
-                      bundle.keyVersion >= trusted.keyVersion,
-                      bundle.keyVersion != trusted.keyVersion || trusted.signedPreKey == bundle.signedPreKey else {
-                    throw DeviceSessionError.untrustedIdentity
-                }
-                if bundle.keyVersion > trusted.keyVersion {
-                    trusted.keyVersion = bundle.keyVersion
-                    trusted.signedPreKey = bundle.signedPreKey
-                }
-            } else {
-                context.insert(RemoteDeviceTrust(ownerID: user.id, peerUserID: id, bundle: bundle))
-            }
-        }
-        try context.save()
-        return verified
-    }
-
-    private func verifyLegacyMutation(_ message: Message, friend: Friend,
-                                      conversation: Conversation, fingerprint: String) throws {
-        try verifyIdentityLookup(for: friend)
-        guard friend.identityFingerprint == fingerprint, friend.sessionStatus != "identityKeyChanged",
-              conversation.ownerID == user.id, conversation.friendID == friend.id,
-              message.conversationID == conversation.id, message.transportEncryptionVersion == 3,
-              !message.deleted,
-              try context.fetch(FetchDescriptor<Message>()).contains(where: { $0.id == message.id }),
-              try context.fetch(FetchDescriptor<Conversation>()).contains(where: { $0.id == conversation.id }) else {
-            throw DeviceSessionError.untrustedIdentity
-        }
     }
 
     func markIdentityChanged(_ friend: Friend, candidate: String) throws {

@@ -217,6 +217,67 @@
 5. **客户端验证顺序**：在 `V4PreKeyService` 外增加目录验证服务，先校验请求账号、账号签名和完整集合，再用成熟验证器验证承诺/查找/历史与检查点；核对独立见证和已固定信任根、单调下限以及新鲜度；最后确认 bundle 的设备身份和版本。通过后才允许 `V4MessageSessionService.prepare`，在 Token 等待后的发送门禁再核对相同目录授权代次。View/Repository 的业务入口和 v1/v2/v3/v4 历史读取不改。
 6. **分叉与隐藏检测条件**：独立审计者须监控同一个部署的完整历史，并对共同检查点背书；至少一名满足所选套件策略的见证必须与日志运营方独立，信任根不可从同一未经验证的目录动态下载。客户端之间可以通过已认证通道比较检查点；是否选门限见证、多少签名及新鲜度窗口，须与套件威胁模型一并审查后固定。不同大小的检查点需验证一致性，不能直接判为攻击；相同版本不同根或不一致历史必须阻断。全部见证串通、客户端隔离及首次历史缺失仍有边界，不承诺实时/绝对检测。
 
+#### 本轮核实的接入缺口（2026-10-23；实施阻塞，不是已上线协议）
+
+- **现有注册授权不足以复用为 roster 授权**：`device.Authorize` 的双方签名绑定账号、nonce 和新设备公钥，但设备 UUID 在验签后由服务器生成；`PutV4Prekeys` 再验证账号对该 UUID/版本/设备身份的绑定。两步都没有签署完整设备集合、前序 roster 或撤销记录。未来登记必须增加可签署的最终设备标识/待批准快照阶段，原 `/devices/authorize` 不能被描述为已授权目录状态；旧设备不自动进入强制策略。
+- **明确首期授权取舍**：建议先采用单一账号签署权威批准完整快照，不向新设备自动复制账号私钥。新设备提出变更，持有账号签署权的已核验端点审核并签署完整目标集合；撤销同样须有前序快照授权。多签/委托及权威丢失后的恢复属于后续独立协议评审，不能由后端代签或通过登录 Token 取代。失去唯一签署权时须停止目录变更，走显式身份重建/联系人重新核验。此取舍需和现有多设备登记兼容向量一并审阅后才能实施。
+- **并发与撤销闭环**：同一前序 revision 的两个合法变更只能由批准端重新审核合并；服务器 CAS 只能报告冲突，不能替用户补签/合并。撤销先关闭后端 Token/路由；新的已证明 roster 发布前暂停受影响账号的严格发送。日志证明仅说明收录/一致，不能让未经账号授权的变更合法。仅签一条设备记录无法证明没有遗漏其他设备。
+- **证明不是简单包含**：必须证明“该账号在受见证检查点的最新完整值”，并将账号授权快照字节、套件/日志 ID、设备身份与预密钥版本绑定到同一证明。普通日志包含证明允许返回历史值。新设备缺失历史时，须从独立可信根与已固定账号身份引导；同服务器下发的新根、单机单调数值、服务器自签 JSON 都不能补足分叉检测。
+- **独立见证与新鲜度仍未冻结**：Signal 的服务端及 auditor 是不同服务，后者验证连续历史并签树头；并非自动给 Luma 提供 Swift 验证器、账号授权或独立运维方。所需 Go 工具链、许可证、确切源码版本、跨语言向量和审计证据尚未锁定。至少一名不受同一服务器控制的见证、其固定公钥与独立获取/比对通道是部署前置条件。见证门限、检查点最大陈旧窗口、系统时间回拨/长期离线处理必须在套件评审中定值；未定值前不能开启强制校验或宣称实时检测。见证不可达时保持历史可读并暂停严格新发送，不能向旧目录静默降级。
+- **接收与恢复**：当前/已撤销设备的历史公钥核验与新发送目标须分开；历史消息要绑定发送时已验证的授权快照，不能拿最新 roster 的排除结果直接销毁历史链。跨存储提交先记录已验证检查点和授权代次，再准备新发送；目录校验失败保留 Ratchet、outbox、OTP tombstone 和未决 journal。恢复检查点须接续原日志历史，丢失历史不保留“已验证”状态。
+
+本轮仅为后续可复核评审记录候选快照：server `2eb0ead9a23dc4bd2dcb75a2f803c6e8ee85600c`、auditor `13a9126a63081c189de8422bb2e7dca770adec9f`（只读远端查询）。[该 server 的 go.mod](https://github.com/signalapp/key-transparency-server/blob/2eb0ead9a23dc4bd2dcb75a2f803c6e8ee85600c/go.mod)要求 Go 1.27 / toolchain 1.27.3，[LICENSE](https://github.com/signalapp/key-transparency-server/blob/2eb0ead9a23dc4bd2dcb75a2f803c6e8ee85600c/LICENSE)为 AGPL-3.0；本项目仍 Go 1.24。官方 README 明确存在 Signal 应用差异，auditor 是独立历史验证/签树头服务；它们没有自动补足 Luma 账号 roster 授权与独立见证运维。此快照不是选型批准或完整源码审计；未引入依赖、降工具链或自制证明，尚须许可证兼容评估、Swift 验证器/向量、根分发与独立运营方。
+
+**客户端候选补充**：本轮另核实 libsignal `b2a5c30f3245c1bcad04b27b1e752a38321c793d` 已有 [Rust keytrans 验证入口](https://github.com/signalapp/libsignal/blob/b2a5c30f3245c1bcad04b27b1e752a38321c793d/rust/keytrans/src/lib.rs)和 [Swift API](https://github.com/signalapp/libsignal/blob/b2a5c30f3245c1bcad04b27b1e752a38321c793d/swift/Sources/LibSignalClient/KeyTransparency.swift)，不能把“Luma 尚无兼容验证器”写成“上游没有 Swift 能力”。Rust 提供通用字节值与 search/monitor 验证，可作为不改算法的适配候选；Swift 的公开 Client 则绑定 Signal 聊天连接、ACI/IdentityKey，并非直接可注入 Luma P-256 账号/完整 roster 的独立验证器。其[既有 Swift 测试](https://github.com/signalapp/libsignal/blob/b2a5c30f3245c1bcad04b27b1e752a38321c793d/swift/Tests/LibSignalClientTests/KeyTransparencyTests.swift)包含 Signal staging 网络用例，不是 Luma 的跨语言离线证明向量；本轮未运行、未向 Signal 服务发送 Luma 数据。后续应评审“固定 Rust 验证核心 + 薄 FFI + Luma 持久化/网络适配”，先验证与所选 Go server/auditor 的实际 wire 兼容，不移植证明算法或假造 Signal 身份。官方[支持范围](https://github.com/signalapp/libsignal/blob/b2a5c30f3245c1bcad04b27b1e752a38321c793d/README.md)明确外部使用不受支持、接口可变化；AGPL、FFI 故障/损坏输入、版本锁定及独立审阅仍是接入门槛。日志可作为独立服务使用其 Go 工具链，不需要仅为选型而修改 Luma 后端工具链。
+
+以上为既有方案的实施门槛补充。当前没有选定可直接兼容的、经独立评审的完整套件，也没有独立见证部署或新登记授权契约；因此本轮不新增目录 SQL/API/自制证明代码。实施顺序仍是：冻结套件/权威与向量 → 登记/撤销版本化合同 → 增量表及发布 outbox → 客户端旁路核验 → 双端与分叉故障注入 → 账号显式强制。每步失败只暂停，不回退有效密钥或旧会话。
+
+#### 授权合同与验收要求补齐（2026-10-23；尚未冻结 wire）
+
+后续的证明冻结门禁、可执行恢复合同和 v4 上下文迁移统一见[接入合同 v1](../Protocol/Client_Server_Protocol.md#可信密钥目录接入合同-v12026-10-23未接入生产)。下文授权矩阵继续有效；不把后续参考工具当已运行的见证。
+
+本节固定安全要求与失败语义，**不代表已冻结密码套件、编码、签名 transcript 或可执行证明向量**。旧 API 的有效签名只是单设备登记授权，不能转译成已签名 roster。客户端现在没有透明目录验证器，服务端也没有目录发布表或见证接口。
+
+**权限及设备集合演进**
+
+| 操作 | 必须取得的端侧授权 | 发布前后及失败行为 |
+| --- | --- | --- |
+| 首份完整集合 | 带外固定的账号身份签署权审核账号、最终设备 ID 和完整集合 | 注册返回的 UUID 必须再被签入快照；不能将提交登记的 nonce/公钥签名当作该最终快照的签名。未完成授权/证明前只保持 legacy 能力，不授予严格目录能力。 |
+| 新增设备 | 账号签署权签署基于上一已确认 revision 的完整目标集合；新设备提供密钥持有证明 | 新设备 Token、单设备签名或服务器“登记成功”不能批准 roster。新增只在 witnessed 状态成为严格发送目标；原有设备不因新设备未就绪而被静默隐藏。 |
+| 更新预密钥 | 已有设备签名证明 + 账号签署权批准被承诺的新版 SPK/版本 | 同身份单调增加版本；同版本换公钥拒绝。OTP 库存领取/补充与 roster 分离，耗尽报告不可用，不将设备从已证明集合中移除。 |
+| 更换设备身份 | 账号签署权明确批准移除旧身份及登记新的设备身份 | 旧设备 ID/身份形成不可复用墓碑；不能在同版本就地换身份。联系人暂停受影响的新发送，不覆盖旧 Ratchet。 |
+| 撤销 | 账号签署权签署新完整集合及旧设备的撤销记录 | 后端立即关闭 Token/路由是服务授权；联系人只有获得新证明才知道撤销，不能承诺恶意服务器下瞬时全局撤销。见证未完成时不得宣称已传播。 |
+| 丢失签署权/账号恢复 | 预先审核的恢复授权；当前没有此合同 | 没有恢复材料时禁止后端代签或重置同一身份。显式重建身份并要求联系人重新核验；历史私钥不凭数据库备份恢复。 |
+
+完整快照必须覆盖账号 UUID/身份代次、账号签署权、公钥目录策略版本、revision、前序承诺、所有活动设备及撤销墓碑；每个设备绑定最终 ID、账号归属、认证公钥、协商/签名身份、SPK 摘要及版本。排序/唯一性/规范编码/大小上限须与冻结套件一起给出字节向量，不使用任意 JSON 重序列化作为签名输入。签署权不自动复制给新设备；签署端持久记录已批准的前序和结果，同一前序不能在崩溃/重试时再批准另一份集合。密钥克隆或权威主动双签不在服务器 CAS 的保证内。
+
+提案的本地状态限定为 `draft → authorized → pending_log → witnessed → active`；每步绑定同一快照承诺和操作 ID。精确重试返回同一结果；同操作 ID 不同内容、同 revision 不同值或前序不匹配均冲突阻断。`active` 只能被证明的后继取代，不能转回旧 revision；新提案失败不覆盖原已确认快照。撤销可使路由先关闭，但不能伪造 witnessed 状态。上述是待实现状态机，不是新增生产枚举。
+
+**承诺、证明与客户端规则**
+
+1. 完整 roster 是选定透明套件的一个原子映射值；单设备包含证明或逐设备查询的并集均不能证明集合完整。账号标识/套件/日志及快照字节必须与同一次最新值查找绑定；日志成员包含、最新映射证明与历史一致性是不同检查，缺一不接受。
+2. 先验证固定的套件配置、账号身份和快照授权，再按该套件验证查找/打开承诺、包含及一致性；验证 mandatory auditor、配置/日志 ID、检查点新鲜度和本机下限，最后把所有 bundle 与同一 roster 匹配。不同检查点大小须给出历史一致性；同大小不同根、同账号 revision 不同快照、低于已存下限均拒绝，不用重取到“可通过”的任意分支消除冲突。
+3. 首次客户端必须通过独立渠道引导日志/审计者根并核验账号身份。已持检查点的长期离线客户端须接续原历史并取满足新鲜度的证明；新鲜度参数、auditor 起始位置及监控窗口采用冻结套件配置，不能由每次未认证 API 响应随意改变。时钟明显回拨/可靠性未知、检查点丢失或恢复后低于已知下限时暂停严格发送并重新可信引导，不凭服务器时间重建“已验证”。
+4. 验证通过的快照/检查点、授权代次和发送准备需用现有 journal/CAS 接续；Token 等待后仍复核该代次，已封装待发不能改用另一份 roster 重新派生。不明确的提交保留 journal/outbox/OTP tombstone，不重置链。目录失败不破坏已保存的历史阅读。
+5. **历史与撤销仍有协议缺口**：现有 `V4Envelope.authenticatedHeader()` 未绑定目录快照/检查点。服务器的 createdAt 不能证明某条迟到消息确实发于撤销前；单凭已撤销设备的历史公钥不能授权它继续发新消息。后续需冻结经过认证的目录上下文及历史接收策略、旧会话迁移向量，再决定是否增加版本化 AAD/控制扩展。不能给旧信封补一个服务器提供的无认证快照字段，也不能直接丢弃所有历史链来绕过问题。本轮不改 v4 消息格式。
+
+**独立见证的具体约束**
+
+- 首期候选为所选套件的第三方 auditor 模式，要求客户端固定的**指定必需 auditor**签名；不是“任意一名见证签过即可”。同一管理员、同一可替换根配置或同一秘密管理权限下运行另一个容器不构成独立见证。多见证门限若以后采用，必须另行证明容错和诚实交集条件，不能用松散任选签名实现。
+- auditor 从固定日志配置和已持久化检查点逐条验证连续更新，不仅验证服务器签名；必须在对外释放新签名之前可靠保存对应状态/签署决定，并拒绝从旧备份自动回退再签另一分支。同一 witness key 的多个副本需共享安全的单调签署约束；分开部署但各自可回退不能保证不双签。
+- 客户端验证 auditor 签名必须绑定该套件规定的日志配置、树大小、根及时间上下文；auditor 签名不会替代账号 roster 授权。auditor 拒签、不可达、过期、证明缺失或配置不符时暂停严格新发送，不静默换根/跳过签名。当前已解密历史仍可读；有两份不一致证据时只保存非秘密证据供审计，不能由主服务器选其中一份继续。
+- 现有候选并非可直接部署的保证：[固定 auditor 源码](https://github.com/signalapp/key-transparency-auditor/blob/13a9126a63081c189de8422bb2e7dca770adec9f/src/main/java/org/signal/keytransparency/audit/Auditor.java#L198)先调用 `setTreeHead`，远端成功后才 `storeAuditorStateAndSignature`；其缺失状态路径从零开始。须验证“远端已收到签名但响应丢失/本地落盘失败/重启”窗口及旧状态恢复，或选择有审阅证据的其他实现。这里是 **Luma 选型阻塞项与待复现风险，不是已完成的上游漏洞验证**，未修改或引入该依赖。[草案 05](https://datatracker.ietf.org/doc/draft-ietf-keytrans-protocol/05/)还要求 auditor 配置、历史连续性和新鲜度验证；不能混用此草案与 Signal 应用差异的字节格式。
+
+**最小冻结验证套件：当前缺少的交付物**
+
+选型负责人须先交付：固定源码/许可证/审阅证据、Go/Swift 共用的真实证明与规范字节向量、签名输入、客户端验证器版本、可信根/配置及轮换策略、独立运营方、持久签署恢复证明、目录上下文迁移方案。上述任一项缺失，suite 状态为 `not_frozen`，不生成自制通过向量、不增加默认放行验证器或强制策略开关。
+
+| 少量合并回归组 | 必须提供的输入及拒绝条件 | 当前证据 |
+| --- | --- | --- |
+| 授权及集合完整性 | 正常新增/轮换/撤销；未授权操作者、重复 ID、少一设备、换账号、同前序双提案、OTP 不可用但 roster 仍含该设备 | 本轮仅验证既有登记/撤销权限和持久化交错；完整 roster 编码/向量未实施 |
+| 证明及见证 | 官方有效查找/一致性证明；单独包含旧值、错误打开值、同大小分叉、不同大小不一致历史、伪造/可选见证、缺证明 | 没有锁定 Go/Swift 可复用验证器，未执行；不能以 stub 返回 false 计通过 |
+| 迁移及恢复 | 新端无状态、长期离线/时间回拨、旧检查点恢复、日志/见证密钥轮换；签名外发前后断电、客户端/目录发布部分提交 | 需要隔离日志+独立 auditor、双端和故障注入；当前均未完成 |
+
 #### 分步迁移、持久化与恢复
 
 | 阶段 | 必要改动 | 验收与回退条件 |
@@ -268,3 +329,391 @@
 - 透明目录结论和可执行的阶段设计已更新到本报告“跨设备可信目录”节，包含账号授权的完整 roster、私密索引、成熟证明验证器、独立见证、增量迁移/发布 outbox、客户端单调检查点、强制策略及数据库/日志恢复对账。选型仍需锁定源码版本、许可证、兼容向量与独立审计；没有新增目录 API、SQL、证明算法或声称已检测跨设备分叉。
 - 核查近期 `V4SessionVault` / `V4PreKeyService` / `V4MessageSessionService`、仓储发送门禁、待发队列及 `SecurityManager` 的关联调用：已有账号/指纹复核、journal 保留和目录下限仍在；本轮未确认需要修改的新竞态，不重写已完成逻辑。Face ID 系统提示与 scenePhase 交错仍需真实设备验证，未据静态检查宣布生物识别可用性通过。
 - Recovery 继续默认关闭。不更改 Ratchet、v4 信封或生产安全文案。真实双设备、完整故障注入、独立密码学审计和可信目录基础设施均未完成；不满足启用生产 E2EE 标识条件。
+
+
+## 2026-10-23：可信目录接入门槛与数据库运行权限准备
+
+> 历史轮次快照；其中“默认部署未切换”的结论已由下节本轮部署代码接入更新。既有验证记录仍保留。
+
+### 已修复且已验证（隔离 PostgreSQL 范围）
+
+- 起止 `main` / `6c3e47a9543b1473592a320155b7bb626cb206fa`，只读核对远端 main 相同。开始时仅有用户未跟踪 `.claude/`，原样保留；本轮不提交、推送或部署。
+- **权限分离的启动缺口**：原 API 必须在启动时执行 DDL 和索引补齐，无法直接使用无 DDL 的运行角色。`backend/cmd/luma/main.go`、`internal/config/config.go` 增加显式 `luma migrate` 和 `LUMA_AUTO_MIGRATE=false` 路径；后者只读核对迁移集合与 HMAC 连续性，拒绝所有者、管理属性、角色成员关系、DDL 和迁移账本写权限。默认 true 保持旧部署兼容，不自动切换连接串。
+- `internal/useridindex/index.go` 复用原索引扫描逻辑，新增只读 Verify；缺索引或错误 secret 失败，不在 API 启动时写回。现有 Backfill 行锁与迁移行为保留。
+- `internal/database/database.go` 的新增版本验证在回归中暴露 search_path 回退：当前 schema 账本不存在时可能读到后续 schema 的账本。修正为同连接取得 current_schema 并限定标识符，缺账本、缺迁移、未知更高版本均拒绝且不执行 SQL 文件。
+- `backend/ops/runtime-grants.sql` 是显式管理员模板，不是新 migration：专用数据库、独立既有角色、预期对象/所有权；事务内按实际 API 操作授予 DML，账本只读，无预留 push_tokens、序列、TRUNCATE 或未来对象默认授权。全局和 schema 默认授权都撤销；既有列级授权需管理员先审阅清除，模板不默许隐藏 ACL。不提供行级租户隔离，不能替代 API 权限检查。
+- 仅扩展两项原集成测试，并新增一项集中权限/恢复回归：`TestConcurrentStartupMigrations`、`TestLegacyBackfillSearchPrivacyAndFriendRequest`、`TestRuntimeRoleBoundary`。使用本轮专建的 PostgreSQL 17.11 临时集群、独立 Unix socket、唯一数据库/角色及合成数据，实际执行迁移、HMAC/搜索/searchable/好友申请、权限拒绝、重复授权、全局默认授权清理，以及真实 pg_dump/pg_restore 后重新授权；三个用例均实际通过，未以 skip 计通过。账本回退问题先失败后修复并重跑相关用例；psql 连接夹具初次配置错误也已修正。
+- `go vet ./cmd/luma ./internal/config ./internal/database ./internal/useridindex`、Go 格式检查与 `git diff --check` 通过。没有单独 Go build、iOS/Release 构建、全量测试、Docker、真实 VPS 或生产迁移。临时集群仅用于这批验证，结束后停止清理；不操作实际数据/备份。
+
+### 已实施但未充分验证
+
+- 已同步 `backend/README.md`、数据库设计、部署文档及本轮额外要求的 `Threat_Model.md` / `Privacy_Model.md`。明确公开资料/关系/路由仍可见、首次带外信任、目录分叉、Keychain 生物识别边界、age local/offline 取舍与真实验收缺失；不把预留 APNs/隐私设置写成已完整执行。
+- **默认 Compose 仍以初始化所有者运行并自动迁移**。独立角色是已验证的准备能力，未接入安装/更新/恢复/回滚自动生命周期。已有卷所有权转换、角色秘密注入、服务进程与代理联调、Ubuntu 灾备及旧二进制回滚仍未充分验证；不能仅替换生产 URL 或关闭迁移开关上线。001–007 迁移及现有数据模型未改。
+- 未发现本轮必须修改的新 iOS 信任/队列/journal 竞态；不重写已完成加固，也不重跑未变化的密码学测试。本轮未证明测试冗余，未删除关键安全用例；没有新增测试框架或生产依赖。
+
+### 需要协议升级 / 外部验收
+
+- 既有设备授权签名没有签署完整 roster、前序快照或撤销，且最终设备 UUID 由服务器在授权验签后分配。目录接入前必须冻结应用授权合同、成熟验证器及跨语言向量、最新完整值/历史一致性证明、独立见证与新鲜度策略；本报告已补齐并发审批、历史接收、检查点恢复和迁移阻断条件。没有添加自制透明证明、目录 API 或数据库表，目录分叉/选择性隐藏尚未解决。
+- 真实双设备、Face ID、完整持久化故障注入、现有数据卷全生命周期与独立密码学审计仍待外部验收。Recovery 默认关闭，不变更 v4 核心或安全标识，不宣称达到生产 E2EE 安全标准。
+
+
+## 2026-10-23：威胁模型逐项闭环与默认部署权限接入
+
+起始/结束仍为 `main`、`6c3e47a9543b1473592a320155b7bb626cb206fa`；只读远端 main 一致。保留上一轮全部未提交 Go/文档/授权模板和 `.claude/`。以下是本轮新增修改；不重新实施原 Ratchet/Recovery/PreKey、Token、备份加密或附件保护。
+
+### 已修复且有本地定向证据
+
+- **P1，默认 API 持数据库管理员凭据**：`deploy/docker-compose.yml` 固定 API 为 `luma_api` 和 `LUMA_AUTO_MIGRATE=false`；`migrate`、`db-grants` 是独立短时管理员任务，不向 API 注入管理员密码。新增 `database-role.sh` 校验/创建无继承、无所有权的 LOGIN 角色，以 SCRAM 设置运行密码，并复用授权模板。口令只从环境读取，不通过 argv/归档/日志；关闭该口令设置会话的语句、错误正文、时长和事务采样日志。原 `luma` 管理员和表所有权保留，避免对旧卷冒险转换；管理员/宿主机失陷仍不由此防护解决。
+- **权限拆分的恢复一致性**：`lib.sh` 统一数据库/Redis → 明确重跑迁移 → 重授权 → API → 代理顺序，任一步失败不启动后续服务。deploy/update/restore/补偿接入该顺序；backup/domain 只恢复 API/代理，避免在线期间执行意外迁移。新安装生成独立密码，已有配置仅显式 deploy 时补缺失字段，保留全部既有秘密。
+- rollback/update/restore 在切换代码、覆盖数据前检查目标版本支持独立运行角色，拒绝回到管理员 API。补偿重放同样先检查原代码版本；停止命令失败明确报告状态未知，不假称已安全停机。旧归档字节与 age 格式不变，显式 `LUMA_RESTORE_KEEP_CODE=1` 可在人工确认后保留当前代码恢复旧数据；仍要求备份版本存在且属于当前 main 历史，并保留原完整性/HMAC/空间预检和失败补偿。此为兼容门禁，不宣称已验证所有历史 schema 的升级。
+- **P2，WebSocket 帧绕过握手限流**：`backend/internal/websocket/websocket.go` 原来每个帧都可触发输入状态 SQL/Redis，且 Token 只每 25 秒检查。本轮每连接每秒最多四个应用帧、超限 1008 关闭；处理有效输入状态前复核 Token/设备/账号，SQL 查询限时三秒。复用定时检查，保留原写 deadline/读大小限制；不修改消息 wire，也不把它称为完整抗 DoS 或撤回已在执行请求。
+
+- **P1，PreKey 首次写入和设备撤销竞态**：原 `PutV4Prekeys` 只锁可选的公钥束行，首次发布尚无行可锁；请求鉴权后遇到撤销仍能补回 OTP。既有真实数据库回归追加迟到上传后先复现 **204**，修复为事务内锁定始终存在的所属活动设备行，与撤销共享锁顺序；旧/v4 上传复用 `lockActiveDevice`。旧版有效签名上传和 v4 迟到上传均拒绝 **403**，v4 库存保持清空，历史撤销公钥只读核验保留。新锁同时串行首次插入，避免两个未见记录的上传越过旧版本检查；此并发交错尚未做完整故障注入，不声称替代客户端目录回滚防护。
+
+### 实际验证与精简
+
+- 独立创建 socket-only PostgreSQL 17 临时集群，只使用可销毁合成数据库/角色；没有使用现有服务或生产数据。扩展既有 `TestRuntimeRoleBoundary`，改为调用真实 `database-role.sh` 和原授权 SQL，验证重复运行、DDL/账本/序列/预留表拒绝、未来对象默认 ACL、真实 pg_dump/pg_restore 后重新授权。首次通过后，仅因新增口令日志保护设置再次运行该项；在集群强制语句/时长日志条件下通过，服务器日志未出现合成口令。
+- 扩展两项既有 WebSocket 测试：原断开测试复用连接夹具覆盖撤销与超限 1008；原 Presence/block 测试增加有效/撤销凭据复核。两个顶层测试（断开测试含两个子场景）均通过，未以 skip 计通过。未新增 Go 测试套件或重复密码学测试。
+- 另外复用 `TestV4PublicDirectoryAndRevokedHistory` 验证有效签名的旧/v4 撤销迟到上传、补库及历史读取，先失败后修复通过；没有新建 PreKey 测试套件。
+- 仅新增一个精简 Shell 回归 `deploy/tests/database-lifecycle.sh`，通过真实 helper 的合成 Compose 调用记录验证顺序和各阶段失败阻断；它不是 Docker/数据库故障注入。修改 Shell 的 `bash -n`、`sh -n database-role.sh`、Ruby YAML 解析与 API 无管理员凭据/依赖链原子检查、受影响包 `go vet ./internal/database ./internal/websocket` 及 `go vet ./internal/device`、格式及 `git diff --check` 通过。ShellCheck/Docker 不可用，未标记通过。
+- 没有独立 build、iOS/Release/全量测试、Docker/VPS/生产迁移。未修改 iOS、消息协议、001–007 migration、现有备份/密钥；没有证据证明既有核心安全测试冗余，本轮不删除。只合并 WebSocket 凭据复核和脚本启动顺序，未做无关重构。
+
+### 部分缓解、协议升级与外部验收
+
+- `Threat_Model.md` 的全部既有条目均逐项追踪，加入此前遗漏的接口滥用/枚举、WebSocket、TLS/代理/Redis 与日志威胁，并标注结论/源码/限制；`Privacy_Model.md`、后端与部署文档同步真实默认配置。没有把“有代码”当成“已生产验收”。
+- 已核查身份固定/签名/版本、AEAD 与有界乱序、journal 提交、敏感字段/缓存/索引/备份、鉴权和 block、文件权限与墓碑、Redis 失败关闭及代理隔离；本轮未确认额外必须修改的新密码学/本地明文泄露路径。此结论来自源码追踪，不等于动态流量、系统缓存、生产日志和独立审计通过。
+- **需要协议升级**：跨设备目录分叉、隐藏/回滚完整 roster 尚未解决。候选方案、成熟实现快照及具体缺口已更新到既有设计节；当前缺账号授权完整快照/注册最终标识合同、冻结的最新值/包含/一致性验证套件与 Swift 向量、独立见证根/运营方及新鲜度/根轮换策略。不能靠简单签名、哈希或本机下限完成，不添加未经审阅的目录协议。
+- **需要隔离容器验收**：已完成默认配置和维护脚本接入以及真实 PostgreSQL 权限/恢复验证；Docker/Ubuntu 的安装、现有卷首次迁入、自动更新失败、回滚和断电联合故障注入尚未完成。旧安装首次迁入必须先用原工具验证备份并人工审核，失败保持停机；不自动回退管理员 API。
+- **保留的固有限制**：首次信任须带外核验；整体 Keychain 回滚/已解锁端点失陷、SQLite/系统历史副本、弱备份口令、VPS local 私钥同机、offline 维护时 root 窃取、备份来源与元数据可见性仍存在。分布式注册/连接/附件资源配额及外部日志采集也需独立运维设计和负载验证，不能由此次局部限流根除。
+- Recovery 保持默认关闭。真实双设备、Face ID、完整持久化故障注入及独立密码学审计仍未完成，不启用生产 E2EE 标识。本轮不提交、推送、合并、发布或部署。
+
+## 2026-10-23：可信目录最终接入审查与验收准备
+
+### 实际修复
+
+- **P1，迟到设备审批仍可新增设备**：`device.Authorize` 原事务只锁 challenge；设备在鉴权后撤销或账号禁用时，后续登记仍可能提交。隔离 PostgreSQL 持有账号行锁、暂停登记后撤销审批设备再释放，旧代码返回 **201**。这不是完整透明目录缺失的替代描述，而是现有登记权限的实际竞态。
+- `backend/internal/device/device.go` 的登记/撤销现在共用账号行锁，并在取得锁后的**新语句**复核操作者所属活动设备。按账号串行设备集合变更，避免把两个相互撤销请求改为“先锁自己再锁对方”的倒序锁；账号禁用、已撤销/非所属操作者拒绝 403，数据库失败返回通用 503。挑战/双签名、UUID 分配、公钥版本及消息协议不变。已先取得授权锁并提交的合法操作按该顺序生效，不承诺撤回已经完成的请求。
+- 仅补充一个 `TestDeviceManagementAuthority`，复用现有 integration 文件及真实处理函数：有效登记、挑战重放、等待账号锁后撤销、拒绝时不消费 challenge/不新增设备、撤销者不能更改其他设备、禁用账号不能审批。`backend/openapi/openapi.yaml` 同步失败码和单设备授权的准确边界；没有新增目录 API/表、私钥或密码学算法。
+
+### 目录结论与兼容门禁
+
+- 在既有“跨设备可信目录”设计内集中补齐完整集合授权矩阵、提案状态规则、证明验证顺序、必须独立 auditor 的信任策略、状态丢失/长期离线及恢复条件、三个合并验证组。**只是冻结安全要求，wire/证明套件仍未冻结**；不放入默认返回成功的占位验证器。
+- 本轮再次只读核对官方候选的固定版本 README/源码及 IETF 草案 05。新增两个具体阻塞：候选 auditor 的签名外发先于本地持久化窗口未经过 Luma 故障审阅；现有 v4 AAD 没有目录上下文，撤销前在途消息与撤销后新发消息不能靠服务器时间区分。前者需要候选实现审查/故障向量，后者需要端侧认证的目录上下文与兼容接收合同，不能在本轮给旧信封附无认证字段强行上线。
+- 还缺账号签署端防双签 journal/规范编码与 Go/Swift 真实证明向量、适配/许可评估、独立运营方及固定配置、新鲜度/日志根轮换、目录状态增量迁移。先锁定完整验证套件并通过审阅，再上线授权/发布 outbox/客户端验证；不从现有无完整签名的设备列表自动生成“已授权 roster”。此前单记录签名、本机高水位继续有效，不声称已解决跨设备分叉或选择性隐藏。
+- 默认 Compose 的 API 独立账号、迁移/授权短时任务及恢复重授权顺序已复核；未重复修改原授权模板。完整 Ubuntu/Docker、旧卷首次切换与维护失败恢复仍未验证。具体隔离步骤收敛到[部署指南](../../deploy/README_DEPLOY.md#隔离-ubuntu-生命周期验收待执行)，不新建重复验收报告。
+
+### 外部安全验收门槛（待执行）
+
+| 验收 | 环境与必做操作 | 通过条件及保留证据 |
+| --- | --- | --- |
+| 双实体设备 | 固定同一测试提交的两台独立 iOS 真机、独立账号/Keychain、隔离 HTTPS Backend；带外比较安全码，再首次/双向/多条文字、图片/文件/语音、编辑/删除/已读/Reaction | 内容与事件各一次、身份绑定一致、已读关闭不发送；弱网/丢失 HTTP 成功响应/断线重连后精确重试、cursor 不跳过失败、无重复。记录设备/iOS/代码与合成消息完整性，不导出秘密。独立逻辑设备/URLProtocol 测试不计此项通过。 |
+| 握手冲突 | 专门测试构建显式开启 Recovery，生产默认仍关闭；两真机同时首次发消息，交换网络先后并重启 App/Backend | 双方首消息都保留、选主一致、落选链排空、已提交 Ratchet 不替换；记录 proposal/revision/阶段及断言，不记录密钥。已有本地历史结果不能代替本项。 |
+| Face ID/锁屏 | 真机分别允许/拒绝/取消/不可用，系统提示期间锁屏、后台、账号切换；重启设备后首次解锁前后读取、授权迟到回调 | 未授权内容不可呈现，迟到回调不授权新账号；Keychain 锁定错误不创建替代密钥。App Switcher/录屏保护按设置生效；模拟器成功不证明硬件门禁。 |
+| 持久化故障 | 在发送 journal、每收件人 Ratchet、SwiftData save、Ratchet commit、cursor/ack、附件上传/缓存/删除边界逐一注入失败/强杀，再恢复存储重启 | 要么一致提交，要么保留未决日志可续办；不丢消息、不重用 OTP、不回滚链、失败不推进 cursor，不删除唯一恢复材料。精确区分“写入前失败”和“写入结果未知”。需有逐阶段证据，不能只做一次 App 重启。 |
+| 身份/设备变更 | 上述请求等待 Token/目录/网络期间更换好友身份、撤销设备；含旧版编辑/回执、乱序/重放/篡改事件 | 新发送暂停且不静默信任，未经端侧认证的旧操作不修改 v4；旧设备无法再同步/路由。合法历史接收不得被当成新发送授权；目录新合同实现前保留对应阻塞。 |
+| 目录独立验收 | 冻结套件、真实 Go/Swift 证明向量、独立日志/auditor 状态；分别返回分叉、旧值、隐藏设备、错证明、缺/旧见证，重启/回滚审计者状态 | 三个目录验证组全部通过；证明失败无 fallback；主服务器不能产生所要求的见证签名。需核对运营权限/根分发独立性，另一个同权 VPS 进程不算独立。当前 suite 未冻结，不能执行或标为通过。 |
+| 独立密码学审计 | 提供固定提交、构建/依赖清单、威胁与授权合同、v4/Recovery/目录字节规范、匿名化测试证据；由独立审计方复核实现与协议 | 覆盖身份/首次信任、握手、AEAD/AAD、Ratchet/跳过密钥、PreKey、目录一致性/见证恢复、降级、跨存储事务及附件；严重发现有复核修复结论。单元测试通过不等于审计认证。 |
+
+以上各项分别记录 `未执行/阻塞/失败/通过`、提交、环境、步骤、结果及审阅人；未提供证据不得推定通过。外部验收失败后保留现场，不能 reset Ratchet/覆盖身份来“恢复测试”。
+
+### 本轮验证与保留边界
+
+- 本轮独立创建 socket-only PostgreSQL 17 临时集群，执行既有 001–007 SQL 建立合成测试表，无生产数据/网络监听。新回归先复现撤销后的 **201**；修复后集中执行 `go test ./internal/device -run '^(TestDeviceManagementAuthority|TestRevocationInvalidatesTokenAndEmitsOneCursorEvent|TestV4PublicDirectoryAndRevokedHistory)$' -count=1 -v`：**3 项通过，无 skip**。补齐禁用账号夹具后只重跑 `TestDeviceManagementAuthority`，通过；`go vet ./internal/device` 通过。未重跑不受影响的全量 Go/XCTest/权限恢复套件。
+- OpenAPI/Compose 的 Ruby YAML 解析及默认 API 无管理员凭据、禁止 DDL、授权成功依赖和内部端口边界检查通过；新增文档链接/验收锚点、gofmt 和 `git diff --check` 通过；新增行常见凭据模式扫描未发现匹配，不据此声称完整秘密审计。未改 iOS、消息格式、001–007 SQL 或 Shell 实现；没有新增依赖或独立 build/Release/Docker/VPS 验证。保留所有关键安全测试，未发现可删的独立重复覆盖，本轮未删测试。
+- 临时测试集群退出清理，保留全部原有工作区修改和 `.claude/`；main/HEAD/远端 main 仍为 `6c3e47a9543b1473592a320155b7bb626cb206fa`。不提交、推送或部署。Recovery 继续默认关闭；**可信目录协议级阻塞尚未解除，不满足启用生产 E2EE 标识条件**。
+
+
+## 2026-10-23：目录证明、见证恢复与 v4 迁移合同
+
+### 关联分析与实际改动
+
+- 三个阻塞互相关联：受见证的完整账号值必须先由兼容证明套件验证；见证必须在外发前保存唯一签署决定并抵抗旧快照恢复；握手/消息还必须认证绑定该决定的目录上下文。单独签树头、增加本机版本或恢复 journal 不会自动补齐其他两项。
+- 复核当前 `V4Handshake`、`V4RatchetMessage.authenticatedHeader`、`V4PreKeyService`、`V4SessionVault` 及设备登记 API。现有签名域/Keychain 记录不含完整目录上下文；没有可直接复用的生产透明度服务或见证。保留上一轮权限竞态、迁移/恢复门禁和测试，不重写；本轮没有改 iOS、线上 API/SQL、部署或已有安全实现。
+- 在现有 `Protocol/Client_Server_Protocol.md` 补充统一接入合同：固定 proof bundle 必须交付的格式/根/签名域/向量及错误语义；完整见证接口/恢复决策和持久化字段；v4 策略迁移、上下文输入、旧会话切换及撤销在途边界。不另建重复审查报告。
+- 新增 `backend/ops/keydirectory-contract/` 离线参考检查器和一个表驱动测试，读取共享 `Protocol/Fixtures/key_directory_witness_recovery_v1.json`。它只核对公开恢复投影与外部锚点的关系，返回**必做下一步**，不实施证明/签名/存储/网络、不作为 Backend handler 或客户端门禁。其成功不能作为实际 signer 防回滚、历史一致性或目录闭环的证据。
+- 夹具使用 base + RFC 7396 patch 复用公共状态，合并“签名保存后未发出/发布回应丢失”的相同动作，不建立重复测试套件。每例的预期来自固定真值表；Go 执行了这些恢复决策，Swift/实际 witness 尚未消费。没有真实 proof 正向字节，不能宣称冻结了 Go/Swift 兼容证明向量。
+
+### 状态分类与接入判定
+
+| 项目 | 实际状态与未完成条件 |
+| --- | --- |
+| 恢复投影检查器、错误码与动作夹具 | **已实现；定向验证见下**。只验证本地参考决策，不是可运行见证服务；未知/缺失锚点、回退或同代不同决定必须停机。 |
+| 见证完整持久化/恢复 | **已设计但尚未实现**。需要完整 frontier/proof/精确签名字节持久化 adapter、独立不可回滚 anchor、fenced signer；写入结果未知、坏盘/备份恢复/多副本签署和重启故障注入尚无证据。 |
+| 兼容证明套件 | **仍阻塞，需要适配验证与独立审阅**。候选源码固定不是选型批准；缺 Luma 授权签名字节、真实 Go/Swift proof/state vectors、Rust FFI/许可及三组件 wire 一致性证据。不得为完成冻结而自制 Merkle/VRF 或编造 expected proof。 |
+| v4 目录迁移 | **已设计，需要协议迁移与独立密码学审计**。新增目录子版本/认证域、旧链迁移确认与切换边界仍未冻结或编码；不重派生有效 Ratchet、不改既有 v4 header。 |
+| 隔离与外部验收 | **尚未执行**。独立 witness/anchor 真实持久化、双实体设备、Face ID、Ubuntu 生命周期及完整故障注入沿用既有门槛，不以参考工具测试替代。 |
+
+**新的候选适配证据**：[libsignal 固定验证器](https://github.com/signalapp/libsignal/blob/b2a5c30f3245c1bcad04b27b1e752a38321c793d/rust/keytrans/src/verify.rs#L170)允许审计者落后查询树头，检查的是该旧审计前缀与查询历史的一致性。不能直接把候选 `verify_search` 成功映射为当前 roster 已被审计。合同要求严格激活时查询结果与 required auditor 为同一 checkpoint；候选是否能在该头提供完整最新值证明仍待实际互操作验证。这是 Luma 安全策略与候选的适配门禁，不定性为上游漏洞。没有独立运营方/可信根及冻结新鲜度时，仍为 `not_frozen`。
+
+撤销同样有不可回避的边界：没有认证 cutoff 时，未见的合法旧在途消息与撤销端新发消息不能仅靠服务器时间区分。合同明确严格迁移后默认暂停这些状态变更、保留材料；如需自动排空，必须先冻结兼容的端侧认证授权。不能承诺同时即时撤销与无条件接收全部历史在途消息。
+
+### 本轮必要验证
+
+- `go test ./ops/keydirectory-contract -run '^TestWitnessRecoveryContract$' -count=1 -v`：1 个顶层测试、23 个表驱动场景通过，无 skip；另含同一用例内的超长/尾随 JSON 拒绝检查。场景涵盖 reserve 回应丢失、精确重发、重启、旧快照、同代异值、失效配置/epoch/阶段及明显树头回退；不验证任何真实密码证明或 durable signer。
+- `go vet ./ops/keydirectory-contract`、gofmt、新共享 JSON/唯一名称/固定预期及文档链接检查、`git diff --check` 通过。此次只运行新离线工具包，不重跑既有设备/数据库/WS/加密测试；没有独立 build、iOS/Release、Docker/Ubuntu/真实 VPS 或数据库迁移。
+- 没有删除现有测试；一个公共 fixture base 合并重复状态数据、一个表驱动用例覆盖不同失败边界。不新增依赖、生产目录开关、密码算法或默认成功的验证 adapter。
+- 保留原工作区和 `.claude/`；main/HEAD 与只读远端 main 均为 `6c3e47a9543b1473592a320155b7bb626cb206fa`，没有提交/推送/发布/部署。完整证明套件、独立见证恢复和 v4 上下文迁移仍未达到接入验收条件，不能宣称三个阻塞已经解除。Recovery 默认关闭，生产 E2EE 标识不变。
+
+
+## 2026-10-23：现有 E2EE 核心最终审查与受限冻结
+
+### 范围及已核实机制
+
+本轮以本地 main `6c3e47a9543b1473592a320155b7bb626cb206fa` 加现有未提交差异为基线；只读远端 main 与 HEAD 相同。保留原 Backend、部署、文档及 `.claude/`，没有拉取、重置、提交、推送或部署。
+
+- 客户端追踪 `V4Handshake`、`V4DoubleRatchet`、`V4PreKeyService`、`V4MessageSessionService`、两个 Session/Recovery vault、`V4EventEnvelope`、`RemoteMessageRepository`、`RemoteSyncCoordinator`、`OutgoingMessageQueue`。身份目录由账号签名绑定设备，发送依赖已固定账号指纹；认证/版本失败不能重建有效链。Ratchet 在候选副本上解密，成功后才提交；接收 journal 按持久 cursor 恢复，精确发送请求先保存后提交 Ratchet，未决日志不能随意丢弃。
+- 核对 `DeviceSessionManager`/`MessageEncryptor`、安全码入口与身份确认、`KeychainManager`/`KeyLifecycleManager`、附件 crypto/文件传输、`MessageStore`、`PrivateMetadataStore`、搜索及 `BackupManager`。v1/v2 本机读取与 v3 历史/v4 正式传输分开；未认证的 legacy read/delete 不修改消息；附件随机密钥只进入 v4 密文与本机加密描述，下载校验 hash/AEAD，Keychain 使用 WhenUnlockedThisDeviceOnly。在线历史便携备份覆盖仍受门禁，不导出会话私钥。未重复实现原修复。
+- 核对 Backend 的 `auth.go`、`device/v4.go`、`message.go`、`v4_event.go`、`session_control.go`、`sync.go`、文件授权/存储及 001/003/004/007 SQL：正常通信接口接收逐设备密文、公钥、签名和必要路由，不含客户端解密秘密/明文文件名字段；事件和 envelope 随事务保存。源码路径未见主动记录正文/客户端私钥/Token 的日志；这不是对真实流量、运维日志或恶意改造服务端的动态验收。必要元数据仍可见。
+
+### 本轮实际修复（P1，定向验证）
+
+1. **同账号多设备会话误绑好友**：`RemoteMessageRepository.applyV4` 原先将本账号另一设备的 Session 元数据绑定聊天好友，而控制事件/发送路径要求其 `friendID=nil`，导致后续编辑或其他聊天拒绝。接收统一使用空好友关联；只在经过账号绑定验证且 `session.remoteUserID` 为本账号时修正旧错误元数据。好友设备绑定不放宽，Session/Root/Chain/PreKey 都不重置或替换，没有数据库模型迁移。
+2. **到期消息导致迟到控制事件阻塞**：`MessageStore.purgeExpired` 原先物理移除 v4 消息，后续合法编辑找不到原作者/会话，无法完成接收链。现在到期清理附件/Reaction，正文替换为本机加密空数据并保留隐藏的路由/作者/revision 墓碑，取消收藏/引用及再次到期。`applyV4Control` 允许对本地墓碑进行原有身份、AEAD、actor、revision 验证；编辑只推进 revision，不恢复正文，Reaction/已读不恢复已删除展示，远端删除仍校验原作者及下一 revision。Reaction 格式在忽略显示前仍校验。已对所有人删除的消息不重新开放普通操作。没有跳 cursor 或跳过认证。
+
+改动仅涉及 `Luma/Repositories/RemoteMessageRepository.swift`、`Luma/Core/Storage/MessageStore.swift` 和扩展现有 `LumaTests/LocalFoundationTests.swift`；另外同步本记录与隐私/威胁说明。没有改 v4 字节格式、Ratchet 算法、密钥存储格式、线上 API、SQL、Recovery 开关或安全文案。到期墓碑不是“彻底擦除所有元数据”；SQLite 历史页、旧索引密文及旧备份副本仍不保证物理擦除。
+
+### 实际验证
+
+- 复用已有 iPhone 17 Pro / iOS 26.5 模拟器、既有 DerivedData 和 URLProtocol 夹具。没有建立新测试套件或删除安全测试；扩展原接收测试，覆盖同账号设备、旧错误关联，以及到期后的编辑、Reaction 添加/移除、删除不复活内容并连续提交原 Ratchet。
+- 首次定向测试禁用签名，因 Keychain `-34018` 在夹具注册前失败，**不计验证通过**。恢复项目原签名配置后，原代码复现同账号元数据断言失败/`untrustedIdentity`；补入到期场景后，复现墓碑缺失/`invalidMessage`。修复后集中执行以下 **6 项，0 失败**：`testV4ReceiveRechecksTrustAfterDirectoryLookup`、`testV4ControlEventsUseFreshKeysAndRejectReplayOrTampering`、`testV4TwoDeviceSessionSurvivesVaultReopen`、`testSimultaneousInitialSessionsFailClosed`、`testLocalAccountAndChatUserFlow`、`testLegacyRoutingCannotMutateV4Messages`。结果：`/tmp/luma-backup-security-derived/Logs/Test/Test-Luma-2026.10.23_15-42-55-+0800.xcresult`。
+- 最后将 Reaction 格式验证收敛到同一处理函数，仅重跑受影响的接收/控制 **2 项，0 失败**：`Test-Luma-2026.10.23_15-44-40-+0800.xcresult`。此前其余四项相关代码未变化，未重复执行。两次通过日志分别为 `/tmp/luma-core-freeze-green.log`、`/tmp/luma-core-freeze-final.log`。
+- 修改的 Swift 源码/测试 `swiftc -frontend -parse`、`git diff --check` 及最终调用点/默认开关检查通过。上述测试包含必要的增量 Debug 编译；没有独立 build、Release、全量 XCTest/Go、Docker、数据库迁移或 VPS 操作。Backend 本轮未改，既有结果仅沿用其原记录，不计为本轮重验。编译日志的 AppIntents 元数据提取跳过提示仍存在；不声明零 warning。
+
+### 冻结结论与发布边界
+
+**建议停止扩展核心，将本轮修复保留为受限候选快照供验收；整体 E2EE 最终冻结暂不通过，不通过生产 E2EE 发布验收，不启用生产标识。** 升级历史中已缺失墓碑的恢复/迁移条件尚未闭环，不能满足“没有遗留已确认核心缺口”的无条件冻结门槛。 本轮发现的两项缺陷已有针对性复现及修复证据；没有用 reset、丢弃日志或降低认证使测试通过。冻结对象是当前受控实现及上述已验证行为，不是将整个未提交工作区或全部历史故障状态认证为安全。当前无新提交/Tag，HEAD 本身不包含本轮及原有未提交改动。
+
+- **兼容恢复限制**：旧版本已物理删除的消息无法仅靠本地重建可信作者/revision 墓碑。其迟到控制事件仍安全暂停，不自动跳过游标；需要受认证的历史恢复/兼容迁移，不能伪造原消息或重置链。该受影响历史状态不得标为本轮已修复；正式发布前需确认升级数据范围和恢复方案。新写入的到期墓碑不解决删除好友/整段历史后的所有晚到事件策略。
+- **已核实但未重验**：原 Ratchet/Recovery journal、PreKey、Token/离线注销、附件和备份机制没有重写；完整跨存储故障矩阵仍依赖既有及后续证据。Recovery 继续默认关闭，同时首次初始化在 legacy 路径仍 fail closed，不能声称冲突可用性已通过生产验收。
+- **独立后续项目**：可信目录/独立见证/目录上下文迁移暂停实现，不属于本轮冻结完成项。安全码与本机固定不能证明服务器对所有客户端返回相同完整设备集合，跨设备分叉、选择性隐藏及状态丢失后的历史下限仍是已知边界。
+- **外部发布门槛**：双实体设备首次/双向/附件/事件闭环、弱网和关键故障注入、锁屏/Face ID/Keychain、撤销与身份变化、既有数据升级兼容、独立密码学审计仍未在本轮执行。VPS age local 模式的同机私钥风险仍依赖显式 offline 保管；本轮不轮换/移动旧钥。源码冻结不等于满足这些门槛。
+
+本轮核心文件 SHA-256（用于识别本地修复快照，不是签名/发布承诺）：
+
+```text
+663e2408dca52e25e877a6eff4890e83fc2f5a2411d628e06f69299032482021  Luma/Repositories/RemoteMessageRepository.swift
+9be09c393d2bbbb8bd5390fdde44198362a0d2ffdc784d53e991f08321ba69f8  Luma/Core/Storage/MessageStore.swift
+61124cf17c85feaffb6c08fe459bd405ed686e53d91aabe453c74884de02e059  LumaTests/LocalFoundationTests.swift
+```
+
+## 2026-10-23：历史墓碑迁移与同步恢复
+
+本节补充上一节的冻结阻塞结论，不将历史证据缺失改写成已恢复。基线仍为 main `6c3e47a9543b1473592a320155b7bb626cb206fa`，只读远端 main 相同；原未提交修改与 `.claude/` 保留，无提交、推送、发布、VPS 或生产数据库操作。Recovery 默认关闭，安全标识未改。
+
+### 根因、证据与迁移合同
+
+- 旧 `purgeExpired` 会物理移除 v4 消息，原作者、会话和 revision 随之丢失；旧便携备份不含对应 Keychain 接收日志、已消费 OTP 和同步游标。服务端 `/sync/events` 提供逐设备密文，不提供可由服务器背书为可信的本机删除事实。原链已提交后，不能重新派生历史 Message Key 来补证。
+- **可沿用的本机证据**：仍存在的已删 v4 消息行，其本机 AES-GCM 密文、账号/会话/联系人、作者和 revision 均可核对。新增 `MessageTombstone` 独立表，内部版本 1、来源 `retained-local-message`，Master Key AEAD 绑定 ownerID/messageID；内部加密保存会话、固定身份、作者及版本，不保存正文、附件描述/密钥或 Reaction。它是可信本机数据库假设下的留存观察，**不是远端签名删除证书，也不能追溯证明旧数据库元数据从未被篡改**。不能只凭服务端路由或缺少消息行来生成记录。
+- **向后兼容**：所有 ModelContainer 加入新表，现有消息/会话字段及 v1/v2/v3/v4 线格式不改。授权解锁时只对现存已删 v4 行补建证据；沿用现有解锁失败 rollback。该迁移不擦除原受保护正文、附件和 Reaction，不操作文件或 Keychain；任一记录无法验证时，旧数据保持。其后现有删除、到期或合法迟到事件处理才执行内容清理。新增未路由的离线待发消息不能伪造远端墓碑；仍可本机删除，获得路由并准备上传后必须先保存对应证据。
+- **保留与恢复**：独立记录可跨 Message 行删除保存；移除好友不主动抹去该证据，但缺失原会话/联系人时不能借此重建好友或信任。保留至账号删除，不因 ack 自动裁剪。恢复只建立空隐藏行，必须匹配账号、原会话和当前固定指纹；已撤销/变化身份不通过此路径取得授权。记录损坏、版本/来源不支持、revision 回退或会话不匹配时拒绝处理。
+- **不可恢复**：旧行已物理删除且无独立记录，不能推导原作者、历史版本或本机删除事实。旧接收日志中的明文只能证明曾解密，不能证明是否已经保存后又被删除。新 legacy v4 接收日志带本机 `localPersistenceVersion=1`；旧日志缺少标记且消息/证据均缺失时，拒绝恢复正文，保留日志/密钥状态及 cursor。旧日志仍有对应消息行或可验证墓碑时走原提交路径。此标记不进入网络，不修改 Ratchet。
+
+### 实际修复与关联文件（P1）
+
+1. **墓碑随消息行再次丢失**：`Models.swift`、`MessageStore.swift`、`LumaApp.swift`、Chat 预览及测试 schema。独立加密证据与删除/修订数据在同一 ModelContext save 内保存。到期清理先验证原密文，不能先覆盖空密文再将损坏旧数据变成“有效证据”。清理包含附件、Reaction、收藏/引用及相关搜索条目。
+2. **缺失原记录造成迟到控制阻塞**：`RemoteMessageRepository.swift` 从可验证墓碑重建空隐藏行后，继续原身份/设备、会话、AEAD、actor、revision 校验。迟到编辑仅推进本机 revision；已读/Reaction 不复活显示。终态删除后只允许旧编辑版本被认证消化，拒绝新增编辑版本；合法迟到 Reaction/已读仍可完成原接收链。重复创建只允许完全匹配接收 journal 的 ID、序号、摘要及认证创建载荷/作者/目标，不将 mutation 重标成 creation。
+3. **缺证据时误恢复旧正文**：`V4SessionVault.swift` 增加可选本机持久化标记，`RemoteMessageRepository` 明确抛出 `historyEvidenceMissing`，不补造作者或删除事实、不推进游标、不丢弃未决日志。`RemoteSyncCoordinator` 的消息保存、cursor、Ratchet finish、ack 顺序保持原样。
+4. **旧备份/legacy 路径绕过独立证据**：`BackupManager.swift` 在仅剩墓碑或 v4 Session 元数据时也拒绝便携导出/覆盖恢复，保留原备份，不换格式或钥。`MessageStore.receiveVerifiedRemote` 与 `LocalMessageRepository` 拒绝以 v3/Mock 创建覆盖已留存 v4 ID。`SecurityManager` 仅在原有账号清理流程中删除本账号墓碑。`FriendProfileView` 在现有删除流程中先保留可验证证据；未重新设计好友、会话或密钥清理。
+
+### 实际验证
+
+没有新增测试套件/框架或删除安全测试；只新增一项磁盘 schema/迁移回归，扩展原接收和备份测试。测试是模拟器及 URLProtocol 夹具，不是真实 Backend/双实体设备验收。
+
+- 原实现定向复现：`testV4ReceiveRechecksTrustAfterDirectoryLookup` 加入“到期后 Message 行再次缺失”场景，失败于查找原消息/`invalidMessage`。日志 `/tmp/luma-tombstone-red.log`，1 项、2 个失败断言（含 unexpected error），不计通过。
+- 首批 5 项中迁移回滚断言失败（`/tmp/luma-tombstone-green.log`）；据此将解锁迁移改为只补证据、不执行内容/文件清理，并以重新读取持久化状态验证回滚。没有把失败结果算通过。
+- 集中复核 **5 项，0 失败**：`testV4ReceiveRechecksTrustAfterDirectoryLookup`、`testV4TombstoneSchemaMigrationPreservesDeletionEvidence`、`testPasswordEncryptedBackupRestoresWithExistingMasterKey`、`testLegacyRoutingCannotMutateV4Messages`、`testV4TwoDeviceSessionSurvivesVaultReopen`。日志 `/tmp/luma-tombstone-final.log`；结果 `Test-Luma-2026.10.23_22-09-27-+0800.xcresult`。
+- 磁盘夹具曾在 SwiftData 保持 SQLite 句柄时删除文件，产生运行时警告。改为等测试宿主退出后清理自己生成的临时目录，单独复核迁移 **1 项，0 失败**（`/tmp/luma-tombstone-migration-final.log`，`Test-Luma-2026.10.23_22-12-09-+0800.xcresult`）。
+- 最终审查移除到期路径提前覆盖空密文的操作，并在同一迁移用例中加入“损坏密文不能生成墓碑”断言。仅复核受影响的迁移/接收 **2 项，0 失败**；`/tmp/luma-tombstone-auth-final.log`，`Test-Luma-2026.10.23_22-15-33-+0800.xcresult`。其余三项相关路径未变，不重复执行。最终两份日志无 SQLite unlink 警告；仍有原 AppIntents 元数据提取跳过提示，不声明零 warning。
+- 上述覆盖：真实 SwiftData 模型子集的磁盘加表升级、现存已删记录补证、失败 rollback 后原持久化数据仍在、进程内重开、AEAD 篡改/跨会话拒绝；有证据时迟到编辑/Reaction/删除只推进原链不恢复内容；终态删除后迟到 Reaction；精确创建重投；旧 journal 缺失记录时拒绝恢复；无原消息时保留接收日志且 cursor=0、不 ack；有墓碑时经实际 SyncCoordinator 提交 cursor=1、finish 后 ack；旧备份门禁及账号清理。
+- 全部本轮修改 Swift 的 `swiftc -frontend -parse` 与 `git diff --check` 通过。只有上述定向 XCTest 必需的增量 Debug 编译，没有独立 build、Release、全量 XCTest/Go、部署或生产迁移。Backend 和 SQL 本轮未修改，不重跑其测试。所有 xcresult 在 `/tmp/luma-backup-security-derived/Logs/Test/`。
+
+### 冻结复评与仍需验收
+
+- **已修复且有上述定向证据**：有可信本机记录的墓碑迁移、独立留存、空行恢复、迟到事件原链提交、旧备份/legacy 覆盖门禁，以及无证据时不复活正文、不确认游标的明确错误路径。本轮新增路径未发现仍未修复的已确认核心代码缺陷；这不代表穷尽所有并发/故障场景。
+- **历史数据限制仍存在**：完全缺失的旧作者/revision/删除事实不可恢复；不能承诺这些账号无需干预恢复连续同步。整段会话/好友已删除、固定身份不再一致，或存在旧实验 Recovery journal 时，不能擅自用旧数据重建信任/发送链，仍需专门兼容验收或经审查的认证历史恢复协议。新增保护不抵抗已取得本机执行权限/主密钥的攻击者，也不证明旧数据库从未被修改。旧版二进制对升级库的降级写入未验证，不能将恢复旧数据库当作兼容回滚方案。
+- **结论**：当前修复可保留为受限源码候选快照，建议停止扩大核心功能；**整体无条件最终冻结仍不通过**，原因是完全缺证据的升级历史及旧实验恢复状态没有无损恢复验收，而不是允许跳认证补齐它们。不得宣称“全部历史账号恢复已闭环”或“生产 E2EE 已认证”。受影响历史账号的恢复可用性仍是发布限制。
+- **外部门槛未完成**：真实双设备、真实后端弱网及关键故障注入、Face ID/锁屏/Keychain、真实升级库、独立密码学审计。可信目录/见证独立后续处理；Recovery 保持默认关闭；不启用生产安全标识。全状态丢失时无法仅从旧备份推断后来发生的本机删除，必须保留这一事实。
+
+
+## 2026-10-23：独立视角密码学源码审计（仅审计）
+
+### 基线、范围与方法
+
+基线为本地 main `6c3e47a9543b1473592a320155b7bb626cb206fa` 加原有未提交差异；只读 `git ls-remote --heads origin main` 与 HEAD 相同。本轮只追加本节，不修改协议、实现、测试、数据库或部署配置；保留全部已有修改和 `.claude/`。Recovery 默认关闭，不启用生产 E2EE 标识，无提交、推送或部署。这是另一次基于源码和最小反例的审计，不是外部密码学机构的独立认证。
+
+实际追踪：
+
+- 原语与身份：`V4Handshake.swift`、`V4DoubleRatchet.swift`、`V4PreKeyService.swift`、`IdentityKeyManager.swift`、`DeviceKeyManager.swift`、`IdentityFingerprint.swift`、`IdentitySafetyCode.swift`、`KeyAgreementService.swift`、`PreKeyManager.swift`、`MessageEncryptor.swift`、`EncryptionService.swift`。
+- 状态与消息：`V4MessageSessionService.swift`、`V4SessionVault.swift`、`V4HandshakeRecovery.swift`、`V4HandshakeRecoveryVault.swift`、`V4HandshakeRecoveryService.swift`、`V4SessionControl.swift`、`V4EventEnvelope.swift`、`DeviceSessionManager.swift`、`RemoteMessageRepository.swift`、`RemoteSyncCoordinator.swift`、`OutgoingMessageQueue.swift`、`MessageStore.swift`、`Models.swift`，及现有 Ratchet/Recovery/journal/墓碑测试。
+- 本地/附件：`V4AttachmentCrypto.swift`、`RemoteFileTransferService.swift`、`FileTransferService.swift`、`PrivateMetadataStore.swift`、`SearchIndexService.swift`、`KeychainManager.swift`、`KeyManager.swift`、`KeyLifecycleManager.swift`、`SecurityManager.swift`、`PasswordHasher.swift`、`BackupManager.swift`、`RemoteAPIClient.swift`/`RemoteAuthProvider.swift`。
+- 后端边界：`device/v4.go`、设备撤销和授权调用点、`message/message.go`、`message/v4_event.go`、`message/session_control.go`、`sync/sync.go`、`file/file.go`/`storage.go`、`auth/auth.go` 的签名与撤销路径、`crypto/crypto.go`、v4 PreKey SQL；VPS 密钥隔离核对 `deploy/backup-crypto.sh`。没有执行数据库或真实流量审计。
+
+参考 [X3DH 规范](https://signal.org/docs/specifications/x3dh/)、[Double Ratchet 规范](https://signal.org/docs/specifications/doubleratchet/)的经典 DH 部分，以及 [Apple Keychain 保护说明](https://support.apple.com/guide/security/keychain-data-protection-secb0694df1a/web)。Luma 使用独立 Ed25519/X25519 与自定义绑定/恢复格式，不能直接继承这些规范或 libsignal 的安全证明；未实施后量子协议。
+
+### 已确认漏洞：CA-01，P2，认证 Reaction 的乱序可回退业务状态
+
+**位置和链路**：`V4DoubleRatchet.swift:75` 的 `decrypt` 正常接收尚未处理的跳过消息密钥；`V4EventEnvelope.swift:27`/`:45` 检查路由和认证载荷；`RemoteMessageRepository.swift:305` 只比较 Reaction 所引用的消息 revision，再由 `:199` 的 `applyV4Reaction` 无条件按到达顺序插入、替换或删除。该 revision 是正文版本，不是 Reaction 操作版本。`RemoteSyncCoordinator` 的连续 `deviceSeq` 属于服务器分配的顺序，不是发送者认证的业务操作先后顺序。
+
+**攻击能力**：恶意服务器已经持有两份合法密文，能够延迟、重排并为同步事件分配连续外层序号；无需私钥、Token、改动密文或猜测消息密钥。普通网络攻击者无法在 TLS 内直接完成同样改写。诚实后端通常按提交顺序返回；本轮没有证明正常网络必然触发。
+
+**最小反例**：
+
+1. 正常 OTP 握手建立 A→B 链，先认证一份初始消息。
+2. A 对同一消息生成两份不同 eventID、相同正文 revision 的合法事件：`add(👍)`，随后 `remove(👍)`；使用不同 Ratchet messageIndex 和消息密钥。
+3. 先向 B 投递 remove，再投递第一次到达的旧 add；路由中的 mutationEventID、会话、设备、messageKeyIndex 和 revision 均保持与认证载荷一致。
+4. 两次 AEAD 和 `V4EventVerifier` 均通过；remove 时无记录，晚到 add 随后重新插入。正常顺序结果为空，倒序结果存在 Reaction。
+5. 再重复投递已消费的 add 会被 Ratchet 拒绝。**这是合法旧操作首次迟到造成的状态回退，不是已处理密文能够重复解密**。
+
+**影响与根因**：服务器能够影响用户看到的 Reaction 最终状态；不代表能够伪造新正文、解密内容、重复使用消息密钥或回滚 Ratchet。加密真实性、服务器幂等和业务因果顺序是不同属性，当前仅前两者不能解决此问题。
+
+**最小修复要求（本轮未实施）**：为同一消息/操作者的 Reaction 保留可信的操作顺序及移除墓碑，认证迟到操作并提交原链，但不得让它覆盖较新状态；还需定义多个操作者设备的并发合并规则。不得仅比较会在 DH 换链后归零的 messageIndex、使用服务器 cursor/时间决定胜负，或拒绝全部乱序密文。现有载荷缺少明确的 Reaction 因果版本，是否可只改本机状态还是需要兼容的事件版本扩展，应先冻结迁移合同；不应改写 Double Ratchet。此缺陷使“全部聊天事件抗恶意服务器重排”不能标为通过。
+
+### 设计缺陷与已有边界
+
+| 编号 | 源码证据与限制 | 风险/后续要求 |
+| --- | --- | --- |
+| D-01 可信目录与首次信任 | `V4PreKeyService.verified` 验证账号签名的设备绑定；`identityVerification`/`trustIdentity` 要求显式确认。`observePeerBundle` 仅固定本机见过的设备及版本。 | 服务器不能在不破坏签名/固定身份的情况下任意替换已见设备，但仍可隐藏设备、提供不同完整集合、回放新端未见过的有效旧目录。安全码若没有独立带外核对，首次信任仍可能指向服务器替换的身份；用户点击确认不是证据。需要独立的可信目录/见证及迁移项目，本轮未实现。 |
+| D-02 v3 Reaction 的历史重放边界（条件性） | `DeviceSessionManager.decrypt` 允许无 OTP 的合法旧信封，且自身不维护重放账本；`RemoteMessageRepository.swift:1090` 的 Reaction 分支不核对历史事件摘要或独立 Reaction 版本。当前新建 v3 mutation 的 `bundles` 已强制目标 OTP，消费后的 OTP 不可再解密，不能忽略该既有防护。 | 若升级库中实际存在曾合法接收的**无 OTP** Reaction，恶意服务器可以用新外层 eventID/seq 重投原签名信封，覆盖较新 Reaction。定向检查仅证明该无 OTP 密文可被实际 v3 crypto 重复解密，未完成真实升级数据库/API 端到端利用，不能断言所有当前账号受影响。需盘点历史数据，再选择限制旧远端 mutation 或兼容的已认证操作账本；保留历史读取，不能改成跳过 v4 验证。 |
+| D-03 安全属性不能由算法名称继承 | v4 独立 Ed25519 签名、X25519 DH、HKDF-SHA256 和 AES-GCM；握手 transcript、P-256 账号绑定及 Recovery 是 Luma 自有组合。legacy P-256 账号标量同时用于签名和本机 v2 ECDH（`IdentityKeyManager`、`KeyAgreementService`、`RemoteAuthProvider`）。 | 未发现从这一用途耦合直接导出的攻击；不能称所有历史密钥用途均完全隔离，或声称实现就是标准 Signal/X3DH。若拆分旧账号密钥须设计身份及历史数据迁移，不应临时更换密钥。 |
+| D-04 撤销不是独立的端侧即时授权证明 | `senderBundle` 特意 `includeRevoked=true` 以核验历史信封；旧设备公钥、已有 Ratchet 本身不提供“发送发生在撤销前”的证明。服务端活动设备/Token 检查保护诚实服务路径。 | 已知边界：恶意服务器与已失陷设备串通，可把仍可生成的有效密文伪装为历史在途消息；没有认证 cutoff/端侧完整 roster，不能保证既即时撤销又无条件接收所有历史在途消息。不是单凭 TLS 能解决；需协议授权合同。 |
+| D-05 传输时间与送达状态不等于端侧声明 | v4 创建时间取 `RemoteSyncEvent.createdAt`；其不在 `V4RatchetMessage.authenticatedHeader` 或创建正文里。legacy delivery 是服务器提示。已读/编辑/删除 v4 载荷另有认证。 | 恶意服务器可改变创建时间/传输送达提示；不能把界面上的这些值当成发送者签署的时间或阅读证明。本轮未证明它可绕过到期/删除保护，不升级定性为内容认证漏洞。 |
+| D-06 Signed PreKey 没有完整客户端轮换合同 | `V4PreKeyService.publishCurrentKeys` 首次生成版本 1 后一直复用 `DeviceSecrets.signedPreKey`；现有补库只增加 OTP。服务端允许较高版本的 Signed PreKey，但客户端接收初始时只匹配当前 device.keyVersion/signedKey，没有旧 Signed PreKey 私钥版本检索。 | 不能将 OTP 补充或 DH Ratchet 换钥描述为 Signed PreKey 定期轮换。不是已证明的历史消息解密漏洞；实际影响为长期预密钥暴露窗口及未来轮换后的离线初始兼容风险。实施轮换前需明确旧钥保留、过期、版本及在途消息策略，不能直接覆盖当前私钥。 |
+
+### 待验证风险（不定性为已确认漏洞）
+
+- **本地信任记录的写入威胁**：`Friend.identityFingerprint`、`pendingIdentityFingerprint`、`sessionStatus` 仍是 SwiftData 元数据，`verifyV4PeerAccess` 据此授权；Keychain peer pin 只覆盖已经见过的设备。读取数据库副本不能据此解密消息，但“攻击者能改本地数据库且同时控制目录”是否可通过伪造新 deviceID 绕过已有联系人信任，需要隔离的数据库篡改回归；本轮没有完成该动态证明。不得把敏感正文加密等同于所有本地授权元数据已受认证。
+- **前向保密和 PCS 的实际边界**：源码有单向链推进、旧链替换及 DH 新熵；失陷后恢复要求攻击者失去端点控制、诚实 DH 更新成功，不能在持续主动 MITM/身份签署权失陷时保证恢复。跳过密钥在消费前、未提交 journal 及尚未到达的 OTP 私钥仍可读取对应内容。接收后的正文/附件密钥还会被 Master Key 加密长期保存；后来取得 Master Key 仍能读取这些本地历史副本，不与“传输链的历史消息密钥不可由当前链反推”混为一谈。
+- **回滚和崩溃**：独立 Keychain 高水位可检测部分记录回退，不能阻止整份可信状态一同回滚；没有硬件单调计数器或外部可信历史锚点。当前单调版本/事务日志不会仅凭本次反例被判定可回滚；SIGKILL/断电/介质错误及全部部分提交点仍需故障注入。历史完全缺失删除证据仍按前节安全暂停，不能补造删除事实。
+- **资源边界**：v4 每条正文密文 1 MiB、乱序密钥总量 2,000，Recovery 出站及候选亦有上限；达到上限会停收或停发，不代表拥有完整抗 DoS 能力。未投递 OTP 及本地保留材料可能增长，需要隔离负载/库存耗尽验证，不得盲目销毁仍可能用于离线消息的私钥。
+- **本地与备份**：WhenUnlockedThisDeviceOnly 不是每条密钥的 Face ID ACL，也不证明可靠内存擦除或安全闪存删除。iOS 备份 PBKDF2-HMAC-SHA256 固定 310,000 轮、16 字节随机盐、AES-GCM/AAD；弱口令可被离线猜测。VPS age offline 与 local 的隔离/自动回滚取舍沿用既有合同，local 同机私钥不抗整机失陷，offline 维护期间主机 root 仍可窃取临时秘密。未轮换、移动或删除现有密钥/备份。
+
+### 已具备防护（源码依据及本轮验证边界）
+
+- **随机和编码**：CryptoKit 生成 Curve/P-256 私钥、AES-GCM 随机 nonce；Master Key/备份盐使用 `SecRandomCopyBytes` 并核对结果。握手、签名、KDF 和消息 AAD 使用不同域；变长字段用大端长度前缀；事件的 actor、设备、消息、会话、kind、revision 在密文内复核。当前受限输入范围内未发现弱随机数、可证明的 nonce 重用或变长字段拼接歧义；不等于所有恶意编码已模糊测试。
+- **身份和 PreKey**：P-256 固定账号身份签名绑定 v4 设备 ID、版本和两种设备身份公钥；Ed25519 认证 Signed PreKey。新在线 claim 拒绝无 OTP；接收兼容路径仍可核验旧无 OTP 初始，不能把它描述成所有旧信封也强制 OTP。后端 `FOR UPDATE SKIP LOCKED` 领取和唯一公钥约束、客户端 journal 后消费、Recovery proposal-bound OTP tombstone 防止已实现路径重复使用；未修改任何既有 Ratchet。
+- **AEAD 和 Ratchet**：消息 ID、设备、会话、版本、DH 公钥、PN/N、initial/proposal 绑定认证；解密在 candidate 上完成后才提交。跳过密钥只在 AEAD 成功后删除。本轮反例同时确认修改 tag 拒绝且 candidate 不变、已消费密文重放拒绝；并未发现能直接解密他人正文或伪造有效 AEAD 的路径。
+- **事务和墓碑**：outbox 先保存精确密文再 finish 发送链；接收保存正文→cursor→finish→ack，未决状态不明时留日志。`V4SessionVault.saveSession` 同版本异值/旧版本拒绝，历史墓碑只恢复空隐藏行。此处是源码复核；前两节定向 XCTest 结果属于此前证据，本轮未重跑，不冒充新的崩溃测试。
+- **版本边界**：v1/v2 为本机存储/模拟，v3/v4 远端明文接收后重新以本机 Master Key 加密；v3 编辑 revision 不能重标为创建，legacy 未认证 read/delete 不修改 v4。不存在本轮已证明的 v4→v3 自动重新加密降级；v3 条件性 Reaction 风险不能外推为 v4 AEAD 失效。
+- **附件和存储**：每附件随机 256 位密钥，ID/消息/会话/类型作为 AAD，描述/文件名/密钥放入 v4 密文；hash 加 AEAD 校验、迟到下载后账号/删除状态复核、Master Key 加密缓存。Keychain 私钥和会话材料不进入普通消息表或便携备份；账户删除已有密钥/索引/文件清理。源码核查正常后端字段没有消息/附件明文或客户端解密秘密入口；这不证明恶意修改客户端、实际抓包、APM 或运维日志均安全。
+
+### 实际验证与基线保护
+
+1. 仅运行系统临时目录中的原子 Swift 反例，不改工程或新增测试套件。拼接**未改动**的 `V4Handshake.swift`、`V4DoubleRatchet.swift`、`V4HandshakeRecovery.swift`、`V4EventEnvelope.swift`、`IdentityFingerprint.swift`、`DeviceSessionManager.swift`，原样提取 `applyV4Reaction`。以最小内存 context 替身承载同一 reducer；未调用真实 SwiftData、Keychain、SyncCoordinator、Backend 或实体设备。
+2. 最终命令：`xcrun swift /var/folders/kf/f5jj77j140l4xvcnlp6w5mhm0000gn/T/luma-crypto-audit-d_mbf8ii/audit.swift`。输出 `/tmp/luma-crypto-audit-counterexamples-final.log`，**7 个原子断言符合预期**：OTP 初始 AEAD；v4 倒序复活 Reaction；已消费重放拒绝；顺序投递正常移除；篡改 tag 拒绝；错误 AEAD 不改变 candidate；v3 无 OTP 密文可重复解密。其中“倒序复活”是漏洞复现成功，不是安全验收通过。首次较小检查有 4 项，随后只补足顺序/篡改/不变性对照；不计为 11 个独立测试。
+3. 未执行 xcodebuild、XCTest、Release、Go 全量/集成测试、Docker、VPS 或数据库迁移。临时 Swift 解释执行包含必要的局部编译，不宣称零编译；没有完整 App 构建。未添加或删除现有测试，不调整已有绿色测试以掩盖问题。
+4. `git diff --check`、报告链接及源码位置复核通过；本轮仅文档增量，其他用户差异不改变。临时夹具只生成随机运行时密钥且不打印秘密，报告/日志不含真实 Token、私钥、消息或附件密钥。
+
+可核对的反例源文件摘要（SHA-256）：
+
+```text
+9bc5ec1baa2dec5ac9ba594876f178f8c87bb68c87225d6f21bba3e58f8e2f3e  V4Handshake.swift
+53bb5bf0df6737eec05d100a929b2113f031f54f6a184911e0009aa09d13c95b  V4DoubleRatchet.swift
+794229035a60edac521f0ecd0453c7952e341101de13ba2c1bb2a84be9a7a81c  V4EventEnvelope.swift
+d4cf28c60e7370dcfc29bbd09f47b14bf4f2bf78cc4509c22de3e59e8660b872  原样提取的 applyV4Reaction 函数
+```
+
+### 最终判断与外部审计要求
+
+- **是否有严重密码学缺陷**：本轮未确认 P0/P1 级的密钥恢复、任意正文解密、AEAD 伪造或 Ratchet 密钥复用攻击；不能由此推断不存在这些缺陷。确认 CA-01 为 P2 业务状态完整性缺陷，保留未修复；D-01/D-04 等已知认证设计边界仍可在其威胁条件下造成实质影响，不能因没有原语破解就忽略。
+- **安全保证**：在固定身份真实、端点/Keychain 可信且实现参数正确的前提下，现有 v4 对内容及已认证上下文提供保密/完整性机制，有受限乱序、已消费密文重放拒绝和跨存储恢复防护。服务器保留路由/时间/大小/IP 等元数据并能拒绝服务。**不保证**跨设备目录一致、即时的恶意服务器下撤销、Reaction 的因果状态一致、所有升级历史自动恢复、端点失陷后的全部历史保密或后量子安全。
+- **修复优先级**：先处理 CA-01 的认证操作顺序和兼容状态迁移；盘点 D-02 旧无 OTP 数据并确定 legacy mutation 策略；目录/撤销授权仍作为需要独立评审的协议项目。本轮遵守只审计，不实施这些修改、不复用时间戳选胜者、不删 Ratchet/journal。
+- **发布结论**：不能启用生产 E2EE 标识或给出无条件核心冻结通过；新增 CA-01 需先处理，历史缺证据恢复及原外部门槛仍存在。源码审查和本次原子反例不是安全认证。
+- **仍需独立专家/外部证据**：自定义握手/恢复组合的认证及前向保密/PCS 分析、恶意服务器与被撤销设备串通、两台真实设备的消息/附件/事件闭环、真实 Keychain/Face ID、完整跨存储故障注入、历史数据库升级和独立密码学审计。不得用本轮内存替身结果冒充这些验收。
+
+
+## 2026-10-23：CA-01 Reaction 乱序状态回退修复
+
+本节更新前一节审计时“CA-01 未修复”的状态；其他历史审计结论及证据保留。基线仍为 main `6c3e47a9543b1473592a320155b7bb626cb206fa` 加原工作区差异。只处理 CA-01 及其接收/持久化依赖，Recovery 默认关闭，不启用生产 E2EE 标识；未提交、推送、发布、部署或连接生产数据。
+
+### 根因与实际修复
+
+原载荷没有 Reaction 操作版本，reducer 按到达顺序插入/物理移除 Reaction；正文 revision 和外层 cursor 无法证明操作先后。正确的 Ratchet 乱序解密会接受第一次迟到的旧操作，因此 AEAD 成功并不能阻止业务状态回退。
+
+| 文件 | 本轮修改与影响 |
+| --- | --- |
+| `Luma/Core/Crypto/V4EventEnvelope.swift` | 认证载荷增加可选 `reactionOrder(version=1,counter)`；Lamport 戳按计数、设备 UUID 原始字节、操作 UUID 原始字节比较。账本按操作者独立选胜；完整事件摘要检测同 ID 异内容。非 Reaction 不能混用该扩展。 |
+| `Luma/Repositories/RemoteMessageRepository.swift` | 新发送从已接受状态和加密 outbox 分配计数；使用原事件 ID 和精确请求重试。认证后应用有序寄存器，保留移除戳及 stale 操作摘要；迟到操作不改变可见状态但正常保存并提交原链。旧 v4 无序 Reaction 认证后不应用；相同 ID 异内容或不兼容版本拒绝、不清 journal。删除/过期不复活内容；当前操作者的遗留重复行按一次操作归一。own-event/outbox save 失败回滚。 |
+| `Luma/Models/Models.swift` | `Message.encryptedReactionState` 可选字节字段，Master Key AES-GCM；AAD 绑定本地 owner/会话/消息。移除不删除操作证据。没有私钥、链密钥、消息密钥进入新字段。 |
+| `Luma/Core/Storage/MessageStore.swift` | 本机墓碑增加可选嵌套账本，兼容旧缺省记录；重建只恢复空隐藏行和账本。 |
+| `LumaTests/LocalFoundationTests.swift` | 两个高价值测试复用现有 URLProtocol、真实 Repository/SwiftData/Vault/SyncCoordinator。共享 context 夹具允许磁盘/只读配置并包含 outbox 模型。没有删除现有安全测试。 |
+| `Documentation/Protocol/Message_Format.md`、`Documentation/Architecture/Data_Model.md` | 记录认证字段、因果/并发合并语义、旧版受限处理、加法模型迁移和恢复限制。 |
+
+**顺序语义**：同设备已生成或已观测操作的计数严格递增；不同设备未相互观测的操作为并发，以认证设备/事件 UUID 字节决胜。不是物理时间排序，也不从服务器顺序或 DH 链序号推断因果。相同输入集合在兼容客户端上得到相同胜者；失陷操作者可选择自己的内容/计数，不能据此操作别的账号。
+
+**事务语义**：只在认证成功后接受业务操作。新增账本与可见 Reaction 同次保存；合法 stale 操作仍完成既有 incoming journal → 业务保存 → cursor → finishReceived → ack。保存失败仍留 journal；同 ID 精确重试幂等，冲突 ID 暂停处理。没有改 `V4DoubleRatchet`、握手、PreKey 消耗、`V4SessionVault` 算法或同步游标策略，没有重置会话/跳过认证。
+
+### 兼容结论
+
+- **已实现的受限兼容**：`encryptionVersion=4` 和服务端 opaque 事件 API 不变；新字段只在加密载荷。旧 Reaction 快照保留，不从本地无序行生成认证版本。旧 v4 无序事件（含已准备的旧 outbox）完整认证并提交，但不修改 Reaction；未知版本拒绝，不能回退为无序操作。不重加密既有提交过的旧请求。
+- **混合版本限制**：旧客户端不会执行新寄存器规则；新客户端也不会应用旧客户端产生的无序 Reaction。发布前必须完成最低客户端版本/升级安排及混合版本验收，不能宣称旧二进制已修复。本轮没有引入未认证的版本协商。
+- **恢复范围**：新增可选字段不要求服务端迁移，旧墓碑缺省可以解码。新版账本随本机数据库/墓碑存续；在线便携备份仍按原有门禁拒绝，不引入丢账本导出。实际历史库升级、完整旧快照恢复和旧二进制降级写入 **NOT_RUN**；全存储回滚不是本机账本可解决的问题。
+- **D-02 单独保留**：核对现有 `DeviceSessionManager` 和 v3 Reaction 分支，条件性风险仍依赖历史无 OTP 密文；当前新 v3 目标要求 OTP 的保护保留。没有改变 v3 add/remove、历史读取或其他 legacy 操作语义，也未完成真实升级库/API 复现。需独立盘点旧数据并审阅迁移方案，不以 CA-01 修复宣称 D-02 已关闭。
+
+### 实际验证
+
+1. **修复前复现**：重跑前节未修改源码的原子夹具，7 个预期断言成立，包含反例复现。真实 Repository/SwiftData 的 `testV4ReactionOutOfOrderRemovalDoesNotRevive` 在旧实现运行 **1 test / 1 expected failure**，旧 add 使 remove 后的 Reaction 重现；随后扩展为下述两个正式回归。最初一次构建因 private helper 不可访问而失败，不计作漏洞复现；调整测试可见性后才获得该红灯。
+2. **最终新增回归**：`/tmp/luma-ca01-final.log` 对两个新增 XCTest 执行 **2 tests / 0 failures**：
+   - `testV4ReactionOrderPersistenceAndCompatibility`：正常 add/remove、先 remove 后首次 add、旧 remove/修改不覆盖新 add、重复 ID 幂等及异内容拒绝、不同操作者、两个设备并发确定性合并、磁盘重新打开、加密 outbox 计数、真实只读 store 保存失败、损坏账本 AEAD 拒绝及 refetch 后回滚状态、过期/物理移除后从墓碑恢复空行、不兼容旧事件受限处理。
+   - `testV4ReactionSyncReorderingAndRecovery`：真实 `V4MessageSessionService`/Keychain/Repository/磁盘 SwiftData/`RemoteSyncCoordinator`，HTTP 使用 URLProtocol。OTP 初始会话后先收 remove，DH 双向换链、新链 index=0 操作后再收旧链 index=1 操作；Reaction 不回退且原链 stateVersion 正常推进。业务已保存但 cursor/ratchet 未提交时重开恢复；只读保存失败 journal 留存并可重试；已处理重放、篡改标签不推进 cursor；同操作重新封装幂等，同 ID 异内容保留 journal 且 cursor 不前进。
+3. **关联旧回归**：同批首次执行 `/tmp/luma-ca01-green.log` 中 `testV4ReceiveRechecksTrustAfterDirectoryLookup`、`testV4TombstoneSchemaMigrationPreservesDeletionEvidence` 各通过；这批新增测试当时有 3 个失败断言，不能把整批记作通过。原因是测试继续使用 rollback 前的失效 Model 引用，以及把旧 DH 链拒绝错误限定为 `.replay`；后者实际在链长度检查以 `.tooManySkipped` 拒绝。最小 SwiftData 探针确认重新 fetch/新 context 保留原持久化值，测试改为验证真实持久状态；允许两种既有安全拒绝，不修改 Ratchet 校验。最后仅重跑两个受影响用例，未重跑无关全量测试。
+4. **构建和静态检查**：为真实 SwiftData/接收事务测试执行必要的 Debug `xcodebuild test`（定向构建）；未额外执行完整独立 build、Release、Go、Docker/VPS 或生产迁移。修改的 Swift 文件 `swiftc -frontend -parse`、`git diff --check` 通过。最终构建仅见既有 `V4SessionVaultJournalTests` 中冗余 try 和 AppIntents 无依赖提示；本轮新代码无这些 warning。预期只读保存失败产生 Cocoa 513 诊断，是故障注入结果，不是成功恢复的静默失败。
+5. **测试清理**：临时红灯用例合并进两个正式回归，不新增独立测试文件/大套件；原有关键加密、恢复、权限测试没有删除。基线外的用户差异和 `.claude/` 保留。
+
+### 状态和剩余限制
+
+- **已修复且有定向证据**：CA-01 在升级后的 v4 接收/本机确认路径中关闭；正常/乱序、移除墓碑、重放/冲突、DH 换链和部分提交不依赖不可信顺序，不改变 Ratchet。
+- **已实现但未充分验证**：实际旧数据库升级、混合客户端和完整磁盘/Keychain 多点断电矩阵。账本摘要随消息/证据保留，高频长期操作的体积/性能尚未压测；不能无证据裁剪唯一去重记录。
+- **BLOCKED / 独立后续项目**：混合旧客户端的发布策略、D-02 数据盘点/兼容、可信目录、撤销 cutoff、Signed PreKey 轮换和缺失历史事实恢复。没有借本轮改写这些边界。
+- **NOT_RUN / 外部验收**：真实双设备与真实 Backend 弱网、真实 App 强退/设备断电、完整故障注入、Face ID/Keychain 实机行为、独立密码学审计。模拟器＋URLProtocol 不是这些验收的替代。
+- **发布判断**：不启用生产 E2EE 标识。局部缺陷回归通过不等于生产密码学安全认证，也不是无条件发布/冻结通过。
+
+## 2026-10-25：D-02 v3 历史 Reaction 受限兼容
+
+本节更新前述 D-02“未处理”状态；CA-01 已有证据仍有效，本轮没有改 v4 Ratchet、操作账本或接收事务。基线为 main `6c3e47a9543b1473592a320155b7bb626cb206fa` 加原有工作区差异，Recovery 仍默认关闭。
+
+- **证据与攻击条件**：`DeviceSessionManager.decrypt` 对合法无 OTP v3 信封不保留重放状态；v3 签名和 AEAD 覆盖信封，但 Reaction 正文没有认证操作 ID、增删动作或因果版本。服务器若持有曾投递的无 OTP Reaction 密文，可以赋予新外层 `eventID/deviceSeq` 重投；即使使用不同 OTP，延迟合法旧操作也能按到达顺序覆盖较新表情。签名能证明发件身份，不能证明它是最新操作。旧 v3 编辑的签名 revision 与 `MessageStore` 单调检查可阻止较低 revision 覆盖；旧已读/删除已经仅消费服务端通知；创建重投仍受已有身份/事件检查。历史物理删除且缺可信墓碑的事实不能从此推断或追溯恢复。
+- **实际修复**：`RemoteMessageRepository.apply` 对旧 Reaction 继续完整验签、AEAD、固定身份、发送/目标账号和目标设备绑定。已有目标须属于同一 v3 会话，v4 目标拒绝。合法事件在业务层无状态消费：不插入或更新 Reaction、不创建缺失目标/会话；游标仍由原同步协调器在应用返回及保存后推进。当前 `RemoteMessageRepository.react` 不再发送 v3 Reaction，并向用户返回旧版操作受限提示。保留已删除行的 v3 迟到编辑通过既有认证/revision 检查后，由 `MessageStore` 只推进 revision，不恢复正文；物理缺失且无可信归属证据的编辑继续暂停。已有本地 Reaction 快照、v3 文字和签名 revision 编辑保持可读。没有给旧载荷伪造操作账本、改服务端路由或降低 v4 认证要求。
+- **兼容及未解决风险**：服务端旧 `/messages/reaction` 接口仍存在，旧客户端仍可能发送/应用无序操作；升级端会忽略其可见变化。混合版本 Reaction 不保证设备间一致；最低客户端版本门禁、混合部署/回滚验收尚未实现，生产发布仍阻塞。曾由旧客户端错误应用的表情无法从缺失的因果证据中自动纠正；签名有效但缺消息行的旧 Reaction 可安全无状态消费，恶意服务器仍能延迟/阻断同步。完整端到端历史事件审计与可信目录不在本轮解决。
+- **验证**：扩展现有 `testV3SignedRevisionCannotBeRelabeledAsCreation`，真实 Repository、SwiftData 和 v3 签名/AEAD，覆盖同一无 OTP 信封换外层 ID 重投、已删除/物理移除目标、v4 跨版本目标、篡改信封拒绝、保留删除行的迟到编辑及 v3 新发送拒绝；同用例保留旧创建/编辑与身份变化门禁。旧逻辑定向测试 **1 失败**，可见 Reaction 由 😂 回退为 👍（`/tmp/luma-d02-red-signed.log`）；迟到编辑扩展测试修复前因 `invalidEnvelope` 失败（`/tmp/luma-d02-late-edit-red.log`）；最终 `/tmp/luma-d02-final.log` **1 项通过、0 失败**。游标提交顺序仅对 `RemoteSyncCoordinator` 做源码追踪，本轮未跑 v3 的真实后端/游标集成测试。仅必要 Debug 定向测试编译，无独立 Release/Go/全量构建。模拟器测试不等于真实双设备或真实 Backend 验收。
+- **发布状态**：D-02 在升级客户端的可见状态回退路径得到受限修复，但旧客户端和旧服务端接口仍保留风险；生产 E2EE 标识继续关闭。真实双设备、混合版本部署、弱网与断电故障注入、独立密码学审计 **NOT_RUN**。
+
+## 2026-10-25：v3/v4 混合版本服务端门禁
+
+- **根因**：上一节客户端已拒绝新 v3 Reaction，服务端 `/v1/messages/reaction` 仍能为旧设备写入无因果顺序的 `reaction.added`；旧二进制还可继续同步、按到达顺序应用旧 v3/v4 Reaction。服务端的 v4 事件载荷是 opaque 密文，不能验证其内部是否有认证的 `reactionOrder`。仅检查客户端版本请求头不能证明请求来自升级设备。
+- **已修复，待隔离环境充分验收**：后端旧 Reaction 写入对 v2 请求返回 `426 legacy_reaction_disabled`，v1 请求由外层门禁返回 `426 client_upgrade_required`；均不进入数据库事务、不追加同步事件或发通知。iOS 在线请求使用设备认证私钥签署 `luma.request.v2` 域；Go 后端同时验证 v1/v2 签名，但只有 v2 能通过在线业务 HTTP/WebSocket 路由。v1 已验证设备不能发消息、修改状态、拉取或 ack 新事件；注册、登录、refresh 和本设备会话撤销的既有签名兼容保留。服务端门禁由认证中间件落实，不从任意请求头读取版本。现有数据库、消息密文、Ratchet、PreKey 和事件格式不迁移、不清理历史数据。
+- **版本与身份边界**：请求证明绑定令牌、已登记设备 Ed25519 公钥、方法、RequestURI、时间戳及 Redis 防重放 nonce；v1 签名不能直接重标成 v2 或用于不同 URI。它能区分诚实的旧/新客户端，但**不能证明运行中二进制、Reaction 解析器或已遭入侵的设备实现**；握有设备私钥的改造客户端仍可声称 v2。旧二进制已下载的无序事件或旧本机快照不能由服务端追溯删除或纠正。历史 v3 文字/签名编辑仍由升级端原验证路径读取；物理缺失且无可信归属证据的迟到编辑继续保留 journal 和游标，不跳过。
+- **迁移/回滚约束**：无 SQL 迁移；但新客户端请求 v2 时旧后端会返回签名失败，新后端上线后旧客户端会收到 426。这要求计划中的服务端与客户端硬切换，不能先发布新客户端到旧服务、也不能回滚到允许 v1 私有操作或无序 Reaction 的旧后端。混合设备不能靠旧客户端继续在线沟通；应升级后从原游标恢复。服务器对 v4 加密载荷的业务有序性仍只能由端侧认证验证。
+- **验证状态**：`go test ./internal/auth -run '^TestSignedRequestVersionGate$'` 为 **1 项通过**；隔离临时 PostgreSQL 的 `TestV4ControlEventsAreOpaqueIdempotentAndAuthorized` 为 **1 项通过**，其中旧接口重复请求均 426、事件和通知计数为 0，v4 事件成功及幂等保持。`testOnlineRequestSignsUpgradeProofWithDeviceKey` 为 **1 项通过**，验证 Swift 设备签名为 v2 且不能作 v1 使用。该 iOS 定向测试执行一次必要 Debug 构建；产生的 `/tmp` DerivedData 与日志已按用户要求删除，未追加重复构建。真实两设备混合版本、真实 HTTP 认证加 Redis 端到端、旧队列/缓存线下迁移、弱网/掉电恢复、真实 VPS 和独立密码学审计 **NOT_RUN**。生产 E2EE 标识继续关闭，可信密钥目录仍未实现。
+
+## 2026-10-26：未发布版本在线协议收敛（本地工作区）
+
+- **实际改动**：新在线消息仅允许 v4；旧消息删除/编辑/已读/Reaction 写接口和 v3 公钥查询/补充接口已从路由及实现移除。设备请求证明仅接受 `luma.request.v2`，含 refresh 与注销；旧域签名返回 401。身份安全码查询改为验证 v4 公钥束。客户端移除 v3 在线编辑与新信封生成，历史 v1/v2/v3 解密、受限 v3 事件认证及已有本地模型/备份保持。v4 传输送达提示继续存在，不充当已读证明。
+- **保留的依赖**：注册和设备审批仍使用传统 Signed PreKey 字段与数据库结构；历史 v3 解密及旧事件游标恢复仍需要对应本机材料。没有删除 SQL 历史迁移或用户数据。此变更尚未发布，旧二进制不再保证在线兼容；将旧后端回滚上线可能重新开放不安全的接口，须单独审查。
+- **发送重试一致性**：原样请求成功入库但响应丢失后，当前好友/设备集合若改变，原逻辑先做新路由授权而不能确认已存结果。后端现先按已认证的同一发送设备、消息 ID 和请求内容哈希返回幂等结果；首次写入仍检查好友、block、活动设备和附件权限。现有隔离 PostgreSQL 用例增补“好友关系变化后原样重试不二次写入”；因本轮未提供隔离测试库，该数据库用例 **NOT_RUN**，需要单独验收。
+- **验证状态**：`go test` 对 auth/message 的两项定向测试通过；device/friend/middleware/cmd 包仅编译检查，未运行隔离 PostgreSQL 集成用例。`go vet` 覆盖受影响的六个 Go 包；Swift 前端语法解析通过。Xcode Debug 定向 XCTest 两项通过：v2 请求签名与 v3 历史认证读取；首次禁用模拟器签名导致 Keychain `-34018`，在同一缓存恢复本地签名后两项通过。`git diff --check` 与 OpenAPI YAML 解析通过。未运行真实双设备、隔离数据库/Redis、Docker 镜像、完整故障注入、Face ID 实机或独立密码学审计。Recovery 默认关闭，生产 E2EE 标识不变。
+- **剩余安全边界**：服务器仍可隐藏设备或向不同设备给出分叉目录；用户须带外核对首次安全码。签名域不证明客户端二进制真实；历史 v3 无因果 Reaction 仅认证后无状态消费，不能修复旧快照。源码可继续冻结候选检查，但不能据此给出生产 E2EE 安全认证或发布判断。
+
+## 2026-10-26：发布前最小补充验收（本地工作区）
+
+本节只补足上节标记为未运行的隔离数据库验证及部署静态检查；没有修改协议、业务代码、现有测试或部署配置。`main`、HEAD、本地与只读远端 `origin/main` 均为 `6c3e47a9543b1473592a320155b7bb626cb206fa`；原有未提交改动与 `.claude/` 保留。Recovery 的默认值仍为 `false`，生产 E2EE 标识未启用。
+
+### 实际执行及结论
+
+| 范围 | 本次证据 | 结论 |
+| --- | --- | --- |
+| 隔离 PostgreSQL 17.11 | 新建仅 Unix Socket 的临时集群和合成数据库；实际运行后端 `migrate`，再定向运行 `TestConcurrentStartupMigrations`、`TestRuntimeRoleBoundary`、`TestRevocationInvalidatesTokenAndEmitsOneCursorEvent`、`TestDeviceManagementAuthority`、`TestV4PublicDirectoryAndRevokedHistory`、`TestV4ControlEventsAreOpaqueIdempotentAndAuthorized`。六项均 PASS；迁移命令成功。测试结束后停止并移除本次临时集群。 | **已验证于隔离数据库**：迁移账本、运行角色拒绝越权、设备授权/撤销、PreKey 撤销与补充、v4 不透明事件和好友关系变化后的原样发送重试。未对生产数据执行迁移。 |
+| 部署静态与控制流 | 相关 Shell 脚本 `bash -n`、`database-role.sh` 的 `sh -n`、`deploy/tests/database-lifecycle.sh` 均通过；Compose YAML 解析并确认 API 使用 `luma_api`、PG/Redis/Backend 不映射宿主端口，以及 migrate → db-grants → backend 健康 → Caddy 的依赖顺序。Caddy 私网 IP 与受信代理配置一致；静态追踪安装脚本的网段重叠拒绝及备份、更新、恢复、回滚的未完成恢复门禁、加密清单预检和 readiness。Dockerfile 最终阶段以 `luma` 运行，迁移文件规范化为目录 755/文件 644。Docker Hub 对 `golang:1.27.3-alpine3.24` 标签查询返回 HTTP 200；这仅证明标签可查询。 | **静态通过，容器运行未验证**：本机没有 Docker/Compose，未执行镜像构建、非 root 实际读取、服务启动、readiness、TLS/WSS 或真实备份恢复。既有 Ubuntu 隔离验收矩阵见 `deploy/README_DEPLOY.md`。 |
+| E2EE 状态一致性 | 核对 `V4RecoveryConfiguration` 默认关闭，现有 Ratchet/墓碑/迟到事件/身份变化定向 XCTest 及结果已记录于本报告前节；本次未改相关 Swift 实现，未重复运行。 | **沿用先前定向证据，不等于本次重新通过**；真实跨设备与完整故障注入仍未运行。 |
+| 工作区完整性 | `git diff --check` 通过；没有提交、推送、发布、部署或清理原有工作。 | 本次仅追加此验收记录。 |
+
+### 两台真实设备的手动验收清单（NOT_RUN）
+
+准备：两台独立 iPhone、两个全新测试账号、隔离后端及测试数据库；各自登记设备并记录非秘密的账号/设备 ID、消息 ID、事件 ID、游标及结果。使用测试域名和有效 TLS；不要把密钥、Token、正文或附件明文写入报告。
+
+1. A/B 同时首次发送，分别核对带外安全码并检查身份变化提示；确认不会静默改信任、重置 Ratchet、复用 PreKey，冲突时按当前禁用 Recovery 的安全拒绝行为记录结果。
+2. A→B、B→A 各发送连续文字及图片、文件、语音密文附件；核对接收端内容、文件哈希、每设备密文信封、编辑、删除、Reaction 添加/移除、已读关闭策略及迟到/重复事件的最终状态。后台数据库只能观察密文和必要元数据。
+3. 在待发、已上传未收到响应、接收已解密未确认游标三个边界分别断网和强制退出 App；重启并恢复连接后核对消息数、附件数、Ratchet 状态版本、未决 journal 与游标。不允许丢失、重复应用或因认证失败错误推进。
+4. 撤销 B 的设备后尝试旧 Token 同步、WebSocket 重连和发送；应拒绝。再核对其他有效设备继续通信，旧设备的本地会话/待发状态不会被错误复用。
+5. 对篡改附件、错误身份、旧目录/旧事件、乱序投递及服务重启恢复做受控故障注入；若出现身份不确定或历史删除证据缺失，保留日志与游标并阻止信任升级，不以重置会话作为通过条件。
+
+**发布门槛仍未满足**：无 Docker/Ubuntu 生命周期实测、真实双设备、Face ID/Keychain 实机行为、完整故障注入及独立密码学审计。可信密钥目录仍未实现，不能证明恶意服务器不会向设备提供分叉或选择性隐藏的目录。隔离 PostgreSQL 测试和既有模拟器结果都不能替代这些证据；不得启用生产 E2EE 标识。

@@ -62,19 +62,6 @@ struct RemoteAuthProvider {
         try Task.checkCancellation()
         try store.save(registration, for: user.userID)
         try await login(userID: user.userID)
-        let oneTime = try prekeys.records(for: user.id).filter { $0.type == "oneTime" && $0.usedAt == nil }
-            .prefix(100).map { $0.publicKey.base64URLEncodedString() }
-        struct PreKeyUpload: Encodable {
-            let signedPreKey: String
-            let signature: String
-            let keyVersion: Int
-            let oneTimePreKeys: [String]
-        }
-        let upload = try JSONEncoder().encode(PreKeyUpload(signedPreKey: prekeyText,
-            signature: signedPrekeySignature.base64URLEncodedString(), keyVersion: 1,
-            oneTimePreKeys: oneTime))
-        _ = try await client.request("PUT", path: "/devices/\(result.deviceID.uuidString.lowercased())/prekeys",
-                                     body: upload)
         return registration
     }
 

@@ -7,15 +7,6 @@ struct MessageEncryptor {
     let local: EncryptionService
     let sessions: SessionManager?
 
-    /// v3 needs a verified recipient device bundle; it is a transport envelope, not a SwiftData blob.
-    static func encryptV3(_ plaintext: Data, messageID: UUID, conversationID: UUID,
-                          senderDeviceID: UUID, identity: P256.Signing.PrivateKey,
-                          recipient: VerifiedDeviceBundle) throws -> DeviceMessageEnvelope {
-        try DeviceSessionManager().encrypt(plaintext, messageID: messageID,
-            conversationID: conversationID, senderDeviceID: senderDeviceID,
-            senderIdentityPrivateKey: identity, recipient: recipient)
-    }
-
     static func decryptV3(_ envelope: DeviceMessageEnvelope, expectedDeviceID: UUID,
                           expectedFingerprint: String, device: P256.KeyAgreement.PrivateKey,
                           signedPreKey: P256.KeyAgreement.PrivateKey,

@@ -12,7 +12,7 @@ struct LumaApp: App {
                 .environment(security)
                 .environment(privacyShield)
         }
-        .modelContainer(for: [User.self, Device.self, Friend.self, Conversation.self, Message.self, Attachment.self, UserPresence.self, Reaction.self, SearchIndexEntry.self, V4PendingEvent.self, SessionKey.self, PreKeyMetadata.self, ChainState.self, V4SessionMetadata.self, V4DeviceMetadata.self, RemoteSyncCheckpoint.self, RemoteDeviceTrust.self, OutgoingMessageQueueItem.self, CleanupState.self])
+        .modelContainer(for: [User.self, Device.self, Friend.self, Conversation.self, Message.self, MessageTombstone.self, Attachment.self, UserPresence.self, Reaction.self, SearchIndexEntry.self, V4PendingEvent.self, SessionKey.self, PreKeyMetadata.self, ChainState.self, V4SessionMetadata.self, V4DeviceMetadata.self, RemoteSyncCheckpoint.self, RemoteDeviceTrust.self, OutgoingMessageQueueItem.self, CleanupState.self])
     }
 }
 
@@ -138,5 +138,5 @@ struct MainTabsView: View {
     RootView()
         .environment(SecurityManager())
         .environment(PrivacyShieldManager())
-        .modelContainer(for: [User.self, Device.self, Friend.self, Conversation.self, Message.self, Attachment.self, UserPresence.self, Reaction.self, SearchIndexEntry.self, V4PendingEvent.self, SessionKey.self, PreKeyMetadata.self, ChainState.self, V4SessionMetadata.self, V4DeviceMetadata.self, RemoteSyncCheckpoint.self, RemoteDeviceTrust.self, OutgoingMessageQueueItem.self, CleanupState.self], inMemory: true)
+        .modelContainer(for: [User.self, Device.self, Friend.self, Conversation.self, Message.self, MessageTombstone.self, Attachment.self, UserPresence.self, Reaction.self, SearchIndexEntry.self, V4PendingEvent.self, SessionKey.self, PreKeyMetadata.self, ChainState.self, V4SessionMetadata.self, V4DeviceMetadata.self, RemoteSyncCheckpoint.self, RemoteDeviceTrust.self, OutgoingMessageQueueItem.self, CleanupState.self], inMemory: true)
 }

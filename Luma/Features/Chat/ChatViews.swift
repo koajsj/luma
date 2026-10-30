@@ -1190,7 +1190,7 @@ private struct FavoriteMessagesView: View {
 }
 
 #Preview("聊天 · 深色与大字体") {
-    let container = try! ModelContainer(for: User.self, Device.self, Friend.self, Conversation.self, Message.self, Attachment.self, UserPresence.self, Reaction.self, SearchIndexEntry.self, V4PendingEvent.self, SessionKey.self, PreKeyMetadata.self, ChainState.self, V4SessionMetadata.self, V4DeviceMetadata.self, OutgoingMessageQueueItem.self, CleanupState.self,
+    let container = try! ModelContainer(for: User.self, Device.self, Friend.self, Conversation.self, Message.self, MessageTombstone.self, Attachment.self, UserPresence.self, Reaction.self, SearchIndexEntry.self, V4PendingEvent.self, SessionKey.self, PreKeyMetadata.self, ChainState.self, V4SessionMetadata.self, V4DeviceMetadata.self, OutgoingMessageQueueItem.self, CleanupState.self,
                                         configurations: ModelConfiguration(isStoredInMemoryOnly: true))
     let user = User(userID: "alice", nickname: "Alice", passwordHash: "preview")
     let friend = Friend(ownerID: user.id, userID: "bob", nickname: "Bob")

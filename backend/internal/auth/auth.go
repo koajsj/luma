@@ -286,6 +286,10 @@ func (s Service) Require(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r.WithContext(middleware.WithIdentity(r.Context(), middleware.Identity{UserID: uid, DeviceID: did})))
 	})
 }
+func validRequestProof(publicKey, signature []byte, r *http.Request, ts, nonce, token string) bool {
+	suffix := r.Method + "\n" + r.URL.RequestURI() + "\n" + ts + "\n" + nonce + "\n" + base64.RawURLEncoding.EncodeToString(crypto.Hash(token))
+	return crypto.VerifyEd25519(publicKey, signature, "luma.request.v2\n"+suffix)
+}
 func (s Service) proof(w http.ResponseWriter, r *http.Request, did string, publicKey []byte, token string) bool {
 	ts := r.Header.Get("X-Device-Timestamp")
 	nonce := r.Header.Get("X-Device-Nonce")
@@ -295,8 +299,7 @@ func (s Service) proof(w http.ResponseWriter, r *http.Request, did string, publi
 		middleware.Fail(w, r, 401, "invalid_device_proof")
 		return false
 	}
-	canonical := "luma.request.v1\n" + r.Method + "\n" + r.URL.RequestURI() + "\n" + ts + "\n" + nonce + "\n" + base64.RawURLEncoding.EncodeToString(crypto.Hash(token))
-	if !crypto.VerifyEd25519(publicKey, signature, canonical) {
+	if !validRequestProof(publicKey, signature, r, ts, nonce, token) {
 		middleware.Fail(w, r, 401, "invalid_device_proof")
 		return false
 	}

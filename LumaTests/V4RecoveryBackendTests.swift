@@ -32,7 +32,7 @@ final class V4RecoveryBackendTests: XCTestCase {
             let timestamp = String(Int(Date().timeIntervalSince1970))
             let nonce = UUID().uuidString
             let digest = Data(SHA256.hash(data: Data(device.token.utf8))).base64URLEncodedString()
-            let proof = ["luma.request.v1", method, path, timestamp, nonce, digest].joined(separator: "\n")
+            let proof = ["luma.request.v2", method, path, timestamp, nonce, digest].joined(separator: "\n")
             request.setValue("Bearer " + device.token, forHTTPHeaderField: "Authorization")
             request.setValue(timestamp, forHTTPHeaderField: "X-Device-Timestamp")
             request.setValue(nonce, forHTTPHeaderField: "X-Device-Nonce")

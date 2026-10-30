@@ -21,3 +21,10 @@
 | `push_tokens` | `device_id`, `token_ciphertext`, `environment`, `updated_at` | token 应加密并严格授权读取；推送内容无消息正文。 |
 
 核心事务：创建消息时验证会话成员和目标设备，写 `messages`、各设备 `message_envelopes`、递增的 `sync_events` 与推送待办；成功后再应答。`device_seq` 必须对每个设备单调且无可见空洞，避免 ack 跳过事件。数据库备份同样只含密文和公钥，但可暴露联系人、时间、设备与流量元数据；按[隐私模型](../Security/Privacy_Model.md)制定保留期和删除策略。
+
+
+## 运行账号与迁移账号
+
+`luma migrate` 可独立执行现有 migration 与 HMAC 补齐；API 设置 `LUMA_AUTO_MIGRATE=false` 时只读检查版本集合/索引，并检查运行角色。管理员授权模板位于 [`backend/ops/runtime-grants.sql`](../../backend/ops/runtime-grants.sql)，不属于自动 SQL migrations：已有角色、对象所有权和数据库必须明确匹配，否则事务拒绝。运行角色只获当前 API 所需 DML 和只读迁移账本；预留推送表、DDL、序列及未来对象不自动授权。默认 ACL 必须针对实际创建对象的迁移角色设置。
+
+原 `001`–`007` 文件和模型未修改，未执行生产迁移。默认 Compose API 使用独立 `luma_api`，迁移/授权由短时 `luma` 管理员任务执行；原卷所有权保持，恢复后重新授权并阻止不兼容旧代码回滚。SQL 授权和恢复已在临时 PostgreSQL 验证，容器全生命周期及已有卷首次切换仍须隔离验收，见[部署指南](../../deploy/README_DEPLOY.md#数据库权限拆分)。

@@ -49,9 +49,12 @@ struct V4SessionVault {
         let session: Session
         let consumedOneTimePublicKey: Data?
         var phase: TransactionPhase = .prepared
+        /// New writers retain independent local deletion evidence. A legacy
+        /// journal with no row/evidence cannot safely authorize content recovery.
+        var localPersistenceVersion: Int? = 1
 
         private enum CodingKeys: String, CodingKey {
-            case eventID, deviceSeq, plaintext, envelopeDigest, session, consumedOneTimePublicKey, phase
+            case eventID, deviceSeq, plaintext, envelopeDigest, session, consumedOneTimePublicKey, phase, localPersistenceVersion
         }
         init(eventID: UUID, deviceSeq: Int64, plaintext: Data, envelopeDigest: Data,
              session: Session, consumedOneTimePublicKey: Data?) {
@@ -68,6 +71,7 @@ struct V4SessionVault {
             session = try values.decode(Session.self, forKey: .session)
             consumedOneTimePublicKey = try values.decodeIfPresent(Data.self, forKey: .consumedOneTimePublicKey)
             phase = try values.decodeIfPresent(TransactionPhase.self, forKey: .phase) ?? .prepared
+            localPersistenceVersion = try values.decodeIfPresent(Int.self, forKey: .localPersistenceVersion)
         }
     }
 

@@ -18,7 +18,9 @@ type Error struct {
 	Message   string `json:"message"`
 	RequestID string `json:"requestID"`
 }
-type Identity struct{ UserID, DeviceID string }
+type Identity struct {
+	UserID, DeviceID string
+}
 type key int
 
 const identityKey key = 1

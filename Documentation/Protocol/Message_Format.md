@@ -25,7 +25,7 @@
 }
 ```
 
-上例是早期 API 草案，不是当前信封 JSON。当前 v3 编码见下节；附件密钥封装、控制事件端侧认证和正式版本协商仍未完成。服务器可见会话、参与设备、时间、大小和版本等路由元数据。
+上例是早期 API 草案，不是当前在线信封 JSON。当前在线写入只允许 v4；v3 编码仅用于历史读取。服务器可见会话、参与设备、时间、大小和版本等路由元数据。
 
 网络事件类型草案为 `message.created`、`message.delivered`、`message.read`、`message.deleted`、`message.edited`、`reaction.added`、`typing.started`、`typing.stopped`、`presence.updated`。服务端事件必须区分可信服务端序列与客户端提供的 `eventID`，权限与设备签名校验后才可应用；删除事件是同步意图，不是远端物理擦除保证。
 
@@ -55,3 +55,43 @@
 ## v4 附件载荷（客户端已实现，跨设备附件联调待验证）
 
 在线附件仍使用 `POST /v1/messages`、`encryptionVersion=4` 和逐设备 `recipientEnvelopes`。外层新增 `attachmentIDs`，服务器可见随机对象 ID 并据此将已上传密文对象绑定到消息。每个 Ratchet 密文正文的 `kind=attachment`，内含发送/目标 UserID 以及 `V4AttachmentDescriptor`：本地随机附件 ID、服务器对象 ID、消息/会话 ID、图片/文件/语音类型、原文件名、随机 256 位附件密钥和 SHA-256 密文哈希。服务器看不到这些正文成员、文件名、密钥或缩略图明文；文件服务另可见对象大小与密文哈希。文件使用独立 AES-GCM，AAD 绑定附件、消息、会话 ID 和类型；AES-GCM combined 字节包含随机 nonce、密文和认证标签。接收端先验证 Ratchet 消息及描述绑定，再按哈希和认证标签校验下载文件。旧 v1/v2/v3 读取不变。
+
+
+## v4 Reaction 操作顺序（CA-01 修复）
+
+`encryptionVersion=4`、Ratchet 头、Backend API 及正文 `revision` 均不变。新 Reaction 的 `V4EventEnvelope` 增加可选字段，位于 **Ratchet 加密并认证的载荷内部**：
+
+```json
+"reactionOrder": { "version": 1, "counter": 8 }
+```
+
+- `version=1`；`counter` 是精确 JSON 无符号整数，范围 `1 ... UInt64.max-1`。其他版本、零、负数或溢出拒绝，不降级。非 Reaction 事件不得携带此字段。
+- 操作 ID 复用既有的认证 `eventID`；账号、操作者设备、会话、原消息、正文 revision、Emoji、add/remove 和 occurredAt 仍在同一 AEAD 载荷中，且经过既有内外路由绑定检查。计数不上传到外层路由。
+- 每个 `(会话, 消息, 操作者账号)` 是一个独立寄存器。本机生成新操作时，读取该操作者已接受的最大计数和加密待发队列中的最大计数，加一后与事件一起持久化；离线重试保留原 ID、计数和精确密文，不重新编号。
+- 接收端在认证后比较 `(counter, actorDeviceID 原始16字节, eventID 原始16字节)`，字典序较大者生效。设备观测过某操作后生成的操作具有更大计数；未相互观测的多设备操作以该规则确定性合并，**不承诺按现实时间选择“最后一次点击”**。同设备异常地重复计数也以 eventID 确定性决胜，正常生成器不重复分配。
+- 不使用正文 revision、服务器 `deviceSeq`/cursor/createdAt、Ratchet messageIndex 或 DH 公钥作为业务顺序。计数由认证的操作者生成；它不证明恶意或失陷操作者诚实，不能用于授予其他操作者的权限。
+
+### 持久化、移除和接收事务
+
+`Message.encryptedReactionState` 是新增可选字节字段：Master Key AES-GCM 加密的版本 1 账本，AAD 绑定 ownerID、消息本机会话 ID 和消息 ID。内容为每个操作者的胜出操作戳，以及每个已接受操作 ID 的完整解码事件摘要（SHA-256，Swift JSONEncoder sortedKeys）；不保留历史 Emoji 明文或消息密钥。摘要是本机幂等记录，不是新的签名方案或跨语言规范编码。
+
+移除会删除可见 `Reaction` 行，但保留操作戳和摘要。相同 ID、相同事件幂等；相同 ID、不同内容拒绝，保留接收 journal，不确认游标。合法旧操作记录摘要但不改可见状态，**仍通过原 Ratchet 接收事务提交**。不同操作者互不覆盖。
+
+账本与可见 Reaction 在同一 SwiftData save 中提交。失败保留原接收 journal，重试使用原认证明文；游标只有在业务保存后推进，随后提交 Ratchet 并 ack。账号切换和身份校验沿用现有门禁。删除/过期目标不恢复正文、附件或 Reaction；独立 `MessageTombstone` 可保留嵌套加密账本，只恢复空隐藏行。
+
+### 兼容与恢复限制
+
+- 旧行没有账本时按空账本读取，已有 Reaction 只作为未排序的历史展示快照，**不伪造历史操作版本**。第一份新版有序操作可替换快照。
+- 旧 v4 Reaction 没有 `reactionOrder`（包括已有待发密文）：仍须完整认证、权限/版本检查及原链提交，但不修改 Reaction。不得为已经准备或提交的旧密文补写新版本或重新加密。
+- 未知新版本安全暂停，不转为旧路径。旧客户端会忽略新增 JSON 字段，仍存在原到达顺序问题；只有升级客户端执行本规则。混合版本期间，旧设备的 Reaction 变化不会应用到新客户端；不能宣称整个设备集合已收敛。发布前需明确最低兼容版本/升级安排，本轮不增加未经认证的能力协商。
+- v1/v2 本地操作不变。v3 历史创建和带签名 revision 的编辑继续读取；v3 Reaction 的后续受限处理见下节。
+- 在线消息的便携备份导出/覆盖门禁不变；不新增丢弃账本的恢复路径。保留原数据库及 Keychain 才能维持状态。完整旧快照回滚、旧二进制降级写入和实际历史库升级仍需外部验收，不能从已丢失数据推断删除事实。
+- 摘要随消息/删除证据保留，不按时间裁剪。长期高频操作会增加本机账本体积；不能仅为节省空间移除唯一的冲突检测证据。
+
+## v3 历史 Reaction 限制（D-02）
+
+v3 Reaction 的 P-256 签名与 AES-GCM 认证覆盖信封，但加密正文只有 `kind/senderUserID/targetUserID/text`，没有认证的操作 ID、增删动作或全局/因果顺序。无 OTP 的合法旧信封能重复解密；即使每个信封使用不同 OTP，服务器仍能把合法旧操作延迟到新操作之后投递。外层 `eventID/deviceSeq/createdAt` 由服务器控制，不能补作业务版本。
+
+升级客户端接收 `reaction.added` 时仍校验 v3 信封签名、AEAD、固定身份、会话/设备和正文身份；已有目标必须属于同一 v3 会话。合法事件随后仅作无状态消费，不改可见 Reaction；目标已物理删除时也不重新创建。既有本地 Reaction 行保留为历史快照，不由其推断先后或生成伪操作墓碑。当前客户端停止向 `/messages/reaction` 发送 v3 操作，保留 v4 有序 Reaction；旧式已读/删除仍只作通知消费。历史 v3 文字消息及签名 revision 编辑读取不变：若本机保留已删除的目标行，合法迟到编辑只推进 revision，不恢复正文；目标已物理删除且没有可信归属证据时仍暂停，不能凭路由猜测并跳过。
+
+当前服务端已移除旧 v3 Reaction 写入口，也拒绝新 v3 消息写入；历史同步队列中已存在的密文仍按上述受限规则读取，不从缺失的因果证据恢复旧快照。当前在线协议和失败行为见[客户端与服务器协议](Client_Server_Protocol.md#当前在线协议与历史读取边界2026-10-26)。
